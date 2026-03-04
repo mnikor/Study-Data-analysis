@@ -1,0 +1,5 @@
+{
+  "name": "ClinicalInsights AI",
+  "description": "An LLM-powered clinical data analysis tool supporting raw programming, mapping, RAG/Stuffing analysis, and full provenance tracking.",
+  "requestFramePermissions": []
+}
