@@ -74,6 +74,32 @@ These areas are prepared architecturally but not fully wired to real enterprise 
 - access control is centralized and can be reconnected to SSO later
 - storage and provider swaps can happen server-side without redesigning the frontend
 
+### Not implemented yet
+
+- real S3-backed file and artifact persistence
+- real RDS/PostgreSQL metadata persistence
+- shared multi-user project ownership and collaboration model
+- server-side authorization enforcement
+- async worker/queue execution for heavy jobs
+- immutable audit persistence and signature workflow
+- enterprise monitoring, alerting, backup, and recovery
+- environment promotion and infrastructure-as-code
+
+## Enterprise Integration Status Matrix
+
+| Area | Current state in repo | Enterprise readiness | What still must be done |
+|---|---|---:|---|
+| Frontend application | Working | Partial | Host through approved enterprise path and remove remaining external CDN dependency if policy requires it |
+| Backend API boundary | Working | Partial | Split integrated server into dedicated API/worker services and harden auth, validation, and rate controls |
+| AI provider boundary | Working | Partial | Replace provider implementation with Azure OpenAI GPT-5 backend and task-specific model routing |
+| Project persistence | Working locally | Partial | Move metadata to RDS/PostgreSQL and files/artifacts to S3 |
+| Authentication | POC open access | No | Integrate J&J sign-in and validate identity on every backend request |
+| Authorization | Frontend-only POC policy | No | Enforce claim/group-based authorization in backend APIs |
+| Analysis execution | Working | Partial | Add async jobs, central run manifests, and governed rerun semantics |
+| Audit/provenance | Basic app provenance | Partial | Store immutable audit trail, approval records, hashes, and signatures centrally |
+| Multi-user operation | Not implemented | No | Add shared persistence, ownership, permissioning, and concurrency handling |
+| Deployment/operations | Local only | No | Add CI/CD, observability, secrets, network controls, backup, and disaster recovery |
+
 ## Repository Structure
 
 - `/components` UI modules
@@ -210,6 +236,21 @@ Move the following server-side for enterprise use:
 - report generation if you need governed exports
 - provenance/audit persistence
 
+Recommended backend service split:
+- `frontend` static build delivery
+- `api-service` for synchronous user-facing APIs
+- `worker-service` for heavy ingestion, transformation, Autopilot, and export jobs
+- optional `scheduler` for maintenance and recurring tasks
+
+Recommended API domains:
+- `/api/auth/*`
+- `/api/projects/*`
+- `/api/files/*`
+- `/api/analysis/*`
+- `/api/ai/*`
+- `/api/provenance/*`
+- `/api/exports/*`
+
 ### Data persistence
 
 Replace the current local metadata and artifact stores with managed backend persistence:
@@ -222,6 +263,12 @@ Replace the current local metadata and artifact stores with managed backend pers
   - review decisions
   - provenance/audit logs
 - optional `Redis/ElastiCache` if you later need short-lived job/session caching
+
+Recommended storage split:
+- `raw-data bucket` for source uploads
+- `derived-data bucket` for standardized datasets, linked workspaces, and exports
+- `metadata database` for projects, files, runs, review decisions, and provenance
+- `optional cache` only for transient execution state, never as system of record
 
 ### Async processing
 
@@ -238,6 +285,15 @@ Recommended pattern:
 - worker service processes job
 - status stored in `RDS`
 - artifacts stored in `S3`
+
+Recommended async candidates:
+- workbook sheet expansion and merge planning
+- QC on large datasets
+- AI mapping suggestion generation
+- linked workspace creation
+- Autopilot packs
+- protocol/SAP extraction on large documents
+- export generation
 
 ## Azure OpenAI With GPT-5
 
@@ -262,6 +318,18 @@ This is the cleanest enterprise pattern because:
 - no model credentials reach the browser
 - provider changes do not require frontend rewrites
 - provider choice can be environment-driven
+
+Recommended provider contract:
+- `generateText`
+- `generateStructuredJson`
+- `extractPlanItems`
+- `generateClinicalCommentary`
+- `healthcheck`
+
+Recommended runtime policy:
+- choose provider by environment/config only
+- keep prompt templates versioned server-side
+- persist provider, deployment, and prompt version for every AI-assisted action
 
 ### Azure OpenAI guidance
 
@@ -352,6 +420,21 @@ Recommended implementation pattern:
 3. Re-enable access control using claims/groups from the identity provider
 4. Enforce permissions in backend APIs, not just in frontend navigation
 
+Recommended authorization layers:
+- workspace access
+- file access
+- analysis execution
+- export/share permission
+- governance/admin actions
+
+What still must be implemented for auth:
+- login initiation and callback flow
+- secure session or token validation middleware
+- claim-to-capability mapping
+- logout/session invalidation
+- backend request guards
+- audit attribution using enterprise identity rather than POC labels
+
 Do not rely on:
 - local role pickers
 - browser-side authorization alone
@@ -371,6 +454,15 @@ Before enterprise rollout, the following should be treated as required:
 9. Add data retention and deletion policies
 10. Classify outputs as exploratory vs confirmed in stored metadata
 
+Additional enterprise security work:
+- move all secrets to AWS Secrets Manager or approved equivalent
+- enforce encryption at rest for S3 and RDS
+- enforce TLS for all service-to-service traffic
+- define PHI/PII handling controls for prompts, logs, exports, and artifacts
+- add request validation, payload limits, and upload scanning if required by policy
+- add dependency/container vulnerability scanning
+- replace CDN-loaded runtime assets if external CDN use is not allowed
+
 ## Gaps To Close Before Enterprise Deployment
 
 This repo is a strong prototype, but the following are still recommended before production:
@@ -383,6 +475,70 @@ This repo is a strong prototype, but the following are still recommended before 
 - remove or replace CDN dependencies in `index.html`
 - add CI/CD, containerization, infrastructure-as-code, and environment promotion
 - add structured health checks and observability dashboards
+
+## Detailed Enterprise Work Breakdown
+
+### Phase 1: Backend hardening while remaining local-first
+
+Goal:
+- keep the app runnable on a developer machine
+- remove remaining prototype-only architectural bottlenecks
+
+Work:
+- split metadata and file artifacts, which is now implemented
+- move analysis/export artifacts behind explicit backend abstractions
+- add provider interfaces for AI, storage, auth, and job execution
+- add structured API validation and typed error responses
+
+Exit criteria:
+- frontend depends on backend APIs for persistence and AI
+- local storage implementation can be swapped without frontend redesign
+
+### Phase 2: Enterprise service substitution
+
+Goal:
+- preserve app behavior while replacing local infrastructure with managed enterprise services
+
+Work:
+- local artifact store -> S3
+- local metadata store -> RDS/PostgreSQL
+- current AI provider -> Azure OpenAI GPT-5 backend
+- open POC access -> J&J SSO + server-side authorization
+- synchronous heavy tasks -> SQS + worker service
+
+Exit criteria:
+- app runs in AWS with managed persistence
+- AI provider is environment-driven on the backend
+- user identity and permissions are enforced on every backend request
+
+### Phase 3: Governance and operationalization
+
+Goal:
+- make the platform supportable and credible for broader enterprise use
+
+Work:
+- immutable audit trail and approval workflow
+- backup and disaster recovery
+- observability dashboards and alerting
+- environment promotion controls
+- retention and deletion policy support
+
+Exit criteria:
+- system behavior, recovery, and audit expectations are documented and tested
+
+## What Else Should Be Done Before Calling This Enterprise-Ready
+
+At minimum:
+1. Replace local artifact persistence with S3.
+2. Replace local metadata persistence with RDS/PostgreSQL.
+3. Implement J&J authentication and backend authorization.
+4. Replace the current AI provider implementation with Azure OpenAI GPT-5 backend integration.
+5. Add SQS-backed worker execution for heavy jobs.
+6. Persist immutable audit records, execution manifests, and artifact hashes.
+7. Add secrets management, environment separation, and IaC.
+8. Add monitoring, alerting, backup, and disaster recovery.
+9. Remove remaining runtime CDN dependency if enterprise policy requires internal hosting only.
+10. Complete security, data handling, and validation review.
 
 ## Suggested AWS Deployment Topology
 
