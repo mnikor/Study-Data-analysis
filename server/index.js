@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadEnv, createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import { createProjectStore } from './projectStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,6 +12,7 @@ const root = path.resolve(__dirname, '..');
 const distDir = path.resolve(root, 'dist');
 const isProduction = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || 3000);
+const projectStore = createProjectStore(root);
 
 const env = loadEnv(isProduction ? 'production' : 'development', root, '');
 for (const [key, value] of Object.entries(env)) {
@@ -107,6 +109,60 @@ const handleAiGenerate = async (req, res) => {
   }
 };
 
+const handleProjects = async (req, res) => {
+  if (req.method === 'GET') {
+    try {
+      const projects = await projectStore.readProjects();
+      sendJson(res, 200, {
+        projects,
+        storageBackend: projectStore.backend,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load projects.';
+      console.error('Project store read error', error);
+      sendJson(res, 500, { error: message });
+    }
+    return;
+  }
+
+  if (req.method === 'PUT') {
+    try {
+      const body = await readJsonBody(req);
+      const projects = Array.isArray(body?.projects) ? body.projects : null;
+      if (!projects) {
+        sendJson(res, 400, { error: 'Projects array is required.' });
+        return;
+      }
+
+      await projectStore.writeProjects(projects);
+      sendJson(res, 200, {
+        ok: true,
+        projectCount: projects.length,
+        storageBackend: projectStore.backend,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save projects.';
+      console.error('Project store write error', error);
+      sendJson(res, 500, { error: message });
+    }
+    return;
+  }
+
+  if (req.method === 'DELETE') {
+    try {
+      await projectStore.clearProjects();
+      sendJson(res, 200, { ok: true, storageBackend: projectStore.backend });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to clear projects.';
+      console.error('Project store clear error', error);
+      sendJson(res, 500, { error: message });
+    }
+    return;
+  }
+
+  sendJson(res, 405, { error: 'Method not allowed' });
+};
+
 const serveStaticAsset = async (pathname, res) => {
   const normalizedPath = pathname === '/' ? '/index.html' : pathname;
   const requestedPath = path.join(distDir, normalizedPath.replace(/^\/+/, ''));
@@ -152,7 +208,16 @@ const start = async () => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if (url.pathname === '/api/health') {
-      sendJson(res, 200, { ok: true, aiConfigured: Boolean(process.env.GEMINI_API_KEY) });
+      sendJson(res, 200, {
+        ok: true,
+        aiConfigured: Boolean(process.env.GEMINI_API_KEY),
+        projectStoreBackend: projectStore.backend,
+      });
+      return;
+    }
+
+    if (url.pathname === '/api/projects') {
+      await handleProjects(req, res);
       return;
     }
 

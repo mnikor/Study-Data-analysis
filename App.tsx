@@ -15,7 +15,14 @@ import { Autopilot } from './components/Autopilot';
 import { BrandLogo } from './components/BrandLogo';
 import { ClinicalFile, ProvenanceRecord, MappingSpec, ChatMessage, AnalysisSession, User, ProvenanceType, StudyType, Project } from './types';
 import { MOCK_FILES, INITIAL_PROVENANCE, MOCK_MAPPING } from './constants';
-import { clearProjectsInIndexedDb, loadProjectsFromIndexedDb, saveProjectsToIndexedDb } from './utils/projectStorage';
+import {
+  clearLegacyProjectsInIndexedDb,
+  clearLegacyProjectsInLocalStorage,
+  loadLegacyProjectsFromIndexedDb,
+  loadLegacyProjectsFromLocalStorage,
+  loadProjectsFromServer,
+  saveProjectsToServer,
+} from './utils/projectStorage';
 import { getAccessProfile, POC_DEFAULT_ROLE } from './utils/accessControl';
 
 enum View {
@@ -30,22 +37,6 @@ enum View {
   BIAS_AUDIT = 'BIAS_AUDIT',
   PROVENANCE = 'PROVENANCE'
 }
-
-const PROJECTS_STORAGE_KEY = 'clinical_ai_projects';
-
-const safelyLoadProjectsFromLocalStorage = (): Project[] | null => {
-  const saved = localStorage.getItem(PROJECTS_STORAGE_KEY);
-  if (!saved) return null;
-  try {
-    const parsed = JSON.parse(saved);
-    if (Array.isArray(parsed)) return parsed as Project[];
-    return null;
-  } catch (e) {
-    console.warn('Failed to parse saved projects from localStorage. Resetting storage.', e);
-    localStorage.removeItem(PROJECTS_STORAGE_KEY);
-    return null;
-  }
-};
 
 const hasLegacyTrimmedContent = (projects: Project[]): boolean =>
   projects.some((project) =>
@@ -122,7 +113,7 @@ const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<View>(View.DASHBOARD);
   const [storageReady, setStorageReady] = useState(false);
   
-  const [projects, setProjects] = useState<Project[]>(createDefaultProjects);
+  const [projects, setProjects] = useState<Project[]>([]);
   
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [activeStatSessionId, setActiveStatSessionId] = useState<string>('NEW');
@@ -135,38 +126,59 @@ const App: React.FC = () => {
 
     const loadProjects = async () => {
       try {
-        const indexedDbProjects = await loadProjectsFromIndexedDb();
+        const serverProjects = await loadProjectsFromServer();
+        if (!cancelled && serverProjects && serverProjects.length > 0) {
+          setProjects(serverProjects);
+          setStorageReady(true);
+          return;
+        }
+      } catch (error) {
+        console.warn('Server-backed project store load failed. Falling back to legacy browser migration.', error);
+      }
+
+      try {
+        const indexedDbProjects = await loadLegacyProjectsFromIndexedDb();
         if (!cancelled && indexedDbProjects && indexedDbProjects.length > 0) {
           if (hasLegacyTrimmedContent(indexedDbProjects)) {
             console.warn('Detected legacy trimmed IndexedDB payload. Clearing corrupted saved data.');
-            await clearProjectsInIndexedDb();
+            await clearLegacyProjectsInIndexedDb();
           } else {
-          setProjects(indexedDbProjects);
-          setStorageReady(true);
-          return;
+            setProjects(indexedDbProjects);
+            await saveProjectsToServer(indexedDbProjects);
+            await clearLegacyProjectsInIndexedDb();
+            clearLegacyProjectsInLocalStorage();
+            setStorageReady(true);
+            return;
           }
         }
-      } catch (e) {
-        console.warn('IndexedDB load failed. Falling back to localStorage migration.', e);
+      } catch (error) {
+        console.warn('Legacy IndexedDB migration unavailable. Falling back to localStorage migration.', error);
       }
 
-      const localProjects = safelyLoadProjectsFromLocalStorage();
+      const localProjects = loadLegacyProjectsFromLocalStorage();
       if (!cancelled && localProjects && localProjects.length > 0) {
         if (hasLegacyTrimmedContent(localProjects)) {
           console.warn('Detected legacy trimmed localStorage payload. Clearing it instead of migrating corrupted file contents.');
-          localStorage.removeItem(PROJECTS_STORAGE_KEY);
+          clearLegacyProjectsInLocalStorage();
           setStorageReady(true);
           return;
         }
         setProjects(localProjects);
         try {
-          await saveProjectsToIndexedDb(localProjects);
-        } catch (e) {
-          console.warn('Failed to migrate localStorage projects to IndexedDB.', e);
+          await saveProjectsToServer(localProjects);
+          clearLegacyProjectsInLocalStorage();
+          await clearLegacyProjectsInIndexedDb().catch(() => undefined);
+        } catch (error) {
+          console.warn('Failed to migrate localStorage projects to the backend store.', error);
         }
+        setStorageReady(true);
+        return;
       }
 
-      if (!cancelled) setStorageReady(true);
+      if (!cancelled) {
+        setProjects(createDefaultProjects());
+        setStorageReady(true);
+      }
     };
 
     loadProjects();
@@ -178,8 +190,8 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!storageReady) return;
 
-    saveProjectsToIndexedDb(projects).catch((e) => {
-      console.error('Failed to persist projects to IndexedDB. Data remains in memory for this session.', e);
+    saveProjectsToServer(projects).catch((error) => {
+      console.error('Failed to persist projects to backend storage. Data remains in memory for this session.', error);
     });
   }, [projects, storageReady]);
 

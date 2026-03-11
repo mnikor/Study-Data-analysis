@@ -1,23 +1,60 @@
 import { Project } from '../types';
 
-const DB_NAME = 'clinical-ai-db';
-const DB_VERSION = 1;
-const STORE_NAME = 'app-state';
-const PROJECTS_KEY = 'projects';
+const PROJECTS_API_ENDPOINT = '/api/projects';
+const LEGACY_PROJECTS_STORAGE_KEY = 'clinical_ai_projects';
+const LEGACY_DB_NAME = 'clinical-ai-db';
+const LEGACY_DB_VERSION = 1;
+const LEGACY_STORE_NAME = 'app-state';
+const LEGACY_PROJECTS_KEY = 'projects';
 
-const openDb = (): Promise<IDBDatabase> =>
+const parseProjects = (value: unknown): Project[] | null => (Array.isArray(value) ? (value as Project[]) : null);
+
+const fetchJson = async <T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> => {
+  const response = await fetch(input, init);
+  const text = await response.text().catch(() => '');
+  const payload = text ? JSON.parse(text) : {};
+
+  if (!response.ok) {
+    const error = typeof payload?.error === 'string' ? payload.error : `Project storage request failed (${response.status})`;
+    throw new Error(error);
+  }
+
+  return payload as T;
+};
+
+export const loadProjectsFromServer = async (): Promise<Project[] | null> => {
+  const payload = await fetchJson<{ projects?: unknown }>(PROJECTS_API_ENDPOINT, {
+    method: 'GET',
+    headers: { 'Cache-Control': 'no-store' },
+  });
+  return parseProjects(payload.projects) || [];
+};
+
+export const saveProjectsToServer = async (projects: Project[]): Promise<void> => {
+  await fetchJson(PROJECTS_API_ENDPOINT, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projects }),
+  });
+};
+
+export const clearProjectsOnServer = async (): Promise<void> => {
+  await fetchJson(PROJECTS_API_ENDPOINT, { method: 'DELETE' });
+};
+
+const openLegacyDb = (): Promise<IDBDatabase> =>
   new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB is not available in this environment.'));
       return;
     }
 
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    const request = indexedDB.open(LEGACY_DB_NAME, LEGACY_DB_VERSION);
 
     request.onupgradeneeded = () => {
       const db = request.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
+      if (!db.objectStoreNames.contains(LEGACY_STORE_NAME)) {
+        db.createObjectStore(LEGACY_STORE_NAME);
       }
     };
 
@@ -25,14 +62,14 @@ const openDb = (): Promise<IDBDatabase> =>
     request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB.'));
   });
 
-const withStore = async <T>(
+const withLegacyStore = async <T>(
   mode: IDBTransactionMode,
   operation: (store: IDBObjectStore, resolve: (value: T) => void, reject: (reason?: unknown) => void) => void
 ): Promise<T> => {
-  const db = await openDb();
+  const db = await openLegacyDb();
   return new Promise<T>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, mode);
-    const store = tx.objectStore(STORE_NAME);
+    const tx = db.transaction(LEGACY_STORE_NAME, mode);
+    const store = tx.objectStore(LEGACY_STORE_NAME);
 
     tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted.'));
     tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed.'));
@@ -42,26 +79,36 @@ const withStore = async <T>(
   });
 };
 
-export const loadProjectsFromIndexedDb = async (): Promise<Project[] | null> =>
-  withStore<Project[] | null>('readonly', (store, resolve, reject) => {
-    const request = store.get(PROJECTS_KEY);
-    request.onsuccess = () => {
-      const result = request.result;
-      resolve(Array.isArray(result) ? (result as Project[]) : null);
-    };
-    request.onerror = () => reject(request.error || new Error('Failed to load projects from IndexedDB.'));
+export const loadLegacyProjectsFromIndexedDb = async (): Promise<Project[] | null> =>
+  withLegacyStore<Project[] | null>('readonly', (store, resolve, reject) => {
+    const request = store.get(LEGACY_PROJECTS_KEY);
+    request.onsuccess = () => resolve(parseProjects(request.result));
+    request.onerror = () => reject(request.error || new Error('Failed to load legacy projects from IndexedDB.'));
   });
 
-export const saveProjectsToIndexedDb = async (projects: Project[]): Promise<void> =>
-  withStore<void>('readwrite', (store, resolve, reject) => {
-    const request = store.put(projects, PROJECTS_KEY);
+export const clearLegacyProjectsInIndexedDb = async (): Promise<void> =>
+  withLegacyStore<void>('readwrite', (store, resolve, reject) => {
+    const request = store.delete(LEGACY_PROJECTS_KEY);
     request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error || new Error('Failed to save projects to IndexedDB.'));
+    request.onerror = () => reject(request.error || new Error('Failed to clear legacy projects from IndexedDB.'));
   });
 
-export const clearProjectsInIndexedDb = async (): Promise<void> =>
-  withStore<void>('readwrite', (store, resolve, reject) => {
-    const request = store.delete(PROJECTS_KEY);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error || new Error('Failed to clear projects from IndexedDB.'));
-  });
+export const loadLegacyProjectsFromLocalStorage = (): Project[] | null => {
+  if (typeof localStorage === 'undefined') return null;
+  const saved = localStorage.getItem(LEGACY_PROJECTS_STORAGE_KEY);
+  if (!saved) return null;
+
+  try {
+    return parseProjects(JSON.parse(saved));
+  } catch (error) {
+    console.warn('Failed to parse saved projects from localStorage. Resetting storage.', error);
+    localStorage.removeItem(LEGACY_PROJECTS_STORAGE_KEY);
+    return null;
+  }
+};
+
+export const clearLegacyProjectsInLocalStorage = (): void => {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(LEGACY_PROJECTS_STORAGE_KEY);
+  }
+};

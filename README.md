@@ -15,8 +15,9 @@ This repository contains the current prototype application and the minimum backe
 - React + Vite frontend
 - Integrated Node server for local development and simple deployment
 - Server-side AI proxy endpoint at `/api/ai/generate`
+- Server-side project persistence endpoint at `/api/projects`
 - Deterministic statistical execution engine in the app
-- Browser-based project persistence for POC use via IndexedDB
+- Local disk-backed project persistence for POC use
 - Evidence CoPilot branding and report export
 
 ## Current Architecture
@@ -25,24 +26,58 @@ This repository contains the current prototype application and the minimum backe
 flowchart LR
     U["User Browser"] --> FE["React/Vite Frontend"]
     FE --> API["Node Backend /api/ai/generate"]
+    FE --> PAPI["Node Backend /api/projects"]
     API --> LLM["LLM Provider"]
-    FE --> IDX["IndexedDB (POC only)"]
+    PAPI --> LDS["Local Disk Project Store (.app-data/projects.json)"]
     FE --> EXP["HTML Exports"]
 ```
 
 Current implementation notes:
 - The frontend calls the backend for AI interactions.
+- The frontend also calls the backend for project persistence.
 - The backend currently uses Google Gemini in `server/index.js`.
 - Deterministic statistics are executed locally in app logic, not by the model.
-- Project state is stored in browser IndexedDB for prototype testing.
+- Project state is currently stored on local disk through the backend project store.
+- Legacy browser IndexedDB/localStorage state is migrated forward on first load when available.
+
+## Working Status
+
+### Fully working in this repository
+
+- local development and production-style local run
+- Evidence CoPilot frontend and integrated Node backend
+- backend AI proxy pattern
+- backend-backed local project persistence
+- ingestion, QC, mapping, Autopilot, Statistical Analysis, AI Chat
+- deterministic statistical execution
+- HTML report export
+- local-first prototype testing with no cloud dependency
+
+### Partially implemented / enterprise-ready seams only
+
+- J&J enterprise authentication and authorization
+- AWS-managed storage and metadata services
+- Azure OpenAI GPT-5 provider implementation
+- async worker architecture for heavy background jobs
+- immutable enterprise audit trail and governed retention model
+- multi-user shared persistence and access enforcement
+
+### What “partially implemented” means here
+
+These areas are prepared architecturally but not fully wired to real enterprise services yet:
+- the app already uses backend endpoints rather than browser-only storage
+- AI calls already flow through a backend boundary
+- access control is centralized and can be reconnected to SSO later
+- storage and provider swaps can happen server-side without redesigning the frontend
 
 ## Repository Structure
 
 - `/components` UI modules
 - `/services/geminiService.ts` frontend service layer for AI and deterministic workflows
 - `/server/index.js` integrated backend server and AI proxy
+- `/server/projectStore.js` local disk-backed project persistence adapter
 - `/utils/statisticsEngine.ts` deterministic analysis execution
-- `/utils/projectStorage.ts` browser persistence
+- `/utils/projectStorage.ts` frontend project persistence client and legacy migration helpers
 - `/public` static assets including the Evidence CoPilot logo
 
 ## Local Reproduction
@@ -94,16 +129,17 @@ A colleague can reproduce:
 - the application code
 - UI behavior
 - AI proxy pattern
+- backend-backed local persistence behavior
 - deterministic analytics behavior
 - export/report generation
 
 A colleague cannot reproduce automatically:
-- your browser-stored projects
+- your local `.app-data/projects.json`
 - uploaded source files
 - local `.env.local`
 - your saved chat history and runs
 
-For shared testing, import the same datasets and recreate the same environment variables.
+For shared testing, import the same datasets and recreate the same environment variables. If you want to share the exact local project state, you must also transfer the local backend persistence file under `.app-data/`.
 
 ## POC vs Enterprise
 
@@ -114,9 +150,14 @@ The current codebase is suitable for pilot testing, not regulated production.
 POC characteristics:
 - everyone has full access in the app
 - auth is intentionally simplified
-- project data is stored in the browser
+- project data is stored in a local backend file store
 - some frontend dependencies are loaded from CDN in `index.html`
 - the backend is a lightweight integrated Node server
+
+What is already better than the earlier prototype:
+- project state is no longer browser-only
+- the frontend already depends on backend APIs for both AI and project persistence
+- this makes the enterprise migration path cleaner
 
 ### Enterprise target state
 
@@ -146,7 +187,7 @@ Recommended options:
 Recommendation for this repo:
 - keep the frontend as a static React build
 - move the current integrated backend into a dedicated API service
-- avoid depending on browser persistence for enterprise use
+- replace the current local disk store with managed enterprise persistence
 
 ### Backend
 
@@ -164,7 +205,7 @@ Move the following server-side for enterprise use:
 
 ### Data persistence
 
-Replace browser IndexedDB with managed backend persistence:
+Replace the current local disk project store with managed backend persistence:
 - `S3` for uploaded raw files, standardized files, generated exports
 - `RDS PostgreSQL` for:
   - projects
@@ -327,7 +368,7 @@ Before enterprise rollout, the following should be treated as required:
 
 This repo is a strong prototype, but the following are still recommended before production:
 
-- move project/session persistence out of IndexedDB
+- replace the local disk project store with S3 + RDS backed persistence
 - move large-file processing and multi-file jobs fully server-side
 - add durable audit trail in database
 - add approval workflow for AI-assisted mapping and confirmatory runs
@@ -425,7 +466,7 @@ npm run start
 
 The cleanest enterprise migration path is:
 1. keep the frontend contract stable
-2. move persistence and jobs server-side
+2. keep persistence server-side, but swap the local disk adapter for S3/RDS
 3. swap only the backend AI provider first
 4. integrate enterprise auth second
 5. harden audit/provenance third
