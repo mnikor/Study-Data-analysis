@@ -15,6 +15,7 @@ const root = path.resolve(__dirname, '..');
 const distDir = path.resolve(root, 'dist');
 const isProduction = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || 3000);
+const fastApiBaseUrl = process.env.ECP_FASTAPI_URL || 'http://127.0.0.1:8000';
 const projectStore = createProjectStore(root);
 
 const env = loadEnv(isProduction ? 'production' : 'development', root, '');
@@ -68,6 +69,43 @@ const sendJson = (res, statusCode, payload) => {
     'Cache-Control': 'no-store',
   });
   res.end(JSON.stringify(payload));
+};
+
+const readRawBody = async (req) => {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+};
+
+const proxyFastApiRequest = async (req, res, url) => {
+  const targetUrl = new URL(`${fastApiBaseUrl}${url.pathname}${url.search}`);
+  const headers = new Headers();
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (!value || ['host', 'connection', 'content-length'].includes(key.toLowerCase())) continue;
+    if (Array.isArray(value)) {
+      value.forEach((entry) => headers.append(key, entry));
+    } else {
+      headers.set(key, value);
+    }
+  }
+
+  const method = req.method || 'GET';
+  const hasBody = !['GET', 'HEAD'].includes(method.toUpperCase());
+  const body = hasBody ? await readRawBody(req) : undefined;
+
+  const response = await fetch(targetUrl, {
+    method,
+    headers,
+    body: hasBody ? body : undefined,
+  });
+
+  const responseBody = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get('content-type') || 'application/json; charset=utf-8';
+  res.writeHead(response.status, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
+  res.end(responseBody);
 };
 
 const resolvePythonBinary = () => {
@@ -338,6 +376,17 @@ const start = async () => {
 
     if (url.pathname === '/api/ingestion/parse-sas') {
       await handleSasParse(req, res);
+      return;
+    }
+
+    if (url.pathname.startsWith('/api/v1/')) {
+      try {
+        await proxyFastApiRequest(req, res, url);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'FastAPI proxy request failed.';
+        console.error('FastAPI proxy error', error);
+        sendJson(res, 502, { error: message });
+      }
       return;
     }
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   Bot,
@@ -60,12 +60,14 @@ import {
   LinkedWorkspaceBuildResult,
 } from '../utils/linkedAnalysisWorkspace';
 import { formatComparisonLabel } from '../utils/displayNames';
+import { assessAutopilotQuestionMatch } from '../utils/autopilotQuestionMatch';
 import { Chart } from './Chart';
 
 type StepKey = 'qc' | 'cleaning' | 'mapping' | 'transform' | 'plan' | 'analysis';
 type StepStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'SKIPPED';
 type ResultDetailView = 'CHART' | 'TABLE';
 type ExperienceMode = 'EXPLORE_FAST' | 'RUN_CONFIRMED';
+const CURRENT_RUN_SENTINEL = '__CURRENT_RUN__';
 
 interface StepState {
   status: StepStatus;
@@ -116,6 +118,68 @@ const defaultStepState = (): Record<StepKey, StepState> => ({
   plan: { status: 'PENDING', detail: 'Waiting' },
   analysis: { status: 'PENDING', detail: 'Waiting' },
 });
+
+const deriveSavedStepState = (session: AnalysisSession | null): Record<StepKey, StepState> => {
+  if (!session) return defaultStepState();
+
+  const review = session.params.autopilotReview;
+  if (!review) {
+    return {
+      qc: { status: 'DONE', detail: 'Saved result restored' },
+      cleaning: { status: 'SKIPPED', detail: 'No saved cleaning summary' },
+      mapping: { status: 'SKIPPED', detail: 'No saved mapping summary' },
+      transform: { status: 'DONE', detail: `Saved ${session.params.fileName}` },
+      plan: { status: 'SKIPPED', detail: 'No saved protocol summary' },
+      analysis: { status: 'DONE', detail: 'Saved analysis result restored' },
+    };
+  }
+
+  const qcFailed = review.qc.blockingIssueCount > 0 || review.qc.status === 'FAIL';
+  const cleaningDetail =
+    review.qc.autoFixSummary ||
+    (review.qc.autoFixableIssueCount > 0 ? 'Auto-fix suggestions were prepared.' : 'No auto-cleaning was needed.');
+  const questionMismatch =
+    session.params.autopilotQuestionMatchStatus === 'FAILED'
+      ? session.params.autopilotQuestionMatchSummary || 'Saved result did not match the original question.'
+      : null;
+
+  return {
+    qc: {
+      status: qcFailed ? 'FAILED' : 'DONE',
+      detail: `${review.qc.issueCount} issue(s), ${review.qc.autoFixableIssueCount} auto-fixable`,
+    },
+    cleaning: {
+      status: review.qc.autoFixableIssueCount > 0 || review.qc.autoFixSummary ? 'DONE' : 'SKIPPED',
+      detail: cleaningDetail,
+    },
+    mapping: {
+      status: review.mapping ? 'DONE' : 'SKIPPED',
+      detail: review.mapping
+        ? `${review.mapping.mappedColumnCount} column(s) mapped to ${review.mapping.targetDomain}`
+        : 'No saved mapping spec for this run',
+    },
+    transform: {
+      status: 'DONE',
+      detail: `Saved ${session.params.fileName}`,
+    },
+    plan: {
+      status: review.protocol ? 'DONE' : 'SKIPPED',
+      detail: review.protocol
+        ? `${review.protocol.extractedPlanCount} protocol/SAP item(s) extracted`
+        : review.analysisPlan.mode === 'SINGLE'
+        ? 'Single-question run without protocol extraction'
+        : 'No protocol/SAP document used',
+    },
+    analysis: {
+      status: questionMismatch ? 'FAILED' : 'DONE',
+      detail:
+        questionMismatch ||
+        `${review.analysisPlan.tasks.length} task(s) completed${
+          review.analysisPlan.multiplicityMethod ? ` with ${review.analysisPlan.multiplicityMethod}` : ''
+        }`,
+    },
+  };
+};
 
 const normalize = (value: string) => value.trim().toLowerCase();
 const baseName = (name: string) => name.replace(/\.[^/.]+$/, '');
@@ -236,6 +300,11 @@ const buildDefaultRunName = (
     return `Linked Analysis Pack - ${linkedLabel}`;
   }
   return isConfirmedRun ? `Run Confirmed - ${sourceLabel}` : `Analysis Pack - ${sourceLabel}`;
+};
+
+const getQuestionMatchBadgeClass = (status: AnalysisSession['params']['autopilotQuestionMatchStatus']) => {
+  if (status === 'FAILED') return 'border-red-200 bg-red-50 text-red-700';
+  return 'border-emerald-200 bg-emerald-50 text-emerald-700';
 };
 
 const renderTableCell = (value: string | number | undefined) => {
@@ -478,10 +547,13 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [runLog, setRunLog] = useState<string[]>([]);
+  const runLogRef = useRef<string[]>([]);
   const [stepState, setStepState] = useState<Record<StepKey, StepState>>(defaultStepState());
   const [selectedRunId, setSelectedRunId] = useState('');
   const [selectedResultId, setSelectedResultId] = useState('');
   const [resultDetailView, setResultDetailView] = useState<ResultDetailView>('CHART');
+  const [isCreatingNewAnalysis, setIsCreatingNewAnalysis] = useState(false);
+  const [showWorkflowPanels, setShowWorkflowPanels] = useState(false);
   const [isEditingRunName, setIsEditingRunName] = useState(false);
   const [runNameDraft, setRunNameDraft] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -608,17 +680,68 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           modeLabel: getModeLabel(mode),
           scopeLabel: getScopeLabel(first.params.autopilotDataScope),
           workflowMode: first.usageMode,
-          questionPreview: first.params.autopilotQuestion || first.name,
+          questionPreview:
+            first.params.autopilotQuestionMatchStatus === 'FAILED'
+              ? `${first.params.autopilotQuestionMatchSummary || 'Question mismatch'} ${first.params.autopilotQuestion || first.name}`
+              : first.params.autopilotQuestion || first.name,
         };
       })
       .sort((a, b) => new Date(b.latestTimestamp).getTime() - new Date(a.latestTimestamp).getTime());
   }, [sessions]);
 
-  const selectedRun = autopilotRuns.find((run) => run.runId === selectedRunId) || autopilotRuns[0] || null;
+  const selectedRun =
+    selectedRunId === CURRENT_RUN_SENTINEL
+      ? null
+      : autopilotRuns.find((run) => run.runId === selectedRunId) || (!selectedRunId ? autopilotRuns[0] || null : null);
   const selectedRunResults = selectedRun?.sessions || [];
   const selectedResult = selectedRunResults.find((session) => session.id === selectedResultId) || selectedRunResults[0] || null;
   const activeResultTable = selectedResult?.tableConfig;
   const activeReview = selectedResult?.params.autopilotReview || null;
+  const displayedStepState = useMemo(
+    () => (isRunning ? stepState : deriveSavedStepState(selectedResult)),
+    [isRunning, stepState, selectedResult]
+  );
+  const displayedRunLog = useMemo(() => {
+    if (isRunning) return runLog;
+
+    const persistedLog = selectedRunResults.reduce<string[]>((best, session) => {
+      const candidate = session.params.autopilotExecutionLog || [];
+      return candidate.length > best.length ? candidate : best;
+    }, []);
+    if (persistedLog.length > 0) return persistedLog;
+
+    if (!selectedRun || !selectedResult) return [];
+
+    const review = selectedResult.params.autopilotReview;
+    const fallbackLog = [
+      `[Saved] Restored run "${selectedRun.runName}".`,
+      `[Saved] ${selectedRun.analysisCount} analysis result(s) saved on ${formatTimestamp(selectedRun.latestTimestamp)}.`,
+    ];
+
+    if (review) {
+      fallbackLog.push(
+        `[Saved] QC: ${review.qc.status} with ${review.qc.issueCount} issue(s) and ${review.qc.autoFixableIssueCount} auto-fixable finding(s).`
+      );
+      if (review.mapping) {
+        fallbackLog.push(
+          `[Saved] Mapping: ${review.mapping.mappedColumnCount} column(s) mapped to ${review.mapping.targetDomain}.`
+        );
+      }
+      if (review.workspace) {
+        fallbackLog.push(
+          `[Saved] Workspace: ${review.workspace.rowCount} row(s), ${review.workspace.columnCount} column(s), join key ${review.workspace.joinKey}.`
+        );
+      }
+      if (review.protocol) {
+        fallbackLog.push(
+          `[Saved] Protocol/SAP: ${review.protocol.extractedPlanCount} plan item(s) extracted from ${review.protocol.documentName}.`
+        );
+      }
+      fallbackLog.push(`[Saved] Analysis plan: ${review.analysisPlan.tasks.length} task(s) were completed.`);
+    }
+
+    return fallbackLog;
+  }, [isRunning, runLog, selectedRun, selectedResult, selectedRunResults]);
 
   const updateStep = (key: StepKey, status: StepStatus, detail: string) => {
     setStepState((prev) => ({ ...prev, [key]: { status, detail } }));
@@ -626,7 +749,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
 
   const appendLog = (line: string) => {
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    setRunLog((prev) => [...prev, `[${ts}] ${line}`]);
+    const entry = `[${ts}] ${line}`;
+    runLogRef.current = [...runLogRef.current, entry];
+    setRunLog(runLogRef.current);
   };
 
   const buildDefaultQuestion = () =>
@@ -640,10 +765,14 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     if (autopilotRuns.length === 0) {
       setSelectedRunId('');
       setSelectedResultId('');
+      setIsCreatingNewAnalysis(true);
       return;
     }
 
-    setSelectedRunId((prev) => (autopilotRuns.some((run) => run.runId === prev) ? prev : autopilotRuns[0].runId));
+    setSelectedRunId((prev) => {
+      if (prev === CURRENT_RUN_SENTINEL) return prev;
+      return autopilotRuns.some((run) => run.runId === prev) ? prev : autopilotRuns[0].runId;
+    });
   }, [autopilotRuns, isRunning]);
 
   useEffect(() => {
@@ -670,6 +799,29 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     setSelectedSupportingIds((prev) =>
       prev.includes(fileId) ? prev.filter((id) => id !== fileId) : [...prev, fileId]
     );
+  };
+
+  const selectAllSupportingFiles = () => {
+    setSelectedSupportingIds(supportingSourceFiles.map((file) => file.id));
+  };
+
+  const clearSupportingFiles = () => {
+    setSelectedSupportingIds([]);
+  };
+
+  const startNewAnalysis = () => {
+    setIsCreatingNewAnalysis(true);
+    setRunError(null);
+    setSelectedRunId(CURRENT_RUN_SENTINEL);
+    setSelectedResultId('');
+    setShowWorkflowPanels(false);
+  };
+
+  const closeNewAnalysis = () => {
+    if (isRunning || autopilotRuns.length === 0) return;
+    setIsCreatingNewAnalysis(false);
+    setRunError(null);
+    setSelectedRunId((prev) => (prev === CURRENT_RUN_SENTINEL ? autopilotRuns[0]?.runId || '' : prev));
   };
 
   useEffect(() => {
@@ -733,6 +885,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     const plotId = `plot-${session.id}`;
     const variables = formatVariablesForDisplay(session.params.var1, session.params.var2);
     const linkedSources = session.params.autopilotSourceNames?.length ? session.params.autopilotSourceNames.join(', ') : session.params.autopilotSourceName || '';
+    const questionMismatch = session.params.autopilotQuestionMatchStatus === 'FAILED';
 
     return `
       <!DOCTYPE html>
@@ -786,6 +939,15 @@ export const Autopilot: React.FC<AutopilotProps> = ({
               ${
                 session.params.autopilotQuestion
                   ? `<div class="question">${escapeHtml(session.params.autopilotQuestion)}</div>`
+                  : ''
+              }
+              ${
+                session.params.autopilotQuestionMatchSummary
+                  ? `<div style="margin-top:14px;border:1px solid ${
+                      questionMismatch ? '#fecaca' : '#bbf7d0'
+                    };background:${questionMismatch ? '#fef2f2' : '#f0fdf4'};color:${questionMismatch ? '#991b1b' : '#166534'};border-radius:14px;padding:12px 14px;font-size:14px;">${escapeHtml(
+                      session.params.autopilotQuestionMatchSummary
+                    )}</div>`
                   : ''
               }
             </div>
@@ -860,6 +1022,19 @@ export const Autopilot: React.FC<AutopilotProps> = ({
                 : ''
             }
 
+            ${
+              session.params.autopilotQuestionMatchDetails && session.params.autopilotQuestionMatchDetails.length > 0
+                ? `
+              <div class="section">
+                <div class="section-title">Question Match Review</div>
+                <ul class="muted">${session.params.autopilotQuestionMatchDetails
+                  .map((item) => `<li>${escapeHtml(item)}</li>`)
+                  .join('')}</ul>
+              </div>
+            `
+                : ''
+            }
+
             ${renderHtmlDataTable(session.tableConfig)}
             ${renderReviewBundleMarkup(session.params.autopilotReview || null)}
 
@@ -898,6 +1073,19 @@ export const Autopilot: React.FC<AutopilotProps> = ({
                 <div style="margin-top:8px;font-size:22px;line-height:1.3;font-weight:800;color:#0f172a;">${escapeHtml(
                   session.params.autopilotQuestion || session.name
                 )}</div>
+                ${
+                  session.params.autopilotQuestionMatchSummary
+                    ? `<div style="margin-top:10px;border:1px solid ${
+                        session.params.autopilotQuestionMatchStatus === 'FAILED' ? '#fecaca' : '#bbf7d0'
+                      };background:${
+                        session.params.autopilotQuestionMatchStatus === 'FAILED' ? '#fef2f2' : '#f0fdf4'
+                      };color:${
+                        session.params.autopilotQuestionMatchStatus === 'FAILED' ? '#991b1b' : '#166534'
+                      };border-radius:12px;padding:10px 12px;font-size:13px;">${escapeHtml(
+                        session.params.autopilotQuestionMatchSummary
+                      )}</div>`
+                    : ''
+                }
                 <div style="margin-top:6px;font-size:14px;color:#64748b;">${escapeHtml(session.params.testType)} | ${escapeHtml(
           variables
         )}</div>
@@ -1302,7 +1490,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     }
 
     setRunError(null);
+    runLogRef.current = [];
     setRunLog([]);
+    setSelectedRunId(CURRENT_RUN_SENTINEL);
     setSelectedResultId('');
     setStepState(defaultStepState());
     setIsRunning(true);
@@ -1595,8 +1785,30 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             task.testType,
             task.var1,
             task.var2,
-            task.concept || null
+            task.concept || null,
+            {
+              question: task.question,
+              sourceFiles:
+                analysisScope === 'LINKED_WORKSPACE'
+                  ? [transformedFile, ...selectedSupportingFiles]
+                  : [analysisFile],
+              covariates: task.covariates || [],
+              imputationMethod: task.imputationMethod,
+              applyPSM: Boolean(task.applyPSM),
+            }
           );
+          const questionMatch = assessAutopilotQuestionMatch(task.question, result, {
+            analysisScope,
+            analysisMode,
+            testType: task.testType,
+            var1: task.var1,
+            var2: task.var2,
+          });
+          if (questionMatch.status === 'FAILED') {
+            appendLog(`Rejected analysis ${index + 1}: ${questionMatch.summary}`);
+            questionMatch.details.forEach((detail) => appendLog(`  - ${detail}`));
+            continue;
+          }
           const enrichedResult: StatAnalysisResult = { ...result, sasCode: sasCode || undefined };
 
           createdSessions.push({
@@ -1634,6 +1846,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
               autopilotDataScope: analysisScope,
               autopilotWorkspaceFileId: analysisScope === 'LINKED_WORKSPACE' ? analysisFile.id : null,
               autopilotWorkspaceFileName: analysisScope === 'LINKED_WORKSPACE' ? analysisFile.name : null,
+              autopilotQuestionMatchStatus: questionMatch.status,
+              autopilotQuestionMatchSummary: questionMatch.summary,
+              autopilotQuestionMatchDetails: questionMatch.details,
             },
             ...enrichedResult,
           });
@@ -1644,7 +1859,11 @@ export const Autopilot: React.FC<AutopilotProps> = ({
 
       if (createdSessions.length === 0) {
         updateStep('analysis', 'FAILED', 'All planned analyses failed');
-        throw new Error('Autopilot could not complete any planned analysis successfully.');
+        throw new Error(
+          analysisMode === 'SINGLE'
+            ? 'Autopilot could not execute an analysis that actually matched the requested question. Refine the question or use datasets that support the requested endpoint and estimands.'
+            : 'Autopilot could not complete any planned analysis successfully.'
+        );
       }
 
       const reviewBundle: AutopilotReviewBundle = {
@@ -1737,12 +1956,20 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           ? applyBenjaminiHochbergAdjustments(createdSessions)
           : createdSessions;
 
+      updateStep('analysis', 'DONE', `${createdSessions.length} of ${tasks.length} analyses completed`);
+      if (analysisScope === 'LINKED_WORKSPACE' && createdSessions.some((session) => session.metrics.adjusted_p_value)) {
+        appendLog('Applied Benjamini-Hochberg FDR adjustment across exploratory linked-workspace results.');
+      }
+      appendLog(`Autopilot completed successfully. ${createdSessions.length} analysis session(s) saved.`);
+      const persistedExecutionLog = [...runLogRef.current];
+
       const finalSessions = await Promise.all(
         adjustedSessions.map(async (session) => ({
           ...session,
           params: {
             ...session.params,
             autopilotReview: reviewBundle,
+            autopilotExecutionLog: persistedExecutionLog,
           },
           aiCommentary: await generateClinicalCommentary(session, {
             question: session.params.autopilotQuestion || '',
@@ -1765,6 +1992,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       setSelectedResultId(finalSessions[0].id);
       setResultDetailView('CHART');
       setRunNameDraft(runName);
+      setIsCreatingNewAnalysis(false);
 
       onRecordProvenance({
         id: crypto.randomUUID(),
@@ -1783,11 +2011,6 @@ export const Autopilot: React.FC<AutopilotProps> = ({
         outputs: finalSessions.map((session) => session.id),
       });
 
-      updateStep('analysis', 'DONE', `${finalSessions.length} of ${tasks.length} analyses completed`);
-      if (analysisScope === 'LINKED_WORKSPACE' && finalSessions.some((session) => session.metrics.adjusted_p_value)) {
-        appendLog('Applied Benjamini-Hochberg FDR adjustment across exploratory linked-workspace results.');
-      }
-      appendLog(`Autopilot completed successfully. ${finalSessions.length} analysis session(s) saved.`);
     } catch (e: any) {
       const message = e?.message || 'Autopilot failed.';
       appendLog(`ERROR: ${message}`);
@@ -1796,6 +2019,788 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       setIsRunning(false);
     }
   };
+
+  const hasAutopilotSessions = sessions.some((session) => session.params.autopilotRunId);
+  const reviewMode = Boolean(selectedRun || isRunning || runError || hasAutopilotSessions);
+  const logHeightClass = reviewMode ? 'h-40' : 'h-56';
+  const showControlPanels =
+    !reviewMode || isCreatingNewAnalysis || isRunning || Boolean(runError) || showWorkflowPanels;
+
+  const runBrowserSection =
+    autopilotRuns.length > 0 ? (
+      <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-4">
+          <div>
+            <h3 className="font-bold text-slate-800 flex items-center">
+              <FolderOpen className="w-4 h-4 mr-2 text-indigo-600" />
+              Saved Runs
+            </h3>
+            <p className="text-sm text-slate-500 mt-1">Switch between previous runs without scrolling away from the current result.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+              {autopilotRuns.length} run{autopilotRuns.length === 1 ? '' : 's'}
+            </span>
+            <button
+              onClick={() => setShowWorkflowPanels((prev) => !prev)}
+              className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              <FileText className="w-4 h-4 mr-2" />
+              {showWorkflowPanels ? 'Hide Workflow & Log' : 'Show Workflow & Log'}
+            </button>
+            <button
+              onClick={isCreatingNewAnalysis ? closeNewAnalysis : startNewAnalysis}
+              disabled={isRunning && isCreatingNewAnalysis}
+              className={`inline-flex items-center justify-center rounded-xl px-4 py-2 text-sm font-semibold ${
+                isCreatingNewAnalysis
+                  ? 'border border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+                  : 'bg-indigo-600 text-white hover:bg-indigo-700'
+              } ${isRunning && isCreatingNewAnalysis ? 'cursor-not-allowed opacity-60' : ''}`}
+            >
+              {isCreatingNewAnalysis ? (
+                <>
+                  <X className="w-4 h-4 mr-2" />
+                  Close New Analysis
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4 mr-2" />
+                  New Analysis
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+        <div className="flex gap-3 overflow-x-auto pb-1">
+          {autopilotRuns.map((run) => (
+            <button
+              key={run.runId}
+              onClick={() => {
+                setSelectedRunId(run.runId);
+                setSelectedResultId('');
+                setIsCreatingNewAnalysis(false);
+              }}
+              className={`shrink-0 w-[320px] text-left rounded-2xl border p-4 transition-colors ${
+                selectedRun?.runId === run.runId
+                  ? 'border-indigo-300 bg-indigo-50'
+                  : 'border-slate-200 bg-white hover:bg-slate-50'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-slate-800 line-clamp-2">{run.runName}</div>
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
+                  {run.analysisCount} analysis{run.analysisCount === 1 ? '' : 'es'}
+                </span>
+              </div>
+              <div className="text-xs text-slate-500 mt-2">{run.modeLabel} | {run.scopeLabel}</div>
+              <div className="text-xs text-slate-600 mt-2 line-clamp-2">{run.questionPreview}</div>
+              <div className="text-[11px] text-slate-400 mt-3">Updated {formatTimestamp(run.latestTimestamp)}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    ) : null;
+
+  const controlPanels = (
+    <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)] gap-6 items-start">
+      <div className="space-y-6">
+        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
+          <div>
+            <h3 className="font-bold text-slate-800">Configuration</h3>
+            <p className="text-sm text-slate-500 mt-1">Autopilot saves each completed analysis as a normal Statistical Analysis session.</p>
+          </div>
+
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Path</div>
+            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
+              <button
+                onClick={() => setExperienceMode('EXPLORE_FAST')}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  experienceMode === 'EXPLORE_FAST' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                Explore Fast
+              </button>
+              <button
+                onClick={() => setExperienceMode('RUN_CONFIRMED')}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  experienceMode === 'RUN_CONFIRMED' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                Run Confirmed
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Analysis Scope</div>
+            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
+              <button
+                onClick={() => setAnalysisScope('SINGLE_DATASET')}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  analysisScope === 'SINGLE_DATASET' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                Single Dataset
+              </button>
+              <button
+                onClick={() => setAnalysisScope('LINKED_WORKSPACE')}
+                disabled={experienceMode === 'RUN_CONFIRMED'}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  analysisScope === 'LINKED_WORKSPACE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
+              >
+                Linked Workspace
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Mode</div>
+            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
+              <button
+                onClick={() => setAnalysisMode('PACK')}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  analysisMode === 'PACK' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                Analysis Pack
+              </button>
+              <button
+                onClick={() => setAnalysisMode('SINGLE')}
+                disabled={experienceMode === 'RUN_CONFIRMED'}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  analysisMode === 'SINGLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
+              >
+                One Question
+              </button>
+            </div>
+          </div>
+
+          {experienceMode === 'RUN_CONFIRMED' ? (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700 mb-1">Run Confirmed Checklist</div>
+              <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
+              <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
+              <ul className="mt-3 space-y-2 text-sm text-slate-700">
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${selectedProtocol ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                  <span>{selectedProtocol ? `Protocol selected: ${selectedProtocol.name}` : 'Select a Protocol or SAP document.'}</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisMode === 'PACK' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                  <span>Run Confirmed uses Analysis Pack only.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisScope === 'SINGLE_DATASET' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                  <span>Run Confirmed currently supports single-dataset protocol-driven runs.</span>
+                </li>
+              </ul>
+              {confirmedBlockingReason && (
+                <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                  {confirmedBlockingReason}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600 mb-1">Explore Fast</div>
+              <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
+              <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Source Dataset</label>
+            <select
+              value={selectedSourceId}
+              onChange={(e) => setSelectedSourceId(e.target.value)}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+            >
+              <option value="">-- Select dataset --</option>
+              {sourceFiles.map((file) => (
+                <option key={file.id} value={file.id}>
+                  {file.name} ({file.type})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {analysisScope === 'LINKED_WORKSPACE' && (
+            <div>
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <label className="block text-xs font-semibold text-slate-500 uppercase">Supporting Datasets</label>
+                <div className="text-[11px] text-slate-400">
+                  {selectedSupportingIds.length}/{supportingSourceFiles.length} selected
+                </div>
+              </div>
+              {supportingSourceFiles.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-2">
+                  <button
+                    onClick={selectAllSupportingFiles}
+                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    onClick={clearSupportingFiles}
+                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-100"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
+              <div className="rounded-xl border border-slate-200 bg-slate-50 max-h-52 overflow-y-auto divide-y divide-slate-200">
+                {supportingSourceFiles.length === 0 ? (
+                  <div className="p-3 text-sm text-slate-500">Choose a source dataset first to unlock supporting datasets.</div>
+                ) : (
+                  supportingSourceFiles.map((file) => (
+                    <label key={file.id} className="flex items-start gap-3 p-3 cursor-pointer hover:bg-white">
+                      <input
+                        type="checkbox"
+                        checked={selectedSupportingIds.includes(file.id)}
+                        onChange={() => toggleSupportingFile(file.id)}
+                        className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-slate-800 break-words">{file.name}</div>
+                        <div className="text-xs text-slate-500">{file.type}</div>
+                      </div>
+                    </label>
+                  ))
+                )}
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                Linked workspace mode creates a subject-level analysis table using shared subject identifiers such as `USUBJID`.
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Reference Mapping (Optional)</label>
+            <select
+              value={selectedReferenceId}
+              onChange={(e) => setSelectedReferenceId(e.target.value)}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+            >
+              <option value="">-- None --</option>
+              {referenceFiles.map((file) => (
+                <option key={file.id} value={file.id}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">
+              Protocol/SAP {experienceMode === 'RUN_CONFIRMED' ? '(Required)' : '(Optional)'}
+            </label>
+            <select
+              value={selectedProtocolId}
+              onChange={(e) => setSelectedProtocolId(e.target.value)}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+            >
+              <option value="">-- None --</option>
+              {protocolFiles.map((file) => (
+                <option key={file.id} value={file.id}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Target Domain</label>
+            <input
+              type="text"
+              value={targetDomain}
+              onChange={(e) => setTargetDomain(e.target.value.toUpperCase())}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm font-mono"
+              placeholder="DM"
+            />
+          </div>
+
+          {analysisMode === 'SINGLE' ? (
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Analysis Question</label>
+              <textarea
+                value={analysisQuestion}
+                onChange={(e) => setAnalysisQuestion(e.target.value)}
+                rows={4}
+                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+                placeholder={`Example: ${buildDefaultQuestion()}`}
+              />
+            </div>
+          ) : (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+              Leave Autopilot in pack mode when you want several analyses created and saved together, similar to a mini workbench.
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Synonyms (Optional)</label>
+            <input
+              value={customSynonyms}
+              onChange={(e) => setCustomSynonyms(e.target.value)}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+              placeholder="rash, dermatitis, erythema"
+            />
+          </div>
+
+          <label className="flex items-center space-x-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={generateSasDraft}
+              onChange={(e) => setGenerateSasDraft(e.target.checked)}
+              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="text-sm text-slate-600">Generate SAS validation draft</span>
+          </label>
+
+          <button
+            onClick={runAutopilot}
+            disabled={
+              isRunning ||
+              !selectedSource ||
+              (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
+              Boolean(confirmedBlockingReason)
+            }
+            className={`w-full py-3 rounded-xl font-bold text-white flex items-center justify-center ${
+              isRunning ||
+              !selectedSource ||
+              (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
+              Boolean(confirmedBlockingReason)
+                ? 'bg-slate-300 cursor-not-allowed'
+                : 'bg-indigo-600 hover:bg-indigo-700'
+            }`}
+          >
+            {isRunning ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
+            {isRunning ? 'Running Autopilot...' : runMode.button}
+          </button>
+        </div>
+
+      </div>
+
+      <div className="space-y-6 min-w-0">
+        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-bold text-slate-800 flex items-center">
+              <Sparkles className="w-4 h-4 mr-2 text-indigo-600" />
+              Workflow Status
+            </h3>
+            {reviewMode && (
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                Secondary panel in review mode
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {STEP_ORDER.map((step) => (
+              <div
+                key={step.key}
+                className={`border rounded-xl px-3 py-2 text-sm ${stepStatusClass[displayedStepState[step.key].status]}`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold">{step.label}</span>
+                  <StepIcon status={displayedStepState[step.key].status} />
+                </div>
+                <div className="text-xs mt-1 opacity-90">{displayedStepState[step.key].detail}</div>
+              </div>
+            ))}
+          </div>
+          {runError && (
+            <div className="mt-4 border border-red-200 bg-red-50 text-red-700 rounded-xl p-3 text-sm">
+              {runError}
+            </div>
+          )}
+        </div>
+
+        <div className="bg-[#111827] border border-slate-700 rounded-2xl overflow-hidden shadow-sm">
+          <div className="px-4 py-3 border-b border-slate-700 text-slate-200 text-sm font-semibold flex items-center justify-between">
+            <div className="flex items-center">
+              <FileText className="w-4 h-4 mr-2" />
+              Autopilot Log
+            </div>
+            {reviewMode && <span className="text-[11px] uppercase tracking-wide text-slate-400">Reference</span>}
+          </div>
+          <div className={`p-4 ${logHeightClass} overflow-y-auto font-mono text-xs text-slate-300 space-y-1`}>
+            {displayedRunLog.length === 0 && <div className="text-slate-500">No execution logs yet.</div>}
+            {displayedRunLog.map((line, idx) => (
+              <div key={idx}>{line}</div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const workspaceSection = (
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm min-w-0">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
+        <div>
+          <h3 className="font-bold text-slate-800 flex items-center">
+            <BarChart3 className="w-4 h-4 mr-2 text-indigo-600" />
+            Autopilot Workspace
+          </h3>
+          <p className="text-sm text-slate-500 mt-1">
+            Browse saved runs first, then compare the analyses inside the selected run.
+          </p>
+        </div>
+        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          {sessions.filter((session) => session.params.autopilotRunId).length} saved autopilot session{sessions.filter((session) => session.params.autopilotRunId).length === 1 ? '' : 's'}
+        </div>
+      </div>
+
+      {selectedRun && selectedResult ? (
+        <div className="space-y-5 min-w-0">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 md:col-span-2">
+              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-2">Run Name</div>
+              {isEditingRunName ? (
+                <div className="space-y-2">
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      value={runNameDraft}
+                      onChange={(e) => setRunNameDraft(e.target.value)}
+                      className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                      placeholder="Enter run name"
+                    />
+                    <button
+                      onClick={handleSaveRunName}
+                      className="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
+                    >
+                      <Save className="w-4 h-4 mr-2" />
+                      Save
+                    </button>
+                    <button
+                      onClick={() => {
+                        setRunNameDraft(selectedRun.runName);
+                        setIsEditingRunName(false);
+                        setRenameError(null);
+                      }}
+                      className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                    >
+                      <X className="w-4 h-4 mr-2" />
+                      Cancel
+                    </button>
+                  </div>
+                  {renameError && <div className="text-sm text-red-600">{renameError}</div>}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-lg font-semibold text-slate-800 break-words">{selectedRun.runName}</div>
+                  <button
+                    onClick={() => setIsEditingRunName(true)}
+                    className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 shrink-0"
+                  >
+                    <PencilLine className="w-4 h-4 mr-2" />
+                    Rename
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Type</div>
+              <div className="text-sm font-semibold text-slate-800 mt-1">{selectedRun.modeLabel}</div>
+              <div className="text-sm text-slate-500 mt-1">{selectedRun.scopeLabel}</div>
+              <div className="text-sm text-slate-500 mt-2">Updated {formatTimestamp(selectedRun.latestTimestamp)}</div>
+              <div className="mt-3">
+                <span
+                  className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
+                    selectedRun.workflowMode
+                  )}`}
+                >
+                  {getWorkflowLabel(selectedRun.workflowMode)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-800">Analyses in This Run</div>
+                <div className="text-sm text-slate-500">Select one result to review in detail below.</div>
+              </div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {selectedRun.analysisCount} saved result{selectedRun.analysisCount === 1 ? '' : 's'}
+              </div>
+            </div>
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+              {selectedRunResults.map((session, index) => (
+                <button
+                  key={session.id}
+                  onClick={() => {
+                    setSelectedResultId(session.id);
+                    setResultDetailView('CHART');
+                  }}
+                  className={`w-full text-left p-4 rounded-xl border transition-colors ${
+                    selectedResult.id === session.id
+                      ? 'border-indigo-300 bg-indigo-50'
+                      : 'border-slate-200 bg-white hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500 mb-1">
+                        Analysis {index + 1}
+                      </div>
+                      <div className="text-sm font-semibold text-slate-800 leading-6">
+                        {session.params.autopilotQuestion || formatVariablesForDisplay(session.params.var1, session.params.var2) || session.name}
+                      </div>
+                    </div>
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
+                      {session.params.testType}
+                    </div>
+                  </div>
+                  <div className="text-xs text-slate-500 mt-2">
+                    {formatVariablesForDisplay(session.params.var1, session.params.var2)}
+                  </div>
+                  {session.params.autopilotQuestionMatchSummary && (
+                    <div
+                      className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getQuestionMatchBadgeClass(
+                        session.params.autopilotQuestionMatchStatus
+                      )}`}
+                    >
+                      {session.params.autopilotQuestionMatchSummary}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="border border-slate-200 rounded-2xl p-5 min-w-0 bg-white">
+            <div className="flex flex-col 2xl:flex-row 2xl:items-start 2xl:justify-between gap-4 mb-4">
+              <div className="min-w-0">
+                <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Selected Result</div>
+                <div className="text-2xl font-bold text-slate-800 break-words">
+                  {`Autopilot - ${selectedResult.params.testType}: ${formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}`}
+                </div>
+                <div className="text-sm text-slate-500 mt-1">
+                  {selectedResult.params.testType} | {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
+                </div>
+                <div className="mt-3">
+                  <span
+                    className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
+                      selectedResult.usageMode
+                    )}`}
+                  >
+                    {getWorkflowLabel(selectedResult.usageMode)}
+                  </span>
+                </div>
+                {selectedResult.params.autopilotQuestion && (
+                  <div className="mt-3 rounded-xl bg-indigo-50 border border-indigo-100 p-3 text-sm text-indigo-950 max-w-3xl">
+                    {selectedResult.params.autopilotQuestion}
+                  </div>
+                )}
+                {selectedResult.params.autopilotQuestionMatchSummary && (
+                  <div
+                    className={`mt-3 rounded-xl border p-3 text-sm max-w-3xl ${getQuestionMatchBadgeClass(
+                      selectedResult.params.autopilotQuestionMatchStatus
+                    )}`}
+                  >
+                    <div className="font-semibold">{selectedResult.params.autopilotQuestionMatchSummary}</div>
+                    {selectedResult.params.autopilotQuestionMatchDetails &&
+                      selectedResult.params.autopilotQuestionMatchDetails.length > 0 && (
+                        <ul className="mt-2 list-disc pl-5 space-y-1">
+                          {selectedResult.params.autopilotQuestionMatchDetails.map((detail, index) => (
+                            <li key={`${selectedResult.id}-match-${index}`}>{detail}</li>
+                          ))}
+                        </ul>
+                      )}
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2 shrink-0">
+                <div className="inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1">
+                  <button
+                    onClick={() => setResultDetailView('CHART')}
+                    className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
+                      resultDetailView === 'CHART' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
+                    }`}
+                  >
+                    <BarChart3 className="w-4 h-4 mr-2" />
+                    Chart
+                  </button>
+                  <button
+                    onClick={() => setResultDetailView('TABLE')}
+                    disabled={!activeResultTable}
+                    className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
+                      resultDetailView === 'TABLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
+                    } ${!activeResultTable ? 'cursor-not-allowed opacity-50' : ''}`}
+                  >
+                    <Table2 className="w-4 h-4 mr-2" />
+                    Table
+                  </button>
+                </div>
+                <button
+                  onClick={handleExportSelectedResult}
+                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  <Download className="w-4 h-4 mr-2" />
+                  Export Result
+                </button>
+                <button
+                  onClick={handleExportRun}
+                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  <FileText className="w-4 h-4 mr-2" />
+                  Export Run
+                </button>
+                <button
+                  onClick={() => onOpenStatistics(selectedResult.id)}
+                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  <ExternalLink className="w-4 h-4 mr-2" />
+                  Promote to Statistical Workbench
+                </button>
+              </div>
+            </div>
+
+            <div className="min-w-0">
+              {resultDetailView === 'CHART' ? (
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 min-w-0">
+                  <Chart
+                    data={selectedResult.chartConfig.data}
+                    layout={selectedResult.chartConfig.layout}
+                    className="h-[36rem] min-h-[36rem] 2xl:h-[40rem] 2xl:min-h-[40rem]"
+                  />
+                </div>
+              ) : (
+                renderResultTable(activeResultTable)
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4 mt-4 min-w-0 items-start">
+              <div className="rounded-2xl border border-slate-200 p-4 bg-white">
+                <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Statistical Interpretation</div>
+                <div className="text-base leading-7 text-slate-800">{selectedResult.interpretation}</div>
+              </div>
+
+              {selectedResult.aiCommentary ? (
+                <div className="rounded-2xl border border-indigo-100 p-4 bg-indigo-50/60">
+                  <div className="flex items-center justify-between gap-3 mb-2">
+                    <div className="text-xs uppercase tracking-wide text-indigo-700 font-semibold">AI Clinical Commentary</div>
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600">
+                      {selectedResult.aiCommentary.source === 'AI' ? 'AI generated' : 'Fallback summary'}
+                    </div>
+                  </div>
+                  <div className="text-base leading-7 text-slate-800">{selectedResult.aiCommentary.summary}</div>
+                  {selectedResult.aiCommentary.limitations.length > 0 && (
+                    <div className="mt-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Limitations</div>
+                      <ul className="space-y-2 text-sm text-slate-700 list-disc pl-5">
+                        {selectedResult.aiCommentary.limitations.map((item, index) => (
+                          <li key={index}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {selectedResult.aiCommentary.caution && (
+                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                      {selectedResult.aiCommentary.caution}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-dashed border-slate-200 p-4 bg-slate-50 text-sm text-slate-500">
+                  No AI clinical commentary is available for this result.
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px] gap-4 mt-4 min-w-0 items-start">
+              <div className="space-y-4 min-w-0">
+                <div className="rounded-2xl border border-slate-200 p-4 bg-white">
+                  <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Metrics</div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {Object.entries(selectedResult.metrics).map(([key, value]) => (
+                      <div key={key} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
+                        <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">
+                          {formatMetricLabel(key)}
+                        </div>
+                        <div className="text-sm font-semibold text-slate-800 mt-1 break-words">{String(value)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-200 p-4 bg-white">
+                  <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Run Details</div>
+                  <div className="grid grid-cols-1 gap-3 text-sm text-slate-700">
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Name</div>
+                      <div className="mt-1 font-medium text-slate-800 break-words">{selectedRun.runName}</div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Source Dataset</div>
+                      <div className="mt-1 font-medium text-slate-800 break-all">
+                        {selectedResult.params.autopilotSourceName || selectedRun.datasetName}
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Scope</div>
+                      <div className="mt-1 font-medium text-slate-800">{getScopeLabel(selectedResult.params.autopilotDataScope)}</div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Standardized Dataset</div>
+                      <div className="mt-1 font-medium text-slate-800 break-all">{selectedResult.params.fileName}</div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Saved</div>
+                      <div className="mt-1 font-medium text-slate-800">{formatTimestamp(selectedResult.timestamp)}</div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Variables</div>
+                      <div className="mt-1 font-medium text-slate-800 break-words">
+                        {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
+                      </div>
+                    </div>
+                    {selectedResult.params.autopilotSourceNames && selectedResult.params.autopilotSourceNames.length > 1 && (
+                      <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
+                        <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Linked Source Datasets</div>
+                        <div className="mt-1 font-medium text-slate-800 break-words">
+                          {selectedResult.params.autopilotSourceNames.join(', ')}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 p-4 bg-slate-50 mt-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Review AI Decisions</div>
+              {renderDecisionReview(activeReview)}
+            </div>
+          </div>
+        </div>
+      ) : autopilotRuns.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center">
+          <div className="text-lg font-semibold text-slate-800">No saved Autopilot run yet</div>
+          <div className="text-sm text-slate-500 mt-2 max-w-2xl mx-auto">
+            The easiest path is: choose Explore Fast for rapid signal finding or Run Confirmed for protocol-driven execution, then review the saved run here and reopen any result later.
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6">
+          <div className="text-sm font-semibold text-slate-800">
+            {isRunning ? 'Autopilot is running. New results will appear here when the run completes.' : 'No current result is selected.'}
+          </div>
+          <div className="text-sm text-slate-500 mt-2">
+            {runError
+              ? 'The latest run did not save a new analysis result. Review the workflow status and Autopilot log below instead of relying on any previous saved run.'
+              : 'Select a saved run from the list, or start a new run to populate this workspace.'}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="p-8 h-full overflow-y-auto bg-slate-50">
@@ -1810,673 +2815,18 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       </div>
 
       <div className="space-y-6">
-        <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)] gap-6 items-start">
-          <div className="space-y-6">
-          <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-            <div>
-              <h3 className="font-bold text-slate-800">Configuration</h3>
-              <p className="text-sm text-slate-500 mt-1">Autopilot saves each completed analysis as a normal Statistical Analysis session.</p>
-            </div>
-
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Path</div>
-              <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-                <button
-                  onClick={() => setExperienceMode('EXPLORE_FAST')}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    experienceMode === 'EXPLORE_FAST' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  }`}
-                >
-                  Explore Fast
-                </button>
-                <button
-                  onClick={() => setExperienceMode('RUN_CONFIRMED')}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    experienceMode === 'RUN_CONFIRMED' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  }`}
-                >
-                  Run Confirmed
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Analysis Scope</div>
-              <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-                <button
-                  onClick={() => setAnalysisScope('SINGLE_DATASET')}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    analysisScope === 'SINGLE_DATASET' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  }`}
-                >
-                  Single Dataset
-                </button>
-                <button
-                  onClick={() => setAnalysisScope('LINKED_WORKSPACE')}
-                  disabled={experienceMode === 'RUN_CONFIRMED'}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    analysisScope === 'LINKED_WORKSPACE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
-                >
-                  Linked Workspace
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Mode</div>
-              <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-                <button
-                  onClick={() => setAnalysisMode('PACK')}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    analysisMode === 'PACK' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  }`}
-                >
-                  Analysis Pack
-                </button>
-                <button
-                  onClick={() => setAnalysisMode('SINGLE')}
-                  disabled={experienceMode === 'RUN_CONFIRMED'}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                    analysisMode === 'SINGLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                  } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
-                >
-                  One Question
-                </button>
-              </div>
-            </div>
-
-            {experienceMode === 'RUN_CONFIRMED' ? (
-              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
-                <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700 mb-1">Run Confirmed Checklist</div>
-                <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
-                <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
-                <ul className="mt-3 space-y-2 text-sm text-slate-700">
-                  <li className="flex items-start gap-2">
-                    <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${selectedProtocol ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                    <span>{selectedProtocol ? `Protocol selected: ${selectedProtocol.name}` : 'Select a Protocol or SAP document.'}</span>
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisMode === 'PACK' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                    <span>Run Confirmed uses Analysis Pack only.</span>
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisScope === 'SINGLE_DATASET' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                    <span>Run Confirmed currently supports single-dataset protocol-driven runs.</span>
-                  </li>
-                </ul>
-                {confirmedBlockingReason && (
-                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                    {confirmedBlockingReason}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
-                <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600 mb-1">Explore Fast</div>
-                <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
-                <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Source Dataset</label>
-              <select
-                value={selectedSourceId}
-                onChange={(e) => setSelectedSourceId(e.target.value)}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-              >
-                <option value="">-- Select dataset --</option>
-                {sourceFiles.map((file) => (
-                  <option key={file.id} value={file.id}>
-                    {file.name} ({file.type})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {analysisScope === 'LINKED_WORKSPACE' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Supporting Datasets</label>
-                <div className="rounded-xl border border-slate-200 bg-slate-50 max-h-52 overflow-y-auto divide-y divide-slate-200">
-                  {supportingSourceFiles.length === 0 ? (
-                    <div className="p-3 text-sm text-slate-500">Choose a source dataset first to unlock supporting datasets.</div>
-                  ) : (
-                    supportingSourceFiles.map((file) => (
-                      <label key={file.id} className="flex items-start gap-3 p-3 cursor-pointer hover:bg-white">
-                        <input
-                          type="checkbox"
-                          checked={selectedSupportingIds.includes(file.id)}
-                          onChange={() => toggleSupportingFile(file.id)}
-                          className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                        />
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium text-slate-800 break-words">{file.name}</div>
-                          <div className="text-xs text-slate-500">{file.type}</div>
-                        </div>
-                      </label>
-                    ))
-                  )}
-                </div>
-                <div className="mt-2 text-xs text-slate-500">
-                  Linked workspace mode creates a subject-level analysis table using shared subject identifiers such as `USUBJID`.
-                </div>
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Reference Mapping (Optional)</label>
-              <select
-                value={selectedReferenceId}
-                onChange={(e) => setSelectedReferenceId(e.target.value)}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-              >
-                <option value="">-- None --</option>
-                {referenceFiles.map((file) => (
-                  <option key={file.id} value={file.id}>
-                    {file.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">
-                Protocol/SAP {experienceMode === 'RUN_CONFIRMED' ? '(Required)' : '(Optional)'}
-              </label>
-              <select
-                value={selectedProtocolId}
-                onChange={(e) => setSelectedProtocolId(e.target.value)}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-              >
-                <option value="">-- None --</option>
-                {protocolFiles.map((file) => (
-                  <option key={file.id} value={file.id}>
-                    {file.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Target Domain</label>
-              <input
-                type="text"
-                value={targetDomain}
-                onChange={(e) => setTargetDomain(e.target.value.toUpperCase())}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm font-mono"
-                placeholder="DM"
-              />
-            </div>
-
-            {analysisMode === 'SINGLE' ? (
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Analysis Question</label>
-                <textarea
-                  value={analysisQuestion}
-                  onChange={(e) => setAnalysisQuestion(e.target.value)}
-                  rows={4}
-                  className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-                  placeholder={`Example: ${buildDefaultQuestion()}`}
-                />
-              </div>
-            ) : (
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                Leave Autopilot in pack mode when you want several analyses created and saved together, similar to a mini workbench.
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Synonyms (Optional)</label>
-              <input
-                value={customSynonyms}
-                onChange={(e) => setCustomSynonyms(e.target.value)}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-                placeholder="rash, dermatitis, erythema"
-              />
-            </div>
-
-            <label className="flex items-center space-x-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={generateSasDraft}
-                onChange={(e) => setGenerateSasDraft(e.target.checked)}
-                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-              />
-              <span className="text-sm text-slate-600">Generate SAS validation draft</span>
-            </label>
-
-            <button
-              onClick={runAutopilot}
-              disabled={
-                isRunning ||
-                !selectedSource ||
-                (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
-                Boolean(confirmedBlockingReason)
-              }
-              className={`w-full py-3 rounded-xl font-bold text-white flex items-center justify-center ${
-                isRunning ||
-                !selectedSource ||
-                (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
-                Boolean(confirmedBlockingReason)
-                  ? 'bg-slate-300 cursor-not-allowed'
-                  : 'bg-indigo-600 hover:bg-indigo-700'
-              }`}
-            >
-              {isRunning ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
-              {isRunning ? 'Running Autopilot...' : runMode.button}
-            </button>
-          </div>
-
-          <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-bold text-slate-800 flex items-center">
-                <FolderOpen className="w-4 h-4 mr-2 text-indigo-600" />
-                Saved Runs
-              </h3>
-              <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                {autopilotRuns.length} run{autopilotRuns.length === 1 ? '' : 's'}
-              </span>
-            </div>
-            <div className="space-y-2 max-h-[32rem] overflow-y-auto pr-1">
-              {autopilotRuns.length === 0 && (
-                <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
-                  Run Autopilot once and the pack will stay here like a saved workspace.
-                </div>
-              )}
-              {autopilotRuns.map((run) => (
-                <button
-                  key={run.runId}
-                  onClick={() => setSelectedRunId(run.runId)}
-                  className={`w-full text-left rounded-xl border p-3 transition-colors ${
-                    selectedRun?.runId === run.runId
-                      ? 'border-indigo-300 bg-indigo-50'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold text-slate-800 truncate">{run.runName}</div>
-                    <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
-                      {run.analysisCount} analysis{run.analysisCount === 1 ? '' : 'es'}
-                    </span>
-                  </div>
-                  <div className="text-xs text-slate-500 mt-1">{run.modeLabel} | {run.scopeLabel} | {prettifyDatasetName(run.datasetName)}</div>
-                  <div className="text-xs text-slate-600 mt-2 line-clamp-2">{run.questionPreview}</div>
-                  <div className="text-[11px] text-slate-400 mt-2">Updated {formatTimestamp(run.latestTimestamp)}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-          </div>
-
-          <div className="space-y-6 min-w-0">
-          <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-            <h3 className="font-bold text-slate-800 mb-4 flex items-center">
-              <Sparkles className="w-4 h-4 mr-2 text-indigo-600" />
-              Workflow Status
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {STEP_ORDER.map((step) => (
-                <div
-                  key={step.key}
-                  className={`border rounded-xl px-3 py-2 text-sm ${stepStatusClass[stepState[step.key].status]}`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold">{step.label}</span>
-                    <StepIcon status={stepState[step.key].status} />
-                  </div>
-                  <div className="text-xs mt-1 opacity-90">{stepState[step.key].detail}</div>
-                </div>
-              ))}
-            </div>
-            {runError && (
-              <div className="mt-4 border border-red-200 bg-red-50 text-red-700 rounded-xl p-3 text-sm">
-                {runError}
-              </div>
-            )}
-          </div>
-
-          <div className="bg-[#111827] border border-slate-700 rounded-2xl overflow-hidden shadow-sm">
-            <div className="px-4 py-3 border-b border-slate-700 text-slate-200 text-sm font-semibold flex items-center">
-              <FileText className="w-4 h-4 mr-2" />
-              Autopilot Log
-            </div>
-            <div className="p-4 h-56 overflow-y-auto font-mono text-xs text-slate-300 space-y-1">
-              {runLog.length === 0 && <div className="text-slate-500">No execution logs yet.</div>}
-              {runLog.map((line, idx) => (
-                <div key={idx}>{line}</div>
-              ))}
-            </div>
-          </div>
-          </div>
-        </div>
-
-        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm min-w-0">
-            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
-              <div>
-                <h3 className="font-bold text-slate-800 flex items-center">
-                  <BarChart3 className="w-4 h-4 mr-2 text-indigo-600" />
-                  Autopilot Workspace
-                </h3>
-                <p className="text-sm text-slate-500 mt-1">
-                  Browse saved runs first, then compare the analyses inside the selected run.
-                </p>
-              </div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                {sessions.filter((session) => session.params.autopilotRunId).length} saved autopilot session{sessions.filter((session) => session.params.autopilotRunId).length === 1 ? '' : 's'}
-              </div>
-            </div>
-
-            {selectedRun && selectedResult ? (
-              <div className="space-y-5 min-w-0">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 md:col-span-2">
-                    <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-2">Run Name</div>
-                    {isEditingRunName ? (
-                      <div className="space-y-2">
-                        <div className="flex flex-col sm:flex-row gap-2">
-                          <input
-                            value={runNameDraft}
-                            onChange={(e) => setRunNameDraft(e.target.value)}
-                            className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
-                            placeholder="Enter run name"
-                          />
-                          <button
-                            onClick={handleSaveRunName}
-                            className="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
-                          >
-                            <Save className="w-4 h-4 mr-2" />
-                            Save
-                          </button>
-                          <button
-                            onClick={() => {
-                              setRunNameDraft(selectedRun.runName);
-                              setIsEditingRunName(false);
-                              setRenameError(null);
-                            }}
-                            className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                          >
-                            <X className="w-4 h-4 mr-2" />
-                            Cancel
-                          </button>
-                        </div>
-                        {renameError && <div className="text-sm text-red-600">{renameError}</div>}
-                      </div>
-                    ) : (
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="text-lg font-semibold text-slate-800 break-words">{selectedRun.runName}</div>
-                        <button
-                          onClick={() => setIsEditingRunName(true)}
-                          className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 shrink-0"
-                        >
-                          <PencilLine className="w-4 h-4 mr-2" />
-                          Rename
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-                    <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Type</div>
-                    <div className="text-sm font-semibold text-slate-800 mt-1">{selectedRun.modeLabel}</div>
-                    <div className="text-sm text-slate-500 mt-1">{selectedRun.scopeLabel}</div>
-                    <div className="text-sm text-slate-500 mt-2">Updated {formatTimestamp(selectedRun.latestTimestamp)}</div>
-                    <div className="mt-3">
-                      <span
-                        className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
-                          selectedRun.workflowMode
-                        )}`}
-                      >
-                        {getWorkflowLabel(selectedRun.workflowMode)}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <div className="text-sm font-semibold text-slate-800">Analyses in This Run</div>
-                      <div className="text-sm text-slate-500">Select one result to review in detail below.</div>
-                    </div>
-                    <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      {selectedRun.analysisCount} saved result{selectedRun.analysisCount === 1 ? '' : 's'}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                    {selectedRunResults.map((session, index) => (
-                      <button
-                        key={session.id}
-                        onClick={() => {
-                          setSelectedResultId(session.id);
-                          setResultDetailView('CHART');
-                        }}
-                        className={`w-full text-left p-4 rounded-xl border transition-colors ${
-                          selectedResult.id === session.id
-                            ? 'border-indigo-300 bg-indigo-50'
-                            : 'border-slate-200 bg-white hover:bg-slate-50'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500 mb-1">
-                              Analysis {index + 1}
-                            </div>
-                            <div className="text-sm font-semibold text-slate-800 leading-6">
-                              {session.params.autopilotQuestion || formatVariablesForDisplay(session.params.var1, session.params.var2) || session.name}
-                            </div>
-                          </div>
-                          <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
-                            {session.params.testType}
-                          </div>
-                        </div>
-                        <div className="text-xs text-slate-500 mt-2">
-                          {formatVariablesForDisplay(session.params.var1, session.params.var2)}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="border border-slate-200 rounded-2xl p-5 min-w-0 bg-white">
-                  <div className="flex flex-col 2xl:flex-row 2xl:items-start 2xl:justify-between gap-4 mb-4">
-                    <div className="min-w-0">
-                      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Selected Result</div>
-                      <div className="text-2xl font-bold text-slate-800 break-words">
-                        {`Autopilot - ${selectedResult.params.testType}: ${formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}`}
-                      </div>
-                      <div className="text-sm text-slate-500 mt-1">
-                        {selectedResult.params.testType} | {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
-                      </div>
-                      <div className="mt-3">
-                        <span
-                          className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
-                            selectedResult.usageMode
-                          )}`}
-                        >
-                          {getWorkflowLabel(selectedResult.usageMode)}
-                        </span>
-                      </div>
-                      {selectedResult.params.autopilotQuestion && (
-                        <div className="mt-3 rounded-xl bg-indigo-50 border border-indigo-100 p-3 text-sm text-indigo-950 max-w-3xl">
-                          {selectedResult.params.autopilotQuestion}
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex flex-col sm:flex-row gap-2 shrink-0">
-                      <div className="inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1">
-                        <button
-                          onClick={() => setResultDetailView('CHART')}
-                          className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
-                            resultDetailView === 'CHART' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
-                          }`}
-                        >
-                          <BarChart3 className="w-4 h-4 mr-2" />
-                          Chart
-                        </button>
-                        <button
-                          onClick={() => setResultDetailView('TABLE')}
-                          disabled={!activeResultTable}
-                          className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
-                            resultDetailView === 'TABLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
-                          } ${!activeResultTable ? 'cursor-not-allowed opacity-50' : ''}`}
-                        >
-                          <Table2 className="w-4 h-4 mr-2" />
-                          Table
-                        </button>
-                      </div>
-                      <button
-                        onClick={handleExportSelectedResult}
-                        className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                      >
-                        <Download className="w-4 h-4 mr-2" />
-                        Export Result
-                      </button>
-                      <button
-                        onClick={handleExportRun}
-                        className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                      >
-                        <FileText className="w-4 h-4 mr-2" />
-                        Export Run
-                      </button>
-                      <button
-                        onClick={() => onOpenStatistics(selectedResult.id)}
-                        className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                      >
-                        <ExternalLink className="w-4 h-4 mr-2" />
-                        Promote to Statistical Workbench
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="min-w-0">
-                    {resultDetailView === 'CHART' ? (
-                      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 min-w-0">
-                        <Chart
-                          data={selectedResult.chartConfig.data}
-                          layout={selectedResult.chartConfig.layout}
-                          className="h-[36rem] min-h-[36rem] 2xl:h-[40rem] 2xl:min-h-[40rem]"
-                        />
-                      </div>
-                    ) : (
-                      renderResultTable(activeResultTable)
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4 mt-4 min-w-0 items-start">
-                    <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Statistical Interpretation</div>
-                      <div className="text-base leading-7 text-slate-800">{selectedResult.interpretation}</div>
-                    </div>
-
-                    {selectedResult.aiCommentary ? (
-                      <div className="rounded-2xl border border-indigo-100 p-4 bg-indigo-50/60">
-                        <div className="flex items-center justify-between gap-3 mb-2">
-                          <div className="text-xs uppercase tracking-wide text-indigo-700 font-semibold">AI Clinical Commentary</div>
-                          <div className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600">
-                            {selectedResult.aiCommentary.source === 'AI' ? 'AI generated' : 'Fallback summary'}
-                          </div>
-                        </div>
-                        <div className="text-base leading-7 text-slate-800">{selectedResult.aiCommentary.summary}</div>
-                        {selectedResult.aiCommentary.limitations.length > 0 && (
-                          <div className="mt-3">
-                            <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Limitations</div>
-                            <ul className="space-y-2 text-sm text-slate-700 list-disc pl-5">
-                              {selectedResult.aiCommentary.limitations.map((item, index) => (
-                                <li key={index}>{item}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                        {selectedResult.aiCommentary.caution && (
-                          <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                            {selectedResult.aiCommentary.caution}
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="rounded-2xl border border-dashed border-slate-200 p-4 bg-slate-50 text-sm text-slate-500">
-                        No AI clinical commentary is available for this result.
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px] gap-4 mt-4 min-w-0 items-start">
-                    <div className="space-y-4 min-w-0">
-                      <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                        <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Metrics</div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          {Object.entries(selectedResult.metrics).map(([key, value]) => (
-                            <div key={key} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">
-                                {formatMetricLabel(key)}
-                              </div>
-                              <div className="text-sm font-semibold text-slate-800 mt-1 break-words">{String(value)}</div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="space-y-4">
-                      <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                        <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Run Details</div>
-                        <div className="grid grid-cols-1 gap-3 text-sm text-slate-700">
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Name</div>
-                            <div className="mt-1 font-medium text-slate-800 break-words">{selectedRun.runName}</div>
-                          </div>
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Source Dataset</div>
-                            <div className="mt-1 font-medium text-slate-800 break-all">
-                              {selectedResult.params.autopilotSourceName || selectedRun.datasetName}
-                            </div>
-                          </div>
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Scope</div>
-                            <div className="mt-1 font-medium text-slate-800">{getScopeLabel(selectedResult.params.autopilotDataScope)}</div>
-                          </div>
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Standardized Dataset</div>
-                            <div className="mt-1 font-medium text-slate-800 break-all">{selectedResult.params.fileName}</div>
-                          </div>
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Saved</div>
-                            <div className="mt-1 font-medium text-slate-800">{formatTimestamp(selectedResult.timestamp)}</div>
-                          </div>
-                          <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                            <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Variables</div>
-                            <div className="mt-1 font-medium text-slate-800 break-words">
-                              {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
-                            </div>
-                          </div>
-                          {selectedResult.params.autopilotSourceNames && selectedResult.params.autopilotSourceNames.length > 1 && (
-                            <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Linked Source Datasets</div>
-                              <div className="mt-1 font-medium text-slate-800 break-words">
-                                {selectedResult.params.autopilotSourceNames.join(', ')}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-slate-200 p-4 bg-slate-50 mt-4">
-                    <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Review AI Decisions</div>
-                    {renderDecisionReview(activeReview)}
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center">
-                <div className="text-lg font-semibold text-slate-800">No saved Autopilot run yet</div>
-                <div className="text-sm text-slate-500 mt-2 max-w-2xl mx-auto">
-                  The easiest path is: choose Explore Fast for rapid signal finding or Run Confirmed for protocol-driven execution, then review the saved run here and reopen any result later.
-                </div>
-              </div>
-            )}
-        </div>
+        {reviewMode ? (
+          <>
+            {runBrowserSection}
+            {!isCreatingNewAnalysis && workspaceSection}
+            {showControlPanels && controlPanels}
+          </>
+        ) : (
+          <>
+            {controlPanels}
+            {workspaceSection}
+          </>
+        )}
       </div>
     </div>
   );

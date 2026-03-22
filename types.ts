@@ -176,6 +176,7 @@ export interface AnalysisResponse {
   chartConfig?: ChartConfiguration;
   tableConfig?: ResultTable;
   keyInsights?: string[];
+  citations?: { sourceId: string; snippet: string }[];
 }
 
 export interface StatAnalysisResult {
@@ -185,6 +186,23 @@ export interface StatAnalysisResult {
   tableConfig?: ResultTable;
   executedCode: string;
   sasCode?: string; // NEW: Stores generated SAS code
+  backendExecution?: {
+    engine: 'FASTAPI';
+    analysisFamily:
+      | 'incidence'
+      | 'risk_difference'
+      | 'logistic_regression'
+      | 'kaplan_meier'
+      | 'cox'
+      | 'mixed_model'
+      | 'threshold_search'
+      | 'competing_risks'
+      | 'feature_importance'
+      | 'partial_dependence'
+      | 'unknown';
+    workspaceId?: string | null;
+    sourceNames?: string[];
+  };
   aiCommentary?: {
     source: 'AI' | 'FALLBACK';
     summary: string;
@@ -286,6 +304,8 @@ export interface AnalysisSession extends StatAnalysisResult {
   params: {
     fileId: string;
     fileName: string;
+    supportingFileIds?: string[];
+    supportingFileNames?: string[];
     testType: StatTestType;
     var1: string;
     var2: string;
@@ -306,14 +326,34 @@ export interface AnalysisSession extends StatAnalysisResult {
     autopilotMode?: AutopilotExecutionMode | null;
     autopilotSourceName?: string | null;
     autopilotSourceNames?: string[] | null;
+    analysisQuestion?: string | null;
     autopilotQuestion?: string | null;
     autopilotResultIndex?: number | null;
     autopilotDataScope?: AutopilotDataScope | null;
     autopilotWorkspaceFileId?: string | null;
     autopilotWorkspaceFileName?: string | null;
+    backendAnalysisFamily?:
+      | 'incidence'
+      | 'risk_difference'
+      | 'logistic_regression'
+      | 'kaplan_meier'
+      | 'cox'
+      | 'mixed_model'
+      | 'threshold_search'
+      | 'competing_risks'
+      | 'feature_importance'
+      | 'partial_dependence'
+      | 'unknown'
+      | null;
+    backendWorkspaceId?: string | null;
+    backendSourceNames?: string[] | null;
     autopilotAdjustedPValue?: string | null;
     autopilotMultiplicityMethod?: string | null;
     autopilotReview?: AutopilotReviewBundle | null;
+    autopilotExecutionLog?: string[] | null;
+    autopilotQuestionMatchStatus?: 'MATCHED' | 'FAILED' | null;
+    autopilotQuestionMatchSummary?: string | null;
+    autopilotQuestionMatchDetails?: string[] | null;
   };
 }
 
@@ -322,7 +362,12 @@ export interface ChatMessage {
   role: 'user' | 'model';
   content: string;
   timestamp: string;
-  citations?: { sourceId: string; snippet: string }[];
+  citations?: {
+    sourceId: string;
+    snippet: string;
+    kind?: 'DOCUMENT' | 'TABULAR_PROFILE' | 'TABULAR_ROWS';
+    title?: string;
+  }[];
   chartConfig?: ChartConfiguration;
   tableConfig?: ResultTable;
   keyInsights?: string[];

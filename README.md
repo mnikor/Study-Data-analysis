@@ -10,6 +10,11 @@ Evidence CoPilot is a clinical and real-world evidence analytics workspace for:
 
 This repository contains the current prototype application and the minimum backend required to run AI features securely through a server-side proxy.
 
+The next architecture step in this repository is a React + TypeScript frontend paired with a FastAPI analysis backend. The migration plan and backend scaffold now live in:
+
+- `docs/react-fastapi-development-plan.md`
+- `backend/`
+
 ## What This Repository Includes
 
 - React + Vite frontend
@@ -154,16 +159,44 @@ GEMINI_API_KEY=your_key_here
 PORT=3000
 ```
 
+For the new FastAPI analysis backend during migration:
+
+```bash
+VITE_FASTAPI_BASE_URL=http://localhost:8000/api/v1
+ECP_ENV=development
+```
+
 ### Run locally
 
 ```bash
+npm run api:setup
 npm run dev
+```
+
+`npm run dev` now starts the Node/Vite app shell and the FastAPI backend together for local development.
+
+If you only want the analysis API:
+
+```bash
+npm run api:dev
+```
+
+If you explicitly want FastAPI autoreload and your environment allows filesystem watchers:
+
+```bash
+npm run api:watch
 ```
 
 Open:
 
 ```text
 http://localhost:3000
+```
+
+FastAPI analysis healthcheck:
+
+```text
+http://localhost:8000/api/v1/health
 ```
 
 ### Production-style local run

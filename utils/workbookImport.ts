@@ -37,7 +37,7 @@ export interface WorkbookImportPlan {
   outputs: WorkbookImportFilePlan[];
 }
 
-const SUBJECT_KEY_ALIASES = ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID', 'PATIENTID'];
+const SUBJECT_KEY_ALIASES = ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID', 'PATIENTID', 'PARTICIPANT_ID', 'PARTICIPANTID', 'PARTICIPANT'];
 const VISIT_KEY_ALIASES = ['VISIT', 'VISITNUM', 'VISITDT', 'VISIT_DATE'];
 const DATE_KEY_HINTS = ['DATE', 'DTC', 'DT', 'START', 'END'];
 

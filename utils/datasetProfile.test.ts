@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ClinicalFile, DataType } from '../types';
-import { inferDatasetProfile } from './datasetProfile';
+import { inferDatasetProfile, mapProfileKindToAnalysisRole } from './datasetProfile';
 
 const makeFile = (overrides: Partial<ClinicalFile>): ClinicalFile => ({
   id: crypto.randomUUID(),
@@ -50,5 +50,49 @@ describe('datasetProfile', () => {
 
     expect(profile.kind).toBe('ADTTE');
     expect(profile.guidance).toMatch(/Kaplan-Meier\/log-rank/i);
+  });
+
+  it('maps raw DM, AE, and LB style files to backend analysis roles', () => {
+    const dmProfile = inferDatasetProfile(
+      makeFile({
+        name: 'dm.csv',
+        type: DataType.RAW,
+        content: 'USUBJID,ARM,AGE,SEX,RACE\n01,DrugA,65,F,ASIAN',
+      })
+    );
+    const aeProfile = inferDatasetProfile(
+      makeFile({
+        name: 'ae.csv',
+        type: DataType.RAW,
+        content: 'USUBJID,AETERM,AEDECOD,AETOXGR,AESTDY\n01,Rash,Rash,2,14',
+      })
+    );
+    const lbProfile = inferDatasetProfile(
+      makeFile({
+        name: 'lb.csv',
+        type: DataType.RAW,
+        content: 'USUBJID,LBTESTCD,LBTEST,LBSTRESN\n01,HGB,Hemoglobin,13.1',
+      })
+    );
+
+    expect(dmProfile.kind).toBe('ADSL');
+    expect(aeProfile.kind).toBe('ADVERSE_EVENTS');
+    expect(lbProfile.kind).toBe('LABS');
+    expect(mapProfileKindToAnalysisRole(dmProfile.kind)).toBe('ADSL');
+    expect(mapProfileKindToAnalysisRole(aeProfile.kind)).toBe('ADAE');
+    expect(mapProfileKindToAnalysisRole(lbProfile.kind)).toBe('ADLB');
+  });
+
+  it('maps disposition and compliance style files to DS', () => {
+    const dsProfile = inferDatasetProfile(
+      makeFile({
+        name: 'ds.csv',
+        type: DataType.RAW,
+        content: 'USUBJID,DSTERM,DSDECOD,DSSTDY\n01,Treatment Discontinued,DISCONTINUED,45',
+      })
+    );
+
+    expect(dsProfile.kind).toBe('DISPOSITION');
+    expect(mapProfileKindToAnalysisRole(dsProfile.kind)).toBe('DS');
   });
 });

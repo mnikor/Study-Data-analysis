@@ -2,8 +2,19 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { Calculator, BarChart3, AlertCircle, Play, Code, ArrowLeft, Terminal, CheckCircle2, Plus, History, Trash2, ChevronRight, Layout, Sparkles, Lightbulb, Download, FileJson, FileType, ChevronDown, FileText, BookOpen, FlaskConical, ShieldAlert, Lock, Unlock, Microscope, Copy, Check, Globe, ArrowRight, Settings } from 'lucide-react';
 import { AnalysisConcept, AnalysisPlanEntry, ClinicalFile, DataType, StatTestType, StatAnalysisResult, ProvenanceRecord, ProvenanceType, StatAnalysisStep, AnalysisSession, StatSuggestion, User, UsageMode, StudyType } from '../types';
 import { extractPreSpecifiedAnalysisPlan, generateStatisticalCode, executeStatisticalCode, generateStatisticalSuggestions, generateSASCode } from '../services/geminiService';
+import {
+  buildAnalysisWorkspace,
+  classifyAnalysisCapabilities,
+  requestAnalysisPlan,
+  type FastApiAnalysisSpec,
+  type FastApiCapabilityResponse,
+  type FastApiDatasetReference,
+  type FastApiPlanResponse,
+  type FastApiWorkspaceResponse,
+} from '../services/fastapiAnalysisService';
 import { Chart } from './Chart';
 import { parseCsv } from '../utils/dataProcessing';
+import { inferDatasetProfileFromHeaders, mapProfileKindToAnalysisRole } from '../utils/datasetProfile';
 import { planAnalysisFromQuestion } from '../utils/queryPlanner';
 
 interface StatisticsProps {
@@ -147,6 +158,220 @@ type SurvivalPreflight = {
   currentGroupCount: number;
 };
 
+type BackendPreviewState = {
+  capability: FastApiCapabilityResponse;
+  plan: FastApiPlanResponse | null;
+  workspace: FastApiWorkspaceResponse | null;
+  question: string;
+  sourceNames: string[];
+};
+
+type EndpointTemplateKey =
+  | 'CUSTOM'
+  | 'WEEK12_GRADE2_DAE'
+  | 'DOSE_ONSET_INTERACTION'
+  | 'TIME_TO_RESOLUTION'
+  | 'EARLY_WARNING_DISCONTINUATION'
+  | 'LONGITUDINAL_MIXED_MODEL'
+  | 'COMPETING_RISKS'
+  | 'THRESHOLD_SEARCH';
+
+const ENDPOINT_TEMPLATE_OPTIONS: Array<{
+  key: EndpointTemplateKey;
+  label: string;
+  helper: string;
+  defaultQuestion: string;
+  recommendedTest: StatTestType;
+}> = [
+  {
+    key: 'CUSTOM',
+    label: 'Custom Question',
+    helper: 'Write your own plain-language endpoint and analysis request.',
+    defaultQuestion: '',
+    recommendedTest: StatTestType.T_TEST,
+  },
+  {
+    key: 'WEEK12_GRADE2_DAE',
+    label: 'Week 12 Grade >=2 DAE',
+    helper: 'Incidence / risk-difference style endpoint with a bounded Week 12 window.',
+    defaultQuestion:
+      'Among the selected population, what is the cumulative incidence of Grade >=2 dermatologic adverse events by Week 12 by treatment arm, and what is the risk difference with 95% confidence interval?',
+    recommendedTest: StatTestType.CHI_SQUARE,
+  },
+  {
+    key: 'DOSE_ONSET_INTERACTION',
+    label: 'Dose Tier And Onset',
+    helper: 'Exposure or weight-tier effect with treatment-arm interaction for earlier onset questions.',
+    defaultQuestion:
+      'Does higher dosing by weight (>80 kg dosing tier) correlate with increased Grade >=2 dermatologic adverse events or earlier onset, and does treatment arm mitigate that relationship?',
+    recommendedTest: StatTestType.COX_PH,
+  },
+  {
+    key: 'TIME_TO_RESOLUTION',
+    label: 'Time To Resolution',
+    helper: 'Among subjects with qualifying adverse events, model factors associated with faster or slower resolution.',
+    defaultQuestion:
+      'Among participants who develop Grade >=2 dermatologic adverse events, what factors predict time to resolution, and do these predictors differ by arm?',
+    recommendedTest: StatTestType.COX_PH,
+  },
+  {
+    key: 'EARLY_WARNING_DISCONTINUATION',
+    label: 'Early Warning Persistence',
+    helper: 'Use early dermatologic events to predict later discontinuation, interruption, or non-persistence.',
+    defaultQuestion:
+      'What is the relationship between early dermatologic events in Weeks 1-4 and later treatment interruption, reduction, discontinuation, or non-persistence?',
+    recommendedTest: StatTestType.REGRESSION,
+  },
+  {
+    key: 'LONGITUDINAL_MIXED_MODEL',
+    label: 'Longitudinal Trend',
+    helper: 'Estimate within-subject change over time and treatment-by-time effects from repeated visit-level rows.',
+    defaultQuestion:
+      'Using repeated visit-level measurements, estimate how the endpoint changes over time by treatment arm and whether treatment modifies the time trend.',
+    recommendedTest: StatTestType.REGRESSION,
+  },
+  {
+    key: 'COMPETING_RISKS',
+    label: 'Cumulative Incidence',
+    helper: 'Estimate cumulative incidence when a competing event can prevent the event of interest.',
+    defaultQuestion:
+      'What is the cumulative incidence of treatment discontinuation by arm when death is treated as a competing event?',
+    recommendedTest: StatTestType.KAPLAN_MEIER,
+  },
+  {
+    key: 'THRESHOLD_SEARCH',
+    label: 'Threshold Search',
+    helper: 'Search for early warning thresholds that best predict later interruption, discontinuation, or non-persistence.',
+    defaultQuestion:
+      'Identify early-warning thresholds from Weeks 1-4 dermatologic events that best predict later treatment discontinuation or non-persistence.',
+    recommendedTest: StatTestType.REGRESSION,
+  },
+];
+
+const SUPPORTED_BACKEND_FAMILIES = new Set<FastApiCapabilityResponse['analysis_family']>([
+  'incidence',
+  'risk_difference',
+  'logistic_regression',
+  'kaplan_meier',
+  'cox',
+  'mixed_model',
+  'threshold_search',
+  'competing_risks',
+  'feature_importance',
+  'partial_dependence',
+]);
+
+const resolveDatasetRole = (file: ClinicalFile): string | undefined => {
+  if (!file.content) return file.metadata?.datasetRole as string | undefined;
+
+  try {
+    const { headers } = parseCsv(file.content);
+    const profile = inferDatasetProfileFromHeaders(file.name, file.type, headers);
+    const mappedRole = mapProfileKindToAnalysisRole(profile.kind);
+    if (mappedRole) return mappedRole;
+  } catch {
+    return file.metadata?.datasetRole as string | undefined;
+  }
+
+  return file.metadata?.datasetRole as string | undefined;
+};
+
+const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReference => {
+  if (!file.content) {
+    return {
+      file_id: file.id,
+      name: file.name,
+      role: resolveDatasetRole(file),
+      column_names: [],
+    };
+  }
+
+  try {
+    const { headers, rows } = parseCsv(file.content);
+    return {
+      file_id: file.id,
+      name: file.name,
+      role: resolveDatasetRole(file),
+      row_count: rows.length,
+      column_names: headers,
+      content: file.content,
+    };
+  } catch {
+    return {
+      file_id: file.id,
+      name: file.name,
+      role: resolveDatasetRole(file),
+      column_names: [],
+    };
+  }
+};
+
+const buildBackendQuestion = (
+  question: string,
+  testType: StatTestType,
+  var1: string,
+  var2: string
+) => {
+  if (question.trim()) return question.trim();
+
+  switch (testType) {
+    case StatTestType.KAPLAN_MEIER:
+      return `Compare survival between ${var1} groups using ${var2} as the time variable.`;
+    case StatTestType.COX_PH:
+      return `Estimate the hazard ratio by ${var1} using ${var2} as the time variable.`;
+    case StatTestType.CHI_SQUARE:
+      return `Compare incidence or proportions across ${var1} using ${var2} as the outcome.`;
+    case StatTestType.T_TEST:
+      return `Compare the mean of ${var2} across ${var1} groups.`;
+    case StatTestType.ANOVA:
+      return `Compare the mean of ${var2} across ${var1} categories using ANOVA.`;
+    case StatTestType.REGRESSION:
+      return `Model ${var2} using ${var1} as a predictor.`;
+    case StatTestType.CORRELATION:
+      return `Assess the correlation between ${var1} and ${var2}.`;
+    default:
+      return `${testType}: ${var1} vs ${var2}`;
+  }
+};
+
+const mapBackendFamilyToTestType = (
+  family: FastApiCapabilityResponse['analysis_family'],
+  fallback: StatTestType
+): StatTestType => {
+  if (family === 'kaplan_meier') return StatTestType.KAPLAN_MEIER;
+  if (family === 'cox') return StatTestType.COX_PH;
+  if (family === 'competing_risks') return StatTestType.KAPLAN_MEIER;
+  if (family === 'incidence' || family === 'risk_difference') return StatTestType.CHI_SQUARE;
+  if (family === 'logistic_regression' || family === 'mixed_model' || family === 'threshold_search') return StatTestType.REGRESSION;
+  return fallback;
+};
+
+const buildBackendExecutionPreviewCode = (
+  preview: BackendPreviewState,
+  sourceFiles: ClinicalFile[]
+) =>
+  [
+    '# Advanced deterministic analysis plan preview',
+    `# Question: ${preview.question}`,
+    `# Analysis family: ${preview.capability.analysis_family}`,
+    ...(preview.workspace?.workspace_id ? [`# Workspace ID: ${preview.workspace.workspace_id}`] : []),
+    `# Source datasets: ${sourceFiles.map((file) => file.name).join(', ')}`,
+    ...(preview.workspace?.derived_columns?.length
+      ? [`# Derived columns: ${preview.workspace.derived_columns.join(', ')}`]
+      : []),
+    '#',
+    '# Execution note:',
+    '# The Statistical Analysis workbench will route execution through the',
+    '# deterministic analysis engine for this question. The local Python preview is intentionally',
+    '# reduced to a stub because the actual analysis depends on the joined row-level workspace.',
+  ].join('\n');
+
+const parseCommaSeparatedTokens = (value: string) =>
+  value
+    .split(',')
+    .map((token) => token.trim())
+    .filter(Boolean);
+
 const SURVIVAL_GROUP_HINTS = ['TRT01A', 'TRTA', 'TRT01P', 'ACTARM', 'ARM', 'TREATMENT_ARM', 'TRT_ARM'];
 const SURVIVAL_TIME_HINTS = ['AVAL', 'TIME', 'OS', 'PFS', 'TTE', 'DURATION', 'DAY', 'MONTH'];
 const SURVIVAL_CENSOR_HINTS = ['CNSR', 'CENSOR', 'CENSORING', 'EVENT', 'EVENTFL', 'STATUS', 'DEATH', 'DEATHFL'];
@@ -234,22 +459,34 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
   // Wizard State (for 'NEW' session)
   const [step, setStep] = useState<StatAnalysisStep>(StatAnalysisStep.CONFIGURATION);
   const [selectedFileId, setSelectedFileId] = useState<string>('');
+  const [selectedSupportingIds, setSelectedSupportingIds] = useState<string[]>([]);
   const [selectedContextIds, setSelectedContextIds] = useState<Set<string>>(new Set()); 
   const [testType, setTestType] = useState<StatTestType>(StatTestType.T_TEST);
   const [variable1, setVariable1] = useState('');
   const [variable2, setVariable2] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [analysisQuestion, setAnalysisQuestion] = useState('');
+  const [endpointTemplateKey, setEndpointTemplateKey] = useState<EndpointTemplateKey>('CUSTOM');
+  const [guidedBackendFamily, setGuidedBackendFamily] = useState<FastApiCapabilityResponse['analysis_family']>('unknown');
+  const [guidedEndpointLabel, setGuidedEndpointLabel] = useState('');
+  const [guidedTargetDefinition, setGuidedTargetDefinition] = useState('');
+  const [guidedGradeThreshold, setGuidedGradeThreshold] = useState('2');
+  const [guidedTimeWindowDays, setGuidedTimeWindowDays] = useState('');
+  const [guidedTermFilters, setGuidedTermFilters] = useState('');
+  const [guidedInteractionTerms, setGuidedInteractionTerms] = useState('');
+  const [guidedThresholdMetric, setGuidedThresholdMetric] = useState<'balanced_accuracy' | 'youden_j' | 'f1'>('balanced_accuracy');
   const [customSynonymsInput, setCustomSynonymsInput] = useState('');
   const [wizardExplanation, setWizardExplanation] = useState('');
   const [analysisConcept, setAnalysisConcept] = useState<AnalysisConcept | null>(null);
   const [isPlanning, setIsPlanning] = useState(false);
+  const [isPreviewingBackend, setIsPreviewingBackend] = useState(false);
   const [selectedPlanDocId, setSelectedPlanDocId] = useState('');
   const [preSpecifiedPlan, setPreSpecifiedPlan] = useState<AnalysisPlanEntry[]>([]);
   const [planNotes, setPlanNotes] = useState<string[]>([]);
   const [isExtractingPlan, setIsExtractingPlan] = useState(false);
   const [enforcePreSpecifiedPlan, setEnforcePreSpecifiedPlan] = useState(false);
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
+  const [backendPreview, setBackendPreview] = useState<BackendPreviewState | null>(null);
   const [draftSeedSession, setDraftSeedSession] = useState<AnalysisSession | null>(null);
   const [draftSourceSessionId, setDraftSourceSessionId] = useState<string | null>(null);
 
@@ -279,8 +516,47 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
   const rawFiles = useMemo(() => files.filter(f => f.type === DataType.RAW || f.type === DataType.STANDARDIZED || f.type === DataType.COHORT_DEF), [files]);
   const docFiles = useMemo(() => files.filter(f => f.type === DataType.DOCUMENT), [files]);
   const selectedFile = rawFiles.find(f => f.id === selectedFileId);
+  const supportingSourceFiles = useMemo(
+    () => rawFiles.filter((file) => file.id !== selectedFileId),
+    [rawFiles, selectedFileId]
+  );
+  const selectedSupportingFiles = useMemo(
+    () => supportingSourceFiles.filter((file) => selectedSupportingIds.includes(file.id)),
+    [supportingSourceFiles, selectedSupportingIds]
+  );
+  const selectedSourceFiles = useMemo(
+    () => (selectedFile ? [selectedFile, ...selectedSupportingFiles] : []),
+    [selectedFile, selectedSupportingFiles]
+  );
   const selectedPlanDoc = docFiles.find(d => d.id === selectedPlanDocId);
   const canRunAnalysis = Boolean(selectedFile && generatedCode.trim());
+  const selectedEndpointTemplate = useMemo(
+    () => ENDPOINT_TEMPLATE_OPTIONS.find((option) => option.key === endpointTemplateKey) || ENDPOINT_TEMPLATE_OPTIONS[0],
+    [endpointTemplateKey]
+  );
+  const guidedSpecSignature = useMemo(
+    () =>
+      [
+        guidedBackendFamily,
+        guidedEndpointLabel,
+        guidedTargetDefinition,
+        guidedGradeThreshold,
+        guidedTimeWindowDays,
+        guidedTermFilters,
+        guidedInteractionTerms,
+        guidedThresholdMetric,
+      ].join('|'),
+    [
+      guidedBackendFamily,
+      guidedEndpointLabel,
+      guidedTargetDefinition,
+      guidedGradeThreshold,
+      guidedTimeWindowDays,
+      guidedTermFilters,
+      guidedInteractionTerms,
+      guidedThresholdMetric,
+    ]
+  );
   const selectedFileData = useMemo(() => {
     if (!selectedFile?.content) return { headers: [] as string[], rows: [] as Record<string, string>[] };
     try {
@@ -289,6 +565,14 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
       return { headers: [] as string[], rows: [] as Record<string, string>[] };
     }
   }, [selectedFile]);
+  const selectedSourceSignature = useMemo(
+    () => selectedSourceFiles.map((file) => file.id).sort().join('|'),
+    [selectedSourceFiles]
+  );
+  const canPreviewBackend = Boolean(
+    selectedFile &&
+      (analysisQuestion.trim() || (variable1.trim() && variable2.trim()))
+  );
 
   const buildPlanEntriesFromReview = (session: AnalysisSession): AnalysisPlanEntry[] => {
     if (session.params.preSpecifiedPlan && session.params.preSpecifiedPlan.length > 0) {
@@ -326,6 +610,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     }
 
     setSelectedFileId(session.params.fileId);
+    setSelectedSupportingIds(session.params.supportingFileIds || []);
     setSelectedContextIds(restoredContextIds);
     setSelectedPlanDocId(session.params.selectedPlanDocId || '');
     setPreSpecifiedPlan(restoredPlan);
@@ -347,7 +632,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     setImputationMethod(session.params.imputationMethod || 'None');
     setApplyPSM(Boolean(session.params.applyPSM));
     setAnalysisConcept(session.params.concept || null);
-    setAnalysisQuestion(session.params.autopilotQuestion || '');
+    setAnalysisQuestion(session.params.analysisQuestion || session.params.autopilotQuestion || '');
     setCustomSynonymsInput('');
     setWizardExplanation(
       options.editableDraft
@@ -359,6 +644,43 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     setGeneratedCode(session.executedCode);
     setSasCode(session.sasCode || '');
     setResult(options.openStep === StatAnalysisStep.RESULTS ? session : null);
+    setBackendPreview(
+      session.params.backendAnalysisFamily || session.params.backendWorkspaceId
+        ? {
+            capability: {
+              status: 'executable',
+              analysis_family: session.params.backendAnalysisFamily || 'unknown',
+              executable: true,
+              requires_row_level_data: true,
+              missing_roles: [],
+              warnings: [],
+              explanation: 'Restored from saved session metadata.',
+            },
+            plan: null,
+            workspace: session.params.backendWorkspaceId
+              ? {
+                  status: 'executable',
+                  workspace_id: session.params.backendWorkspaceId,
+                  source_names: session.params.backendSourceNames || [
+                    session.params.fileName,
+                    ...(session.params.supportingFileNames || []),
+                  ],
+                  missing_roles: [],
+                  row_count: null,
+                  column_count: null,
+                  derived_columns: [],
+                  notes: ['Restored from saved session metadata.'],
+                  explanation: 'Workspace metadata restored from the saved session.',
+                }
+              : null,
+            question: session.params.analysisQuestion || session.params.autopilotQuestion || '',
+            sourceNames: session.params.backendSourceNames || [
+              session.params.fileName,
+              ...(session.params.supportingFileNames || []),
+            ],
+          }
+        : null
+    );
     setStep(options.openStep);
     setActiveCodeTab('PYTHON');
     setSuggestions([]);
@@ -387,9 +709,23 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     }
   }, [usageMode]);
 
+  useEffect(() => {
+    setBackendPreview((current) => {
+      if (!current) return null;
+      const nextQuestion = buildBackendQuestion(analysisQuestion, testType, variable1, variable2);
+      const currentSourceSignature = current.sourceNames.join('|');
+      const nextSourceSignature = selectedSourceFiles.map((file) => file.name).join('|');
+      if (current.question !== nextQuestion || currentSourceSignature !== nextSourceSignature) {
+        return null;
+      }
+      return current;
+    });
+  }, [analysisQuestion, testType, variable1, variable2, selectedSourceSignature, guidedSpecSignature]);
+
   const resetWizard = () => {
     setStep(StatAnalysisStep.CONFIGURATION);
     setSelectedFileId('');
+    setSelectedSupportingIds([]);
     setTestType(StatTestType.T_TEST);
     setVariable1('');
     setVariable2('');
@@ -403,6 +739,15 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     setImputationMethod('None');
     setApplyPSM(false);
     setAnalysisQuestion('');
+    setEndpointTemplateKey('CUSTOM');
+    setGuidedBackendFamily('unknown');
+    setGuidedEndpointLabel('');
+    setGuidedTargetDefinition('');
+    setGuidedGradeThreshold('2');
+    setGuidedTimeWindowDays('');
+    setGuidedTermFilters('');
+    setGuidedInteractionTerms('');
+    setGuidedThresholdMetric('balanced_accuracy');
     setCustomSynonymsInput('');
     setWizardExplanation('');
     setAnalysisConcept(null);
@@ -412,6 +757,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     setPlanNotes([]);
     setEnforcePreSpecifiedPlan(false);
     setActivePlanId(null);
+    setBackendPreview(null);
     setErrorMsg(null);
     setDraftSourceSessionId(null);
   };
@@ -561,9 +907,30 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
             <div class="metric-card"><div class="metric-label">Dataset</div><div class="metric-value">${escapeHtml(
               selectedFile?.name || activeSession?.params.fileName || 'Unknown'
             )}</div></div>
+            ${
+              activeSession?.params.supportingFileNames && activeSession.params.supportingFileNames.length > 0
+                ? `<div class="metric-card"><div class="metric-label">Supporting Datasets</div><div class="metric-value">${escapeHtml(
+                    activeSession.params.supportingFileNames.join(', ')
+                  )}</div></div>`
+                : ''
+            }
             <div class="metric-card"><div class="metric-label">Variables</div><div class="metric-value">${escapeHtml(
-              `${variable1} vs ${variable2}`
+              `${activeSession?.params.var1 || variable1} vs ${activeSession?.params.var2 || variable2}`
             )}</div></div>
+            ${
+              activeSession?.params.backendAnalysisFamily
+                ? `<div class="metric-card"><div class="metric-label">Execution Engine</div><div class="metric-value">${escapeHtml(
+                    `Deterministic analysis engine (${activeSession.params.backendAnalysisFamily})`
+                  )}</div></div>`
+                : ''
+            }
+            ${
+              activeSession?.params.backendWorkspaceId
+                ? `<div class="metric-card"><div class="metric-label">Workspace ID</div><div class="metric-value">${escapeHtml(
+                    activeSession.params.backendWorkspaceId
+                  )}</div></div>`
+                : ''
+            }
             <div class="metric-card"><div class="metric-label">Saved</div><div class="metric-value">${escapeHtml(
               activeSession ? new Date(activeSession.timestamp).toLocaleString() : 'Current session'
             )}</div></div>
@@ -627,6 +994,99 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     setSelectedContextIds(newSet);
   };
 
+  const toggleSupportingFile = (id: string) => {
+    setSelectedSupportingIds((current) =>
+      current.includes(id) ? current.filter((candidate) => candidate !== id) : [...current, id]
+    );
+  };
+
+  const handlePreviewBackendPlan = async () => {
+    if (!selectedFile) {
+      setErrorMsg('Select a primary dataset before previewing the backend plan.');
+      return;
+    }
+    if (!canPreviewBackend) {
+      setErrorMsg('Enter a question or choose both variables before previewing the backend plan.');
+      return;
+    }
+
+    const question = buildBackendQuestion(analysisQuestion, testType, variable1, variable2);
+    const datasetRefs = selectedSourceFiles
+      .filter((file) => Boolean(file.content))
+      .map(buildDatasetReference);
+
+    if (datasetRefs.length === 0) {
+      setErrorMsg('No row-level tabular sources are available for advanced analysis preview.');
+      return;
+    }
+
+    setIsPreviewingBackend(true);
+    setErrorMsg(null);
+    try {
+      const capability = await classifyAnalysisCapabilities(question, datasetRefs);
+      const plan = await requestAnalysisPlan(question, datasetRefs);
+      const effectiveSpec = buildGuidedBackendSpec(plan.spec || undefined);
+      const shouldBuildWorkspace =
+        plan.status === 'executable' &&
+        Boolean(effectiveSpec) &&
+        SUPPORTED_BACKEND_FAMILIES.has(effectiveSpec?.analysis_family || 'unknown');
+      const workspace = shouldBuildWorkspace
+        ? await buildAnalysisWorkspace(question, datasetRefs, effectiveSpec)
+        : null;
+
+      setBackendPreview({
+        capability,
+        plan: {
+          ...plan,
+          spec: effectiveSpec || plan.spec || null,
+        },
+        workspace,
+        question,
+        sourceNames: selectedSourceFiles.map((file) => file.name),
+      });
+
+      setWizardExplanation(
+        workspace?.workspace_id
+          ? `Advanced analysis preview ready: ${capability.analysis_family} using ${selectedSourceFiles.length} dataset(s). Workspace ${workspace.workspace_id} is available for deterministic execution.`
+          : plan.explanation || capability.explanation
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to preview the advanced analysis plan.';
+      setErrorMsg(message);
+      setBackendPreview(null);
+    } finally {
+      setIsPreviewingBackend(false);
+    }
+  };
+
+  const applyBackendPlanToWorkbench = () => {
+    const spec = backendPreview?.plan?.spec;
+    if (!spec) return;
+
+    const nextVar1 = spec.treatment_variable || spec.outcome_variable || variable1;
+    const nextVar2 = spec.time_variable || spec.outcome_variable || variable2;
+
+    setTestType(mapBackendFamilyToTestType(spec.analysis_family, testType));
+    setVariable1(nextVar1 || '');
+    setVariable2(nextVar2 || '');
+    setGuidedBackendFamily(spec.analysis_family);
+    setGuidedEndpointLabel(spec.endpoint_label || '');
+    setGuidedTargetDefinition(spec.target_definition || '');
+    setGuidedGradeThreshold(spec.grade_threshold != null ? String(spec.grade_threshold) : '');
+    setGuidedTimeWindowDays(spec.time_window_days != null ? String(spec.time_window_days) : '');
+    setGuidedTermFilters(spec.term_filters.join(', '));
+    setGuidedInteractionTerms(spec.interaction_terms.join(', '));
+    setGuidedThresholdMetric(spec.threshold_metric || 'balanced_accuracy');
+    if (spec.covariates.length > 0) {
+      setCovariates(spec.covariates);
+    }
+    setActivePlanId(null);
+    setAnalysisConcept(null);
+    setWizardExplanation(
+      `Applied advanced analysis plan: ${spec.analysis_family} with ${backendPreview?.sourceNames.length || 0} source dataset(s). Execution will use the deterministic analysis engine.`
+    );
+  };
+
   const handleGenerateSuggestions = async () => {
     if (!selectedFile) return;
     setIsSuggesting(true);
@@ -657,6 +1117,130 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
       setAnalysisConcept(null);
       setActivePlanId(null);
       setWizardExplanation(`Applied AI suggestion: ${s.reason}`);
+  };
+
+  const buildGuidedBackendSpec = (baseSpec?: FastApiAnalysisSpec | null): FastApiAnalysisSpec | undefined => {
+    const parsedGrade = toNumber(guidedGradeThreshold);
+    const parsedWindow = toNumber(guidedTimeWindowDays);
+    const termFilters = parseCommaSeparatedTokens(guidedTermFilters);
+    const interactionTerms = parseCommaSeparatedTokens(guidedInteractionTerms);
+    const analysisFamily =
+      guidedBackendFamily !== 'unknown'
+        ? guidedBackendFamily
+        : baseSpec?.analysis_family;
+
+    if (!analysisFamily) return baseSpec || undefined;
+
+    return {
+      analysis_family: analysisFamily,
+      endpoint_label: guidedEndpointLabel.trim() || baseSpec?.endpoint_label || null,
+      target_definition: guidedTargetDefinition.trim() || baseSpec?.target_definition || null,
+      treatment_variable: baseSpec?.treatment_variable || null,
+      outcome_variable: baseSpec?.outcome_variable || null,
+      time_variable: baseSpec?.time_variable || null,
+      event_variable: baseSpec?.event_variable || null,
+      repeated_measure_variable: baseSpec?.repeated_measure_variable || null,
+      repeated_time_variable: baseSpec?.repeated_time_variable || null,
+      subject_variable: baseSpec?.subject_variable || null,
+      competing_event_variable: baseSpec?.competing_event_variable || null,
+      grade_threshold: parsedGrade ?? baseSpec?.grade_threshold ?? null,
+      term_filters: termFilters.length > 0 ? termFilters : baseSpec?.term_filters || [],
+      cohort_filters: baseSpec?.cohort_filters || [],
+      covariates: baseSpec?.covariates || covariates,
+      interaction_terms: interactionTerms.length > 0 ? interactionTerms : baseSpec?.interaction_terms || [],
+      threshold_variables: baseSpec?.threshold_variables || [],
+      threshold_direction: baseSpec?.threshold_direction || 'auto',
+      threshold_metric:
+        analysisFamily === 'threshold_search'
+          ? guidedThresholdMetric
+          : baseSpec?.threshold_metric || null,
+      time_window_days: parsedWindow ?? baseSpec?.time_window_days ?? null,
+      requested_outputs: baseSpec?.requested_outputs || [],
+      notes: [
+        ...(baseSpec?.notes || []),
+        'Guided endpoint builder overrides applied from the Statistical Analysis workbench.',
+      ],
+    };
+  };
+
+  const applyEndpointTemplate = () => {
+    if (selectedEndpointTemplate.key === 'CUSTOM') {
+      setGuidedBackendFamily('unknown');
+      setGuidedEndpointLabel('');
+      setGuidedTargetDefinition('');
+      setGuidedTimeWindowDays('');
+      setGuidedTermFilters('');
+      setGuidedInteractionTerms('');
+      setWizardExplanation('Using a custom clinical question. Describe the endpoint, population, and comparison in plain language.');
+      return;
+    }
+
+    setAnalysisQuestion(selectedEndpointTemplate.defaultQuestion);
+    setTestType(selectedEndpointTemplate.recommendedTest);
+    setAnalysisConcept(null);
+    setActivePlanId(null);
+    setGuidedGradeThreshold('2');
+    switch (selectedEndpointTemplate.key) {
+      case 'WEEK12_GRADE2_DAE':
+        setGuidedBackendFamily('risk_difference');
+        setGuidedEndpointLabel('Grade >=2 dermatologic adverse event by Week 12');
+        setGuidedTargetDefinition('grade_2_plus_dae_by_week_12');
+        setGuidedTimeWindowDays('84');
+        setGuidedTermFilters('rash, dermatologic, erythema, skin');
+        setGuidedInteractionTerms('');
+        break;
+      case 'DOSE_ONSET_INTERACTION':
+        setGuidedBackendFamily('cox');
+        setGuidedEndpointLabel('Time to first Grade >=2 dermatologic adverse event');
+        setGuidedTargetDefinition('time_to_first_grade_2_plus_dae');
+        setGuidedTimeWindowDays('');
+        setGuidedTermFilters('rash, dermatologic, erythema, skin');
+        setGuidedInteractionTerms('treatment*dose');
+        break;
+      case 'TIME_TO_RESOLUTION':
+        setGuidedBackendFamily('cox');
+        setGuidedEndpointLabel('Time to resolution of Grade >=2 dermatologic adverse events');
+        setGuidedTargetDefinition('time_to_resolution_grade_2_plus_dae');
+        setGuidedTimeWindowDays('');
+        setGuidedTermFilters('rash, dermatologic, erythema, skin');
+        setGuidedInteractionTerms('treatment*all');
+        break;
+      case 'EARLY_WARNING_DISCONTINUATION':
+        setGuidedBackendFamily('logistic_regression');
+        setGuidedEndpointLabel('Later treatment discontinuation or non-persistence');
+        setGuidedTargetDefinition('later_treatment_discontinuation');
+        setGuidedTimeWindowDays('28');
+        setGuidedTermFilters('rash, dermatologic, erythema, skin');
+        setGuidedInteractionTerms('');
+        break;
+      case 'LONGITUDINAL_MIXED_MODEL':
+        setGuidedBackendFamily('mixed_model');
+        setGuidedEndpointLabel('Repeated-measures trend');
+        setGuidedTargetDefinition('repeated_measure_change');
+        setGuidedTimeWindowDays('');
+        setGuidedTermFilters('');
+        setGuidedInteractionTerms('treatment*time');
+        break;
+      case 'COMPETING_RISKS':
+        setGuidedBackendFamily('competing_risks');
+        setGuidedEndpointLabel('Cumulative incidence with competing events');
+        setGuidedTargetDefinition('cumulative_incidence_of_discontinuation');
+        setGuidedTimeWindowDays('');
+        setGuidedTermFilters('');
+        setGuidedInteractionTerms('');
+        break;
+      case 'THRESHOLD_SEARCH':
+        setGuidedBackendFamily('threshold_search');
+        setGuidedEndpointLabel('Early warning threshold for later persistence risk');
+        setGuidedTargetDefinition('later_treatment_discontinuation');
+        setGuidedTimeWindowDays('28');
+        setGuidedTermFilters('rash, dermatologic, erythema, skin');
+        setGuidedInteractionTerms('');
+        break;
+      default:
+        break;
+    }
+    setWizardExplanation(`Applied endpoint template: ${selectedEndpointTemplate.label}. Preview the advanced analysis plan to confirm required supporting datasets and derivations.`);
   };
 
   const handleAutoPlanFromQuestion = async () => {
@@ -792,7 +1376,12 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
   ]);
 
   const handleGenerateCode = async () => {
-    if (!selectedFile || availableColumns.length === 0) {
+    const shouldUseBackendStub =
+      Boolean(analysisQuestion.trim()) &&
+      backendPreview?.capability.status === 'executable' &&
+      SUPPORTED_BACKEND_FAMILIES.has(backendPreview.capability.analysis_family);
+
+    if (!selectedFile || (!shouldUseBackendStub && availableColumns.length === 0)) {
       setErrorMsg("Please select a valid file and both analysis variables.");
       return;
     }
@@ -833,7 +1422,15 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
     }
     setIsGenerating(true);
     setErrorMsg(null);
-    
+
+    if (shouldUseBackendStub && backendPreview) {
+      setGeneratedCode(buildBackendExecutionPreviewCode(backendPreview, selectedSourceFiles));
+      setStep(StatAnalysisStep.CODE_REVIEW);
+      setActiveCodeTab('PYTHON');
+      setIsGenerating(false);
+      return;
+    }
+
     const timeoutPromise = new Promise<string>((_, reject) => {
         setTimeout(() => reject(new Error("Code generation timed out")), 120000);
     });
@@ -920,7 +1517,14 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
 
     try {
       const res = await Promise.race([
-          executeStatisticalCode(generatedCode, selectedFile, testType, variable1, variable2, analysisConcept),
+          executeStatisticalCode(generatedCode, selectedFile, testType, variable1, variable2, analysisConcept, {
+            question: analysisQuestion.trim() || undefined,
+            sourceFiles: selectedSourceFiles,
+            covariates,
+            imputationMethod,
+            applyPSM,
+            backendSpec: buildGuidedBackendSpec(backendPreview?.plan?.spec || undefined) || undefined,
+          }),
           timeoutPromise
       ]);
       if (res) {
@@ -939,6 +1543,8 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
           params: {
             fileId: selectedFileId,
             fileName: selectedFile.name,
+            supportingFileIds: selectedSupportingFiles.map((file) => file.id),
+            supportingFileNames: selectedSupportingFiles.map((file) => file.name),
             testType,
             var1: variable1,
             var2: variable2,
@@ -954,6 +1560,10 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
             sourceWorkflow: 'STATISTICS',
             sourceSessionId: draftSourceSessionId || (activeSessionId !== 'NEW' ? activeSessionId : null),
             preSpecifiedPlanId: activePlanId,
+            analysisQuestion: analysisQuestion.trim() || null,
+            backendAnalysisFamily: res.backendExecution?.analysisFamily || null,
+            backendWorkspaceId: res.backendExecution?.workspaceId || null,
+            backendSourceNames: res.backendExecution?.sourceNames || null,
           },
           ...enrichedResult
         };
@@ -969,7 +1579,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
           userRole: currentUser.role,
           actionType: ProvenanceType.STATISTICS,
           details: `Ran ${testType}${analysisConcept ? ` (${analysisConcept.label})` : ''}. Mode: ${usageMode}. Result: ${res.interpretation.substring(0, 50)}...`,
-          inputs: [selectedFileId, ...Array.from(selectedContextIds)],
+          inputs: [selectedFileId, ...selectedSupportingFiles.map((file) => file.id), ...Array.from(selectedContextIds)],
           outputs: []
         });
       }
@@ -1064,6 +1674,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                 value={selectedFileId}
                                 onChange={(e) => {
                                   setSelectedFileId(e.target.value);
+                                  setSelectedSupportingIds([]);
                                   setAnalysisConcept(null);
                                   setWizardExplanation('');
                                   setVariable1('');
@@ -1073,6 +1684,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                   setPlanNotes([]);
                                   setEnforcePreSpecifiedPlan(false);
                                   setActivePlanId(null);
+                                  setBackendPreview(null);
                                 }}
                                 className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-medical-500 outline-none bg-slate-50 text-sm"
                               >
@@ -1081,6 +1693,44 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                   <option key={f.id} value={f.id}>{f.name}</option>
                                 ))}
                               </select>
+                            </div>
+                            <div>
+                              <label className="block text-sm font-semibold text-slate-700 mb-2">Supporting Datasets (Optional, for advanced row-level analysis)</label>
+                              <div className="rounded-xl border border-slate-200 bg-slate-50 max-h-52 overflow-y-auto divide-y divide-slate-200">
+                                {!selectedFile ? (
+                                  <div className="p-3 text-sm text-slate-500">Choose a primary dataset first to unlock supporting sources.</div>
+                                ) : supportingSourceFiles.length === 0 ? (
+                                  <div className="p-3 text-sm text-slate-500">No additional datasets are available.</div>
+                                ) : (
+                                  supportingSourceFiles.map((file) => {
+                                    const role = resolveDatasetRole(file);
+                                    return (
+                                      <label key={file.id} className="flex items-start gap-3 p-3 cursor-pointer hover:bg-white">
+                                        <input
+                                          type="checkbox"
+                                          checked={selectedSupportingIds.includes(file.id)}
+                                          onChange={() => toggleSupportingFile(file.id)}
+                                          className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                        />
+                                        <div className="min-w-0">
+                                          <div className="text-sm font-medium text-slate-800 break-words">{file.name}</div>
+                                          <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-slate-500">
+                                            <span>{file.type}</span>
+                                            {role && (
+                                              <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 font-semibold text-indigo-700">
+                                                {role}
+                                              </span>
+                                            )}
+                                          </div>
+                                        </div>
+                                      </label>
+                                    );
+                                  })
+                                )}
+                              </div>
+                              <div className="mt-2 text-xs text-slate-500">
+                                Select ADaM-style supporting datasets such as <span className="font-semibold">ADSL</span>, <span className="font-semibold">ADAE</span>, <span className="font-semibold">ADLB</span>, <span className="font-semibold">ADTTE</span>, <span className="font-semibold">ADEX/EX</span>, or <span className="font-semibold">DS</span> when the question needs row-level joins, exposure derivation, or persistence outcomes.
+                              </div>
                             </div>
                          </div>
                       </div>
@@ -1208,6 +1858,39 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                          </div>
 
                          <div className="mb-5 p-4 rounded-lg border border-blue-100 bg-blue-50">
+                            <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-3 mb-3">
+                              <div>
+                                <label className="block text-xs font-semibold text-blue-800 uppercase mb-2">
+                                  Endpoint Builder
+                                </label>
+                                <select
+                                  value={endpointTemplateKey}
+                                  onChange={(e) => setEndpointTemplateKey(e.target.value as EndpointTemplateKey)}
+                                  disabled={usageMode === UsageMode.OFFICIAL}
+                                  className="w-full p-2.5 border border-blue-200 rounded-lg focus:ring-2 focus:ring-blue-400 outline-none text-sm bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                >
+                                  {ENDPOINT_TEMPLATE_OPTIONS.map((option) => (
+                                    <option key={option.key} value={option.key}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <p className="mt-2 text-xs text-blue-900">{selectedEndpointTemplate.helper}</p>
+                              </div>
+                              <div className="flex items-end">
+                                <button
+                                  onClick={applyEndpointTemplate}
+                                  disabled={usageMode === UsageMode.OFFICIAL}
+                                  className={`px-3 py-2 rounded text-xs font-bold transition-colors ${
+                                    usageMode === UsageMode.OFFICIAL
+                                      ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                                  }`}
+                                >
+                                  Apply Template
+                                </button>
+                              </div>
+                            </div>
                             <label className="block text-xs font-semibold text-blue-800 uppercase mb-2">
                               Ask In Plain Language
                             </label>
@@ -1243,6 +1926,107 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                               >
                                 {isPlanning ? 'Planning...' : 'Auto Configure'}
                               </button>
+                            </div>
+                            <div className="mt-4 rounded-lg border border-blue-200 bg-white p-3">
+                              <div className="text-[11px] font-semibold uppercase tracking-wide text-blue-800 mb-3">
+                                Guided Endpoint Spec
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Backend Family</label>
+                                  <select
+                                    value={guidedBackendFamily}
+                                    onChange={(e) => setGuidedBackendFamily(e.target.value as FastApiCapabilityResponse['analysis_family'])}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  >
+                                    <option value="unknown">Auto from question</option>
+                                    <option value="risk_difference">Incidence / Risk Difference</option>
+                                    <option value="logistic_regression">Logistic Regression</option>
+                                    <option value="cox">Cox Time-To-Event</option>
+                                    <option value="mixed_model">Repeated Measures</option>
+                                    <option value="threshold_search">Threshold Search</option>
+                                    <option value="competing_risks">Competing Risks</option>
+                                    <option value="feature_importance">Feature Importance</option>
+                                    <option value="partial_dependence">Partial Dependence</option>
+                                  </select>
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Endpoint Label</label>
+                                  <input
+                                    value={guidedEndpointLabel}
+                                    onChange={(e) => setGuidedEndpointLabel(e.target.value)}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    placeholder="User-facing endpoint label"
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Target Definition</label>
+                                  <input
+                                    value={guidedTargetDefinition}
+                                    onChange={(e) => setGuidedTargetDefinition(e.target.value)}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    placeholder="e.g. grade_2_plus_dae_by_week_12"
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  />
+                                </div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div>
+                                    <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Grade Threshold</label>
+                                    <input
+                                      value={guidedGradeThreshold}
+                                      onChange={(e) => setGuidedGradeThreshold(e.target.value)}
+                                      disabled={usageMode === UsageMode.OFFICIAL}
+                                      placeholder="2"
+                                      className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Time Window (Days)</label>
+                                    <input
+                                      value={guidedTimeWindowDays}
+                                      onChange={(e) => setGuidedTimeWindowDays(e.target.value)}
+                                      disabled={usageMode === UsageMode.OFFICIAL}
+                                      placeholder="84"
+                                      className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                    />
+                                  </div>
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Term Filters</label>
+                                  <input
+                                    value={guidedTermFilters}
+                                    onChange={(e) => setGuidedTermFilters(e.target.value)}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    placeholder="rash, dermatologic, erythema"
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Interaction Terms</label>
+                                  <input
+                                    value={guidedInteractionTerms}
+                                    onChange={(e) => setGuidedInteractionTerms(e.target.value)}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    placeholder="treatment*dose, treatment*time"
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[11px] font-semibold text-slate-500 uppercase mb-1">Threshold Metric</label>
+                                  <select
+                                    value={guidedThresholdMetric}
+                                    onChange={(e) => setGuidedThresholdMetric(e.target.value as 'balanced_accuracy' | 'youden_j' | 'f1')}
+                                    disabled={usageMode === UsageMode.OFFICIAL}
+                                    className="w-full p-2 border border-slate-300 rounded text-xs bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                  >
+                                    <option value="balanced_accuracy">Balanced Accuracy</option>
+                                    <option value="youden_j">Youden J</option>
+                                    <option value="f1">F1 Score</option>
+                                  </select>
+                                </div>
+                              </div>
                             </div>
                             {wizardExplanation && (
                               <p className="mt-3 text-xs text-blue-900">{wizardExplanation}</p>
@@ -1469,7 +2253,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                </button>
                            </div>
 
-                           {usageMode === UsageMode.OFFICIAL && (
+                       {usageMode === UsageMode.OFFICIAL && (
                              <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
                                <div className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700 mb-2">Run Confirmed Checklist</div>
                                <ul className="space-y-2 text-sm text-slate-700">
@@ -1499,11 +2283,160 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                            )}
                        </div>
 
+                       <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
+                           <div className="flex items-start justify-between gap-3 mb-4">
+                             <div>
+                               <h3 className="font-bold text-slate-800">Advanced Analysis Plan Preview</h3>
+                               <p className="text-xs text-slate-500 mt-1">
+                                 Preview the recommended analysis family, required roles, and joined workspace before you generate code.
+                               </p>
+                             </div>
+                             <button
+                               onClick={handlePreviewBackendPlan}
+                               disabled={!canPreviewBackend || isPreviewingBackend}
+                               className={`px-3 py-2 rounded-lg text-xs font-bold transition-colors ${
+                                 !canPreviewBackend || isPreviewingBackend
+                                   ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                                   : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                               }`}
+                             >
+                               {isPreviewingBackend ? 'Previewing...' : 'Preview Analysis Plan'}
+                             </button>
+                           </div>
+
+                           {!backendPreview ? (
+                             <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
+                               No analysis preview yet. Use this when the analysis depends on multiple datasets, survival endpoints, or advanced row-level derivations.
+                             </div>
+                           ) : (
+                             <div className="space-y-4">
+                               <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                                 <div className="flex flex-wrap items-center gap-2">
+                                   <span className={`rounded-full px-2.5 py-1 text-[11px] font-bold uppercase ${
+                                     backendPreview.capability.status === 'executable'
+                                       ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                       : backendPreview.capability.status === 'missing_data'
+                                         ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                         : 'bg-slate-200 text-slate-700 border border-slate-300'
+                                   }`}>
+                                     {backendPreview.capability.status}
+                                   </span>
+                                   <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-bold text-indigo-700">
+                                     {backendPreview.capability.analysis_family}
+                                   </span>
+                                   <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-600">
+                                     {backendPreview.sourceNames.length} source dataset(s)
+                                   </span>
+                                 </div>
+                                 <p className="mt-3 text-sm text-slate-700">{backendPreview.plan?.explanation || backendPreview.capability.explanation}</p>
+                                 {backendPreview.workspace?.workspace_id && (
+                                   <div className="mt-3 text-xs text-slate-600 space-y-1">
+                                     <div>Workspace: <span className="font-semibold text-slate-800">{backendPreview.workspace.workspace_id}</span></div>
+                                     <div>
+                                       Shape: <span className="font-semibold text-slate-800">
+                                         {backendPreview.workspace.row_count ?? '—'} rows x {backendPreview.workspace.column_count ?? '—'} columns
+                                       </span>
+                                     </div>
+                                   </div>
+                                 )}
+                                 {backendPreview.workspace?.derived_columns.length ? (
+                                   <div className="mt-3">
+                                     <div className="text-[11px] font-semibold uppercase text-slate-500 mb-1">Derived Columns</div>
+                                     <div className="flex flex-wrap gap-2">
+                                       {backendPreview.workspace.derived_columns.map((column) => (
+                                         <span key={column} className="rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700">
+                                           {column}
+                                         </span>
+                                       ))}
+                                     </div>
+                                   </div>
+                                 ) : null}
+                                 {backendPreview.capability.missing_roles.length > 0 && (
+                                   <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                                     Missing roles: {backendPreview.capability.missing_roles.join(', ')}
+                                   </div>
+                                 )}
+                                 {backendPreview.capability.warnings.length > 0 && (
+                                   <div className="mt-3 text-xs text-slate-600 space-y-1">
+                                     {backendPreview.capability.warnings.map((warning, index) => (
+                                       <div key={`${warning}-${index}`}>- {warning}</div>
+                                     ))}
+                                   </div>
+                                 )}
+                               </div>
+
+                               {backendPreview.plan?.spec && (
+                                 <button
+                                   onClick={applyBackendPlanToWorkbench}
+                                   type="button"
+                                   className="w-full inline-flex items-center justify-center rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-700 hover:bg-indigo-100"
+                                 >
+                                   Apply Backend Plan
+                                 </button>
+                               )}
+
+                               {backendPreview.workspace?.preview_table && backendPreview.workspace.preview_table.rows.length > 0 && (
+                                 <div className="rounded-xl border border-slate-200 overflow-hidden">
+                                   <div className="bg-slate-50 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                     Workspace Preview
+                                   </div>
+                                   <div className="overflow-x-auto">
+                                     <table className="min-w-full text-xs">
+                                       <thead className="bg-white text-slate-500">
+                                         <tr>
+                                           {backendPreview.workspace.preview_table.columns.map((column) => (
+                                             <th key={column} className="px-3 py-2 text-left font-semibold border-b border-slate-200">
+                                               {column}
+                                             </th>
+                                           ))}
+                                         </tr>
+                                       </thead>
+                                       <tbody className="bg-white">
+                                         {backendPreview.workspace.preview_table.rows.slice(0, 5).map((row, rowIndex) => (
+                                           <tr key={rowIndex} className="border-b border-slate-100">
+                                             {backendPreview.workspace?.preview_table?.columns.map((column) => (
+                                               <td key={`${rowIndex}-${column}`} className="px-3 py-2 text-slate-700 whitespace-nowrap">
+                                                 {String(row[column] ?? '—')}
+                                               </td>
+                                             ))}
+                                           </tr>
+                                         ))}
+                                       </tbody>
+                                     </table>
+                                   </div>
+                                 </div>
+                               )}
+                             </div>
+                           )}
+                       </div>
+
                        <button
                          onClick={handleGenerateCode}
-                         disabled={isGenerating || !selectedFileId || !variable1 || !variable2 || availableColumns.length === 0 || Boolean(confirmedBlockingReason)}
+                         disabled={
+                           isGenerating ||
+                           !selectedFileId ||
+                           (
+                             (!variable1 || !variable2 || availableColumns.length === 0) &&
+                             !(
+                               Boolean(analysisQuestion.trim()) &&
+                               backendPreview?.capability.status === 'executable' &&
+                               SUPPORTED_BACKEND_FAMILIES.has(backendPreview.capability.analysis_family)
+                             )
+                           ) ||
+                           Boolean(confirmedBlockingReason)
+                         }
                          className={`w-full py-4 rounded-xl font-bold flex items-center justify-center shadow-lg transition-all text-sm ${
-                             isGenerating || !selectedFileId || !variable1 || !variable2 || availableColumns.length === 0 || Boolean(confirmedBlockingReason)
+                             isGenerating ||
+                             !selectedFileId ||
+                             (
+                               (!variable1 || !variable2 || availableColumns.length === 0) &&
+                               !(
+                                 Boolean(analysisQuestion.trim()) &&
+                                 backendPreview?.capability.status === 'executable' &&
+                                 SUPPORTED_BACKEND_FAMILIES.has(backendPreview.capability.analysis_family)
+                               )
+                             ) ||
+                             Boolean(confirmedBlockingReason)
                              ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                              : 'bg-medical-600 text-white hover:bg-medical-700 hover:shadow-xl'
                          }`}
@@ -1799,10 +2732,42 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                         <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Dataset</div>
                                         <div className="mt-1 font-medium text-slate-800 break-all">{activeSession?.params.fileName}</div>
                                     </div>
+                                    {activeSession?.params.supportingFileNames && activeSession.params.supportingFileNames.length > 0 && (
+                                      <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                                          <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Supporting Datasets</div>
+                                          <div className="mt-1 font-medium text-slate-800 break-words">
+                                            {activeSession.params.supportingFileNames.join(', ')}
+                                          </div>
+                                      </div>
+                                    )}
                                     <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                                         <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Variables</div>
-                                        <div className="mt-1 font-medium text-slate-800 break-words">{variable1} vs {variable2}</div>
+                                        <div className="mt-1 font-medium text-slate-800 break-words">
+                                          {activeSession?.params.var1 || variable1} vs {activeSession?.params.var2 || variable2}
+                                        </div>
                                     </div>
+                                    {activeSession?.params.backendAnalysisFamily && (
+                                      <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                                          <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Execution Engine</div>
+                                          <div className="mt-1 font-medium text-slate-800 break-words">
+                                            Deterministic analysis engine ({activeSession.params.backendAnalysisFamily})
+                                          </div>
+                                      </div>
+                                    )}
+                                    {activeSession?.params.backendWorkspaceId && (
+                                      <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                                          <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Workspace ID</div>
+                                          <div className="mt-1 font-medium text-slate-800 break-all">{activeSession.params.backendWorkspaceId}</div>
+                                      </div>
+                                    )}
+                                    {backendPreview?.workspace?.row_count != null && backendPreview.workspace.column_count != null && (
+                                      <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                                          <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Preview Workspace Shape</div>
+                                          <div className="mt-1 font-medium text-slate-800">
+                                            {backendPreview.workspace.row_count} rows x {backendPreview.workspace.column_count} columns
+                                          </div>
+                                      </div>
+                                    )}
                                     <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                                         <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Saved</div>
                                         <div className="mt-1 font-medium text-slate-800">

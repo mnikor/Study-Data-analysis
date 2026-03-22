@@ -3,7 +3,7 @@ import { parseCsv, stringifyCsv, toNumber, type CsvRow } from './dataProcessing'
 import type { AutopilotAnalysisTask } from './autopilotPlanner';
 import { formatComparisonLabel, formatDisplayName } from './displayNames';
 
-const SUBJECT_KEY_ALIASES = ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID'];
+const SUBJECT_KEY_ALIASES = ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID', 'PARTICIPANT_ID', 'PARTICIPANTID', 'PARTICIPANT'];
 const SIGNAL_TEXT_HINTS = ['PT', 'AETERM', 'SOC', 'TEST', 'LBTEST', 'GENE', 'BIOMARKER', 'MUTATION', 'VARIANT'];
 const IDENTIFIER_HINTS = ['ID', 'SUBJID', 'USUBJID', 'SUBJECT', 'PATIENT', 'RECORD'];
 

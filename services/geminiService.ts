@@ -19,11 +19,20 @@ import { isIsoDate, normalizeSex, parseCsv, stringifyCsv, toNumber } from "../ut
 import { executeLocalStatisticalAnalysis } from "../utils/statisticsEngine";
 import { formatComparisonLabel, formatDisplayName } from "../utils/displayNames";
 import { planAnalysisFromQuestion } from "../utils/queryPlanner";
+import { retrieveRelevantContext } from "../utils/rag";
 import {
-  type DatasetProfileKind,
   findHeaderByAlias as matchHeaderByAlias,
   inferDatasetProfileFromHeaders,
+  mapProfileKindToAnalysisRole,
 } from "../utils/datasetProfile";
+import {
+  buildAnalysisWorkspace,
+  classifyAnalysisCapabilities,
+  requestAnalysisPlan,
+  runBackendAnalysis,
+  type FastApiAnalysisSpec,
+  type FastApiDatasetReference,
+} from "./fastapiAnalysisService";
 
 const JsonType = {
   OBJECT: 'OBJECT',
@@ -44,6 +53,15 @@ interface ProxyGenerateRequest {
   temperature?: number;
   responseMimeType?: string;
   responseSchema?: Record<string, unknown>;
+}
+
+interface StatisticalExecutionOptions {
+  question?: string;
+  sourceFiles?: ClinicalFile[];
+  covariates?: string[];
+  imputationMethod?: string;
+  applyPSM?: boolean;
+  backendSpec?: FastApiAnalysisSpec | null;
 }
 
 const getNodeClient = async () => {
@@ -167,6 +185,10 @@ const formatAiServiceError = (error: unknown): string => {
 
 const CHAT_EXECUTION_INTENT = /compare|difference|association|correlat|regress|incidence|rate|frequency|distribution|trend|outlier|analy[sz]e|analysis|run|test|chart|kaplan|survival|hazard|cox|anova|chi[- ]?square|t[- ]?test/i;
 const CHAT_GUIDANCE_INTENT = /what can i do|which workflow|how should i|what does this dataset|review the selected|explain the dataset|what files|how to start/i;
+const ADVANCED_ANALYSIS_GUARD_INTENT =
+  /feature importance|partial dependence|predictor|predictors|week\s*\d+|risk difference|95%\s*ci|confidence interval|time to resolution|adherence|compliance|interrupt|reduction|discontinuation|dose|mitigat|key drivers|model outputs/i;
+const SURVIVAL_BACKEND_GUARD_INTENT =
+  /kaplan|survival|hazard ratio|cox|time[- ]to[- ]event|time to event|overall survival|progression[- ]free|\bpfs\b|\bos\b/i;
 
 const canRunExploratoryChatAnalysis = (query: string, contextFiles: ClinicalFile[]): ClinicalFile | null => {
   if (!CHAT_EXECUTION_INTENT.test(query) || CHAT_GUIDANCE_INTENT.test(query)) {
@@ -178,6 +200,725 @@ const canRunExploratoryChatAnalysis = (query: string, contextFiles: ClinicalFile
   );
 
   return dataFiles.length === 1 ? dataFiles[0] : null;
+};
+
+const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReference => {
+  if (!file.content) {
+    return {
+      file_id: file.id,
+      name: file.name,
+      role: file.metadata?.datasetRole as string | undefined,
+      column_names: [],
+    };
+  }
+
+  try {
+    const { headers, rows } = parseCsv(file.content);
+    const profile = inferDatasetProfileFromHeaders(file.name, file.type, headers);
+    const role = mapProfileKindToAnalysisRole(profile.kind) || file.metadata?.datasetRole as string | undefined;
+
+    return {
+      file_id: file.id,
+      name: file.name,
+      role,
+      row_count: rows.length,
+      column_names: headers,
+      content: file.content,
+    };
+  } catch {
+    return {
+      file_id: file.id,
+      name: file.name,
+      role: file.metadata?.datasetRole as string | undefined,
+      column_names: [],
+    };
+  }
+};
+
+const buildBackendExecutionQuestion = (
+  testType: StatTestType,
+  var1: string,
+  var2: string,
+  question?: string
+): string => {
+  if (question?.trim()) return question.trim();
+
+  switch (testType) {
+    case StatTestType.KAPLAN_MEIER:
+      return `Compare survival between ${var1} groups using ${var2} as the time variable.`;
+    case StatTestType.COX_PH:
+      return `Estimate the hazard ratio by ${var1} using ${var2} as the time variable.`;
+    case StatTestType.CHI_SQUARE:
+      return `Compare incidence or proportions across ${var1} using ${var2} as the outcome.`;
+    case StatTestType.T_TEST:
+      return `Compare the mean of ${var2} across ${var1} groups.`;
+    case StatTestType.ANOVA:
+      return `Compare the mean of ${var2} across ${var1} categories using ANOVA.`;
+    case StatTestType.REGRESSION:
+      return `Model ${var2} using ${var1} as a predictor.`;
+    case StatTestType.CORRELATION:
+      return `Assess the correlation between ${var1} and ${var2}.`;
+    default:
+      return `${testType}: ${var1} vs ${var2}`;
+  }
+};
+
+const metricsListToRecord = (
+  metrics: Array<{ name: string; value: string | number }>
+): Record<string, string | number> =>
+  Object.fromEntries(metrics.map((metric) => [metric.name, metric.value]));
+
+const toFiniteNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
+const buildFastApiChartConfig = (
+  analysisFamily: string,
+  table?: { title: string; columns: string[]; rows: Array<Record<string, string | number>> } | null
+) => {
+  if (!table || table.rows.length === 0) {
+    return {
+      data: [],
+      layout: {
+        title: { text: `FastAPI ${analysisFamily} result` },
+      },
+    };
+  }
+
+  if (analysisFamily === 'incidence' || analysisFamily === 'risk_difference') {
+    const categoryColumn = table.columns[0];
+    const values = table.rows.map((row) => toFiniteNumber(row.incidence_pct) ?? 0);
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: table.rows.map((row) => String(row[categoryColumn] ?? '')),
+          y: values,
+          marker: { color: '#2563eb' },
+        },
+      ],
+      layout: {
+        title: { text: table.title || 'Incidence by treatment group' },
+        xaxis: { title: categoryColumn },
+        yaxis: { title: 'Incidence (%)' },
+      },
+    };
+  }
+
+  if (analysisFamily === 'kaplan_meier') {
+    const categoryColumn = table.columns[0];
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: table.rows.map((row) => String(row[categoryColumn] ?? '')),
+          y: table.rows.map((row) => toFiniteNumber(row.median_survival)),
+          marker: { color: '#0f766e' },
+          customdata: table.rows.map((row) => [row.event_n, row.n]),
+          hovertemplate: '%{x}<br>Median survival: %{y}<br>Events: %{customdata[0]} / %{customdata[1]}<extra></extra>',
+        },
+      ],
+      layout: {
+        title: { text: table.title || 'Kaplan-Meier summary by treatment group' },
+        xaxis: { title: categoryColumn },
+        yaxis: { title: 'Median survival' },
+      },
+    };
+  }
+
+  if (analysisFamily === 'competing_risks') {
+    const categoryColumn = table.columns[0];
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: table.rows.map((row) => String(row[categoryColumn] ?? '')),
+          y: table.rows.map((row) => toFiniteNumber(row.cumulative_incidence) ?? 0),
+          marker: { color: '#b45309' },
+          customdata: table.rows.map((row) => [row.event_of_interest_n, row.competing_event_n]),
+          hovertemplate: '%{x}<br>Cumulative incidence: %{y}<br>Event of interest: %{customdata[0]}<br>Competing events: %{customdata[1]}<extra></extra>',
+        },
+      ],
+      layout: {
+        title: { text: table.title || 'Competing-risks cumulative incidence' },
+        xaxis: { title: categoryColumn },
+        yaxis: { title: 'Cumulative incidence' },
+      },
+    };
+  }
+
+  if (analysisFamily === 'logistic_regression' || analysisFamily === 'cox' || analysisFamily === 'mixed_model') {
+    const isRepeated = analysisFamily === 'mixed_model';
+    const estimateKey = analysisFamily === 'cox' ? 'hazard_ratio' : 'odds_ratio';
+    const color = analysisFamily === 'cox' ? '#dc2626' : isRepeated ? '#0891b2' : '#7c3aed';
+    const x = table.rows.map((row) => toFiniteNumber(row[isRepeated ? 'coefficient' : estimateKey]) ?? (isRepeated ? 0 : 1));
+    const lower = table.rows.map((row) => toFiniteNumber(row.ci_lower_95) ?? (isRepeated ? 0 : 1));
+    const upper = table.rows.map((row) => toFiniteNumber(row.ci_upper_95) ?? (isRepeated ? 0 : 1));
+    return {
+      data: [
+        {
+          type: 'scatter',
+          mode: 'markers',
+          x,
+          y: table.rows.map((row) => String(row.predictor ?? '')),
+          marker: { color, size: 12 },
+          error_x: {
+            type: 'data',
+            visible: true,
+            array: upper.map((value, index) => value - x[index]),
+            arrayminus: lower.map((value, index) => x[index] - value),
+          },
+          hovertemplate: `%{y}<br>${(isRepeated ? 'coefficient' : estimateKey).replace('_', ' ')}: %{x}<extra></extra>`,
+        },
+      ],
+      layout: {
+        title: { text: table.title || `FastAPI ${analysisFamily}` },
+        xaxis: { title: (isRepeated ? 'coefficient' : estimateKey).replace('_', ' ') },
+        yaxis: { automargin: true },
+        shapes: [
+          {
+            type: 'line',
+            x0: isRepeated ? 0 : 1,
+            x1: isRepeated ? 0 : 1,
+            y0: -0.5,
+            y1: Math.max(0.5, table.rows.length - 0.5),
+            line: { color: '#94a3b8', dash: 'dash' },
+          },
+        ],
+      },
+    };
+  }
+
+  if (analysisFamily === 'threshold_search') {
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: table.rows.map((row) => String(row.predictor ?? '')),
+          y: table.rows.map((row) => toFiniteNumber(row.score) ?? 0),
+          marker: { color: '#0f766e' },
+          customdata: table.rows.map((row) => [row.threshold, row.direction, row.balanced_accuracy, row.sensitivity, row.specificity]),
+          hovertemplate: '%{x}<br>Score: %{y}<br>Threshold: %{customdata[0]} (%{customdata[1]})<br>Balanced accuracy: %{customdata[2]}<br>Sensitivity: %{customdata[3]}<br>Specificity: %{customdata[4]}<extra></extra>',
+        },
+      ],
+      layout: {
+        title: { text: table.title || 'Threshold search ranking' },
+        xaxis: { automargin: true },
+        yaxis: { title: 'Optimization score' },
+      },
+    };
+  }
+
+  if (analysisFamily === 'feature_importance') {
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: table.rows.map((row) => toFiniteNumber(row.importance) ?? 0),
+          y: table.rows.map((row) => String(row.predictor ?? '')),
+          orientation: 'h',
+          marker: { color: '#2563eb' },
+          hovertemplate: '%{y}<br>Importance: %{x}<extra></extra>',
+        },
+      ],
+      layout: {
+        title: { text: table.title || 'Exploratory feature importance' },
+        xaxis: { title: 'Importance' },
+        yaxis: { automargin: true, autorange: 'reversed' },
+      },
+    };
+  }
+
+  if (analysisFamily === 'partial_dependence') {
+    const features = Array.from(new Set(table.rows.map((row) => String(row.feature ?? '')).filter(Boolean)));
+    return {
+      data: features.map((feature, index) => ({
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: feature,
+        x: table.rows
+          .filter((row) => String(row.feature ?? '') === feature)
+          .map((row) => toFiniteNumber(row.feature_value) ?? 0),
+        y: table.rows
+          .filter((row) => String(row.feature ?? '') === feature)
+          .map((row) => toFiniteNumber(row.partial_dependence) ?? 0),
+        marker: { color: ['#7c3aed', '#2563eb', '#0f766e'][index % 3] },
+        hovertemplate: `${feature}<br>Value: %{x}<br>Partial dependence: %{y}<extra></extra>`,
+      })),
+      layout: {
+        title: { text: table.title || 'Exploratory partial dependence' },
+        xaxis: { title: 'Feature value' },
+        yaxis: { title: 'Partial dependence' },
+      },
+    };
+  }
+
+  return {
+    data: [
+      {
+        type: 'bar',
+        x: table.rows.map((row, index) => String(row[table.columns[0]] ?? `Row ${index + 1}`)),
+        y: table.rows.map((row) => toFiniteNumber(row[table.columns[1]]) ?? 0),
+        marker: { color: '#2563eb' },
+      },
+    ],
+    layout: {
+      title: { text: table.title || `FastAPI ${analysisFamily}` },
+      xaxis: { title: table.columns[0] },
+      yaxis: { title: table.columns[1] || 'Value' },
+    },
+  };
+};
+
+const buildFastApiExecutedCode = (
+  code: string,
+  analysisFamily: string,
+  workspaceId?: string | null,
+  sourceFiles?: ClinicalFile[]
+) =>
+  [
+    '# FastAPI deterministic backend execution',
+    `# Analysis family: ${analysisFamily}`,
+    ...(workspaceId ? [`# Workspace ID: ${workspaceId}`] : []),
+    ...(sourceFiles && sourceFiles.length > 0 ? [`# Source datasets: ${sourceFiles.map((file) => file.name).join(', ')}`] : []),
+    '',
+    code || '# No local Python preview was supplied.',
+  ].join('\n');
+
+const maybeExecuteFastApiStatisticalAnalysis = async (
+  code: string,
+  file: ClinicalFile,
+  testType: StatTestType,
+  resolvedVar1: string,
+  resolvedVar2: string,
+  options?: StatisticalExecutionOptions
+): Promise<StatAnalysisResult | null> => {
+  const sourceFiles = (options?.sourceFiles && options.sourceFiles.length > 0 ? options.sourceFiles : [file])
+    .filter((candidate) => (candidate.type === DataType.RAW || candidate.type === DataType.STANDARDIZED) && Boolean(candidate.content));
+  if (sourceFiles.length === 0) {
+    return null;
+  }
+
+  const question = buildBackendExecutionQuestion(testType, resolvedVar1, resolvedVar2, options?.question);
+  const datasetRefs = sourceFiles.map(buildDatasetReference);
+
+  try {
+    const capability = await classifyAnalysisCapabilities(question, datasetRefs);
+    if (
+      capability.status !== 'executable' ||
+      !['incidence', 'risk_difference', 'logistic_regression', 'kaplan_meier', 'cox', 'mixed_model', 'threshold_search', 'competing_risks', 'feature_importance', 'partial_dependence'].includes(capability.analysis_family)
+    ) {
+      return null;
+    }
+
+    const plan = await requestAnalysisPlan(question, datasetRefs);
+    const spec: FastApiAnalysisSpec | undefined =
+      plan.spec || options?.backendSpec
+        ? ({
+            ...(plan.spec || {}),
+            ...(options?.backendSpec || {}),
+          } as FastApiAnalysisSpec)
+        : undefined;
+    if (spec) {
+      if (options?.covariates && options.covariates.length > 0) {
+        spec.covariates = options.covariates;
+      }
+      if (testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) {
+        spec.treatment_variable = resolvedVar1 || spec.treatment_variable;
+        spec.time_variable = resolvedVar2 || spec.time_variable;
+      }
+    }
+
+    const workspace = await buildAnalysisWorkspace(question, datasetRefs, spec);
+    const executed = await runBackendAnalysis(question, datasetRefs, spec, workspace.workspace_id);
+    if (!executed.executed) {
+      if (sourceFiles.length > 1) {
+        throw new Error(executed.explanation || 'FastAPI backend did not return an executed result.');
+      }
+      return null;
+    }
+
+    return {
+      metrics: metricsListToRecord(executed.metrics),
+      interpretation: executed.interpretation || executed.explanation,
+      chartConfig: buildFastApiChartConfig(executed.analysis_family, executed.table),
+      tableConfig: executed.table
+        ? {
+            title: executed.table.title,
+            columns: executed.table.columns,
+            rows: executed.table.rows,
+          }
+        : undefined,
+      executedCode: buildFastApiExecutedCode(code, executed.analysis_family, executed.workspace_id, sourceFiles),
+      backendExecution: {
+        engine: 'FASTAPI',
+        analysisFamily: executed.analysis_family,
+        workspaceId: executed.workspace_id,
+        sourceNames: sourceFiles.map((candidate) => candidate.name),
+      },
+      aiCommentary: {
+        source: 'FALLBACK',
+        summary: executed.interpretation || executed.explanation,
+        limitations: executed.warnings.length > 0 ? executed.warnings : ['Result came from the FastAPI deterministic backend execution layer.'],
+      },
+    };
+  } catch (error) {
+    if (sourceFiles.length > 1) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(message || 'FastAPI backend execution failed.');
+    }
+    return null;
+  }
+};
+
+const requiresAdvancedAnalysisGuard = (query: string, contextFiles: ClinicalFile[]): boolean => {
+  if (CHAT_GUIDANCE_INTENT.test(query)) {
+    return false;
+  }
+
+  const tabularFiles = contextFiles.filter(
+    (file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)
+  );
+
+  if (ADVANCED_ANALYSIS_GUARD_INTENT.test(query)) {
+    return tabularFiles.length >= 1;
+  }
+
+  if (SURVIVAL_BACKEND_GUARD_INTENT.test(query)) {
+    return tabularFiles.length > 1;
+  }
+
+  return false;
+};
+
+const DATASET_FEASIBILITY_INTENT = /\bcan i answer this question\b|\bcan i answer\b|\bcan this dataset answer\b|\bwith this dataset\b|\bdo i have enough data\b|\bis this enough data\b|\bcan we answer\b/i;
+
+const isDatasetFeasibilityQuestion = (query: string) => DATASET_FEASIBILITY_INTENT.test(query);
+
+const describeRole = (role: string) => {
+  switch (role) {
+    case 'ADSL':
+      return 'subject-level baseline and treatment data';
+    case 'ADAE':
+      return 'adverse event rows with grade and timing';
+    case 'ADLB':
+      return 'baseline laboratory data';
+    case 'ADTTE':
+      return 'time-to-event endpoint data';
+    case 'ADEX':
+    case 'EX':
+      return 'exposure or dosing data';
+    case 'DS':
+      return 'disposition, discontinuation, or adherence data';
+    default:
+      return role;
+  }
+};
+
+const describeFamily = (family: string) => {
+  switch (family) {
+    case 'incidence':
+    case 'risk_difference':
+      return 'incidence and risk-difference analysis';
+    case 'logistic_regression':
+      return 'predictor modeling';
+    case 'kaplan_meier':
+    case 'cox':
+      return 'time-to-event analysis';
+    case 'mixed_model':
+      return 'repeated-measures modeling';
+    case 'threshold_search':
+      return 'early-warning threshold search';
+    case 'competing_risks':
+      return 'competing-risks cumulative-incidence analysis';
+    case 'feature_importance':
+    case 'partial_dependence':
+      return 'exploratory machine-learning analysis';
+    default:
+      return 'backend analysis';
+  }
+};
+
+const runAdvancedAnalysisGuard = async (
+  query: string,
+  contextFiles: ClinicalFile[]
+): Promise<AnalysisResponse | null> => {
+  if (!requiresAdvancedAnalysisGuard(query, contextFiles)) {
+    return null;
+  }
+
+  const datasetRefs = contextFiles
+    .filter((file) => file.type === DataType.RAW || file.type === DataType.STANDARDIZED)
+    .map(buildDatasetReference);
+
+  const fallbackAnswer = [
+    '### Advanced analysis requires the FastAPI execution path',
+    'This request was blocked from the summary-only AI Chat path because it needs row-level workspace construction and deterministic backend execution.',
+    '',
+    'The current chat context for multiple tabular files only includes dataset profiles and summaries, which is not sufficient for feature importance, partial dependence, Week 12 endpoint derivation, or similar multi-domain analyses.',
+    '',
+    'Start the full stack with `npm run dev` or run the backend separately with `npm run api:start`, then route this request through the new analysis workflow.',
+  ].join('\n');
+
+  try {
+    const capability = await classifyAnalysisCapabilities(query, datasetRefs);
+    const feasibilityQuestion = isDatasetFeasibilityQuestion(query);
+
+    if (feasibilityQuestion) {
+      const missingDescriptions = capability.missing_roles.map(describeRole);
+      const familyDescription = describeFamily(capability.analysis_family);
+      const baseAnswer =
+        capability.status === 'executable'
+          ? [
+              '### Yes, this dataset looks capable of supporting that analysis',
+              `Based on the selected files, the app can map this request to ${familyDescription}.`,
+              '',
+              'To actually compute the result, the backend still needs to run the row-level analysis workflow.',
+            ]
+          : [
+              '### Not yet, this dataset selection is not sufficient',
+              capability.explanation || `The current files do not yet support ${familyDescription}.`,
+            ];
+
+      return {
+        answer: [
+          ...baseAnswer,
+          ...(missingDescriptions.length > 0
+            ? ['', `**Still needed:** ${missingDescriptions.join(', ')}.`]
+            : ['', '**What is already present:** the key dataset roles needed for this analysis appear to be selected.']),
+          ...(capability.warnings.length > 0
+            ? ['', '### Things to check', ...capability.warnings.map((warning) => `- ${warning}`)]
+            : []),
+          '',
+          capability.status === 'executable'
+            ? 'If you want, ask the app to run the analysis rather than just assess feasibility.'
+            : 'Select the missing domains or clean the role mapping, then ask the app to run the analysis.',
+        ].join('\n'),
+      };
+    }
+
+    if (
+      capability.status === 'executable' &&
+      (
+        capability.analysis_family === 'incidence' ||
+        capability.analysis_family === 'risk_difference' ||
+        capability.analysis_family === 'logistic_regression' ||
+        capability.analysis_family === 'kaplan_meier' ||
+        capability.analysis_family === 'cox' ||
+        capability.analysis_family === 'mixed_model' ||
+        capability.analysis_family === 'threshold_search' ||
+        capability.analysis_family === 'competing_risks' ||
+        capability.analysis_family === 'feature_importance' ||
+        capability.analysis_family === 'partial_dependence'
+      )
+    ) {
+      const plan = await requestAnalysisPlan(query, datasetRefs);
+      const workspace = await buildAnalysisWorkspace(query, datasetRefs, plan.spec || undefined);
+      const executed = await runBackendAnalysis(query, datasetRefs, plan.spec || undefined, workspace.workspace_id);
+
+      if (executed.executed) {
+        const metrics = Object.fromEntries(executed.metrics.map((metric) => [metric.name, metric.value]));
+        const buildFamilyLabel = () => {
+          switch (executed.analysis_family) {
+            case 'feature_importance':
+              return 'Exploratory predictor ranking';
+            case 'partial_dependence':
+              return 'Exploratory predictor profile';
+            case 'mixed_model':
+              return 'Repeated-measures model';
+            case 'threshold_search':
+              return 'Early warning threshold search';
+            case 'competing_risks':
+              return 'Competing-risks summary';
+            case 'incidence':
+            case 'risk_difference':
+              return 'Incidence comparison';
+            case 'logistic_regression':
+              return 'Predictor analysis';
+            case 'kaplan_meier':
+              return 'Survival comparison';
+            case 'cox':
+              return 'Time-to-event model';
+            default:
+              return 'Analysis results';
+          }
+        };
+
+        const buildMeaningText = () => {
+          switch (executed.analysis_family) {
+            case 'feature_importance':
+              return [
+                metrics.top_predictor
+                  ? `In this exploratory model, the strongest predictor was ${metrics.top_predictor}.`
+                  : null,
+                metrics.candidate_predictors
+                  ? `${metrics.candidate_predictors} candidate predictors were usable after preprocessing.`
+                  : null,
+                metrics.subjects_used && metrics.event_subjects
+                  ? `The model used ${metrics.subjects_used} subjects, including ${metrics.event_subjects} subjects who met the derived endpoint.`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(' ');
+            case 'partial_dependence':
+              return [
+                metrics.features_profiled
+                  ? `Partial dependence summaries were generated for ${metrics.features_profiled} top predictors.`
+                  : null,
+                metrics.subjects_used && metrics.event_subjects
+                  ? `The model used ${metrics.subjects_used} subjects, including ${metrics.event_subjects} subjects who met the derived endpoint.`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(' ');
+            case 'mixed_model':
+              return metrics.observations_used && metrics.subjects_used
+                ? `The repeated-measures model used ${metrics.observations_used} visit-level observations from ${metrics.subjects_used} subjects.`
+                : 'This result estimates within-subject change over time and treatment-by-time effects.';
+            case 'threshold_search':
+              return metrics.top_predictor
+                ? `The highest-ranking threshold rule came from ${metrics.top_predictor}.`
+                : 'This result ranks candidate cutoffs for later persistence risk.';
+            case 'competing_risks':
+              return metrics.subjects_used && metrics.event_of_interest_subjects
+                ? `The cumulative-incidence summary used ${metrics.subjects_used} subjects, including ${metrics.event_of_interest_subjects} event-of-interest outcomes.`
+                : 'This result summarizes event-of-interest incidence in the presence of competing events.';
+            case 'logistic_regression':
+              return metrics.predictor_columns
+                ? `The model retained ${metrics.predictor_columns} informative predictor terms in the final regression.`
+                : 'This result estimates which baseline factors are associated with the binary endpoint.';
+            case 'cox':
+              return metrics.concordance_index
+                ? `The fitted time-to-event model achieved a concordance index of ${metrics.concordance_index}.`
+                : 'This result estimates how the selected predictors relate to time-to-event risk.';
+            case 'kaplan_meier':
+              return metrics.subjects_used && metrics.event_subjects
+                ? `The survival comparison used ${metrics.subjects_used} subjects with ${metrics.event_subjects} observed events.`
+                : 'This result compares time-to-event patterns across groups.';
+            case 'incidence':
+            case 'risk_difference':
+              return metrics.total_subjects && metrics.event_subjects
+                ? `${metrics.cohort_filters_applied ? `The requested cohort filter was applied (${metrics.cohort_filters_applied}). ` : ''}The comparison used ${metrics.total_subjects} subjects, of whom ${metrics.event_subjects} met the endpoint.`
+                : 'This result compares the endpoint frequency across groups.';
+            default:
+              return executed.interpretation || executed.explanation || '';
+          }
+        };
+
+        const buildNaturalLanguageInsights = () => {
+          const insights: string[] = [];
+          switch (executed.analysis_family) {
+            case 'feature_importance':
+              if (metrics.top_predictor) insights.push(`${metrics.top_predictor} was the strongest predictor in this exploratory model.`);
+              if (metrics.subjects_used) insights.push(`The model used ${metrics.subjects_used} subjects.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} subjects met the derived endpoint.`);
+              if (metrics.candidate_predictors) insights.push(`${metrics.candidate_predictors} candidate predictors were evaluated after preprocessing.`);
+              break;
+            case 'partial_dependence':
+              if (metrics.features_profiled) insights.push(`Partial dependence was generated for ${metrics.features_profiled} leading predictors.`);
+              if (metrics.subjects_used) insights.push(`The model used ${metrics.subjects_used} subjects.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} subjects met the derived endpoint.`);
+              break;
+            case 'mixed_model':
+              if (metrics.subjects_used) insights.push(`The repeated-measures model used ${metrics.subjects_used} subjects.`);
+              if (metrics.observations_used) insights.push(`${metrics.observations_used} repeated observations contributed to the fit.`);
+              if (metrics.predictor_columns) insights.push(`${metrics.predictor_columns} informative fixed-effect terms remained in the model.`);
+              break;
+            case 'threshold_search':
+              if (metrics.top_predictor) insights.push(`${metrics.top_predictor} produced the top-ranked threshold rule.`);
+              if (metrics.candidate_predictors) insights.push(`${metrics.candidate_predictors} predictor candidates were scored.`);
+              if (metrics.subjects_used) insights.push(`The threshold search used ${metrics.subjects_used} subjects.`);
+              break;
+            case 'competing_risks':
+              if (metrics.subjects_used) insights.push(`The cumulative-incidence summary used ${metrics.subjects_used} subjects.`);
+              if (metrics.event_of_interest_subjects) insights.push(`${metrics.event_of_interest_subjects} event-of-interest outcomes were observed.`);
+              if (metrics.competing_event_subjects) insights.push(`${metrics.competing_event_subjects} competing events were observed.`);
+              break;
+            case 'logistic_regression':
+              if (metrics.subjects_used) insights.push(`The regression used ${metrics.subjects_used} subjects.`);
+              if (metrics.predictor_columns) insights.push(`${metrics.predictor_columns} informative predictor terms remained in the fitted model.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} subjects contributed endpoint events.`);
+              break;
+            case 'cox':
+              if (metrics.subjects_used) insights.push(`The time-to-event model used ${metrics.subjects_used} subjects.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} observed events were included.`);
+              if (metrics.concordance_index) insights.push(`Model discrimination was ${metrics.concordance_index} by concordance index.`);
+              break;
+            case 'kaplan_meier':
+              if (metrics.subjects_used) insights.push(`The survival comparison used ${metrics.subjects_used} subjects.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} observed events contributed to the comparison.`);
+              if (metrics.log_rank_p_value) insights.push(`The log-rank p-value was ${metrics.log_rank_p_value}.`);
+              break;
+            case 'incidence':
+            case 'risk_difference':
+              if (metrics.cohort_filters_applied) insights.push(`Applied cohort filters: ${metrics.cohort_filters_applied}.`);
+              if (metrics.total_subjects) insights.push(`The comparison used ${metrics.total_subjects} subjects.`);
+              if (metrics.event_subjects) insights.push(`${metrics.event_subjects} subjects met the endpoint.`);
+              if (metrics.risk_difference) insights.push(`The estimated risk difference was ${metrics.risk_difference}.`);
+              break;
+            default:
+              break;
+          }
+          return insights;
+        };
+
+        const summaryText = executed.interpretation || executed.explanation;
+        const meaningText = buildMeaningText();
+        return {
+          answer: [
+            `### ${buildFamilyLabel()}`,
+            summaryText,
+            ...(meaningText ? ['', '### What this means', meaningText] : []),
+            ...(executed.warnings.length > 0 ? ['', '### Important cautions', ...executed.warnings.map((warning) => `- ${warning}`)] : []),
+          ].join('\n'),
+          tableConfig: executed.table
+            ? {
+                title: executed.table.title,
+                columns: executed.table.columns,
+                rows: executed.table.rows,
+              }
+            : undefined,
+          keyInsights: buildNaturalLanguageInsights(),
+        };
+      }
+    }
+
+    return {
+      answer: [
+        '### This question needs a full backend analysis run',
+        capability.status === 'executable'
+          ? `The selected files look structurally suitable for ${describeFamily(capability.analysis_family)}, but chat has not produced a validated result yet.`
+          : capability.explanation,
+        '',
+        capability.missing_roles.length > 0
+          ? `**Still needed:** ${capability.missing_roles.map(describeRole).join(', ')}.`
+          : '**Selected data:** enough to recognize the needed analysis workflow.',
+        ...(capability.warnings.length > 0 ? ['', '### Things to check', ...capability.warnings.map((warning) => `- ${warning}`)] : []),
+        '',
+        'Chat is intentionally not inventing a chart or a result table here. To answer the question, the app needs to execute the backend workflow on the selected data.',
+      ].join('\n'),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown FastAPI execution error';
+    return {
+      answer: [
+        fallbackAnswer,
+        '',
+        '### Backend Error',
+        message,
+        '',
+        'Common causes:',
+        '- the unified dev stack was not started with `npm run dev`',
+        '- the FastAPI backend process is not running or crashed during startup',
+        '- the browser could not reach the backend endpoint through the local server proxy',
+      ].join('\n'),
+    };
+  }
 };
 
 const median = (values: number[]): number | null => {
@@ -284,8 +1025,12 @@ export const buildTabularChatContext = (file: ClinicalFile): string => {
   }
 };
 
-export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' | 'STUFFING'): string => {
+export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' | 'STUFFING', query = ''): string => {
   if (contextFiles.length === 0) return 'No context files selected.';
+
+  if (mode === 'RAG') {
+    return retrieveRelevantContext(query, contextFiles).contextText;
+  }
 
   const sections = contextFiles.map((file) => {
     const isTabular = file.type === DataType.RAW || file.type === DataType.STANDARDIZED;
@@ -300,9 +1045,7 @@ export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' |
     return `[Source: ${file.name}]: ${(file.content || 'No text content available.').substring(0, 1200)}...`;
   });
 
-  return mode === 'RAG'
-    ? `RETRIEVED CONTEXT:\n${sections.join('\n\n')}`
-    : sections.join('\n\n');
+  return sections.join('\n\n');
 };
 
 const buildExploratoryChatInsights = (
@@ -390,7 +1133,7 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
 
   const subjectId: QCColumnRequirement = {
     label: 'Subject ID',
-    aliases: ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID'],
+    aliases: ['USUBJID', 'SUBJID', 'SUBJECT_ID', 'PATIENT_ID', 'PARTICIPANT_ID', 'PARTICIPANTID', 'PARTICIPANT'],
   };
   const treatmentVariable: QCColumnRequirement = {
     label: 'Treatment Variable',
@@ -499,6 +1242,34 @@ const inferQCProfile = (file: ClinicalFile, headers: string[]): QCProfile => {
   }
 
   if (fileName.includes('lab') || headerText.includes('lbstres') || headerText.includes('lborres')) {
+    const isWideBaselineAnthro =
+      fileName.includes('anthro') ||
+      /baseline_height|baseline_weight|baseline_bmi|height_cm|weight_kg|bmi/i.test(headerText);
+
+    if (isWideBaselineAnthro) {
+      return {
+        kind: 'LABS',
+        name: 'Baseline anthropometry',
+        required: [
+          subjectId,
+          {
+            label: 'Baseline Measurement',
+            aliases: [
+              'BASELINE_HEIGHT_CM',
+              'BASELINE_WEIGHT_KG',
+              'BASELINE_BMI_KG_M2',
+              'HEIGHT_CM',
+              'WEIGHT_KG',
+              'BMI',
+              'HEIGHT',
+              'WEIGHT',
+            ],
+          },
+        ],
+        recommended: [treatmentVariable],
+      };
+    }
+
     return {
       kind: 'LABS',
       name: 'Labs',
@@ -728,7 +1499,13 @@ export const generateAnalysis = async (
     }
   }
 
-  const contextText = buildChatContextText(contextFiles, mode);
+  const guardedAdvancedResponse = await runAdvancedAnalysisGuard(query, contextFiles);
+  if (guardedAdvancedResponse) {
+    return guardedAdvancedResponse;
+  }
+
+  const retrieval = mode === 'RAG' ? retrieveRelevantContext(query, contextFiles) : null;
+  const contextText = retrieval?.contextText ?? buildChatContextText(contextFiles, mode, query);
 
   const systemInstruction = `You are an expert Clinical Data Scientist and Medical Monitor. 
   Your goal is to assist with clinical study analysis, signal detection, and root cause analysis.
@@ -805,18 +1582,19 @@ export const generateAnalysis = async (
             return {
                 answer: parsed.answer,
                 chartConfig: chartConfig,
-                keyInsights: parsed.keyInsights
+                keyInsights: parsed.keyInsights,
+                citations: retrieval?.citations,
             };
         } catch (e) {
             console.error("Failed to parse JSON response", e);
-            return { answer: response.text || "Error parsing analysis." };
+            return { answer: response.text || "Error parsing analysis.", citations: retrieval?.citations };
         }
     }
-    return { answer: "No response generated." };
+    return { answer: "No response generated.", citations: retrieval?.citations };
 
   } catch (error) {
     console.error("Gemini API Error", error);
-    return { answer: formatAiServiceError(error) };
+    return { answer: formatAiServiceError(error), citations: retrieval?.citations };
   }
 };
 
@@ -903,7 +1681,8 @@ export const executeStatisticalCode = async (
   testType: StatTestType,
   var1?: string,
   var2?: string,
-  concept?: AnalysisConcept | null
+  concept?: AnalysisConcept | null,
+  options?: StatisticalExecutionOptions
 ): Promise<StatAnalysisResult> => {
   try {
     const { headers } = parseCsv(file.content);
@@ -912,6 +1691,18 @@ export const executeStatisticalCode = async (
 
     if (!resolvedVar1) {
       throw new Error("Unable to infer analysis variables from dataset headers.");
+    }
+
+    const backendResult = await maybeExecuteFastApiStatisticalAnalysis(
+      code,
+      file,
+      testType,
+      resolvedVar1,
+      resolvedVar2,
+      options
+    );
+    if (backendResult) {
+      return backendResult;
     }
 
     const result = executeLocalStatisticalAnalysis(file, testType, resolvedVar1, resolvedVar2, concept);

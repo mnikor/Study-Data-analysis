@@ -7,6 +7,7 @@ export type DatasetProfileKind =
   | 'ADVERSE_EVENTS'
   | 'LABS'
   | 'EXPOSURE'
+  | 'DISPOSITION'
   | 'VISITS'
   | 'CONMEDS'
   | 'TUMOR'
@@ -195,6 +196,15 @@ export const inferDatasetProfileFromHeaders = (
     };
   }
 
+  if (/disposition|\bds\b|compliance|discontinu/.test(name) || headerText.includes('dsterm') || headerText.includes('dsdecod')) {
+    return {
+      kind: 'DISPOSITION',
+      model: type === DataType.STANDARDIZED ? 'STANDARDIZED' : 'RAW_CLINICAL',
+      label: 'Disposition or compliance dataset',
+      shortLabel: 'Disposition',
+    };
+  }
+
   if (/visit/.test(name) || headerText.includes('visitnum') || headerText.includes('visit')) {
     return {
       kind: 'VISITS',
@@ -243,3 +253,25 @@ export const inferDatasetProfile = (file: ClinicalFile): DatasetProfile =>
   inferDatasetProfileFromHeaders(file.name, file.type, parseHeadersSafely(file));
 
 export const isAdamDatasetProfile = (profile: DatasetProfile): boolean => profile.model === 'ADAM';
+
+export const mapProfileKindToAnalysisRole = (kind: DatasetProfileKind): string | undefined => {
+  switch (kind) {
+    case 'ADSL':
+    case 'DEMOGRAPHICS':
+      return 'ADSL';
+    case 'ADAE':
+    case 'ADVERSE_EVENTS':
+      return 'ADAE';
+    case 'ADLB':
+    case 'LABS':
+      return 'ADLB';
+    case 'ADTTE':
+      return 'ADTTE';
+    case 'EXPOSURE':
+      return 'ADEX';
+    case 'DISPOSITION':
+      return 'DS';
+    default:
+      return undefined;
+  }
+};
