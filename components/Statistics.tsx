@@ -2760,6 +2760,54 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                           <div className="mt-1 font-medium text-slate-800 break-all">{activeSession.params.backendWorkspaceId}</div>
                                       </div>
                                     )}
+                                    {result.backendExecution?.receipt && (
+                                      <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3">
+                                          <div className="text-[11px] uppercase tracking-wide font-semibold text-indigo-700">Analysis Receipt</div>
+                                          <div className="mt-2 space-y-2 text-sm text-slate-700">
+                                            {result.backendExecution.receipt.endpointLabel && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Endpoint:</span> {result.backendExecution.receipt.endpointLabel}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.targetDefinition && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Target definition:</span> {result.backendExecution.receipt.targetDefinition}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.cohortFiltersApplied.length > 0 && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Cohort filters:</span> {result.backendExecution.receipt.cohortFiltersApplied.join(', ')}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.treatmentVariable && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Grouping variable:</span> {result.backendExecution.receipt.treatmentVariable}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.outcomeVariable && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Outcome variable:</span> {result.backendExecution.receipt.outcomeVariable}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.timeVariable && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Time variable:</span> {result.backendExecution.receipt.timeVariable}
+                                              </div>
+                                            )}
+                                            {result.backendExecution.receipt.derivedColumns.length > 0 && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Derived fields:</span> {result.backendExecution.receipt.derivedColumns.join(', ')}
+                                              </div>
+                                            )}
+                                            {(result.backendExecution.receipt.rowCount || result.backendExecution.receipt.columnCount) && (
+                                              <div>
+                                                <span className="font-semibold text-slate-800">Workspace shape:</span>{' '}
+                                                {result.backendExecution.receipt.rowCount ?? '?'} rows x {result.backendExecution.receipt.columnCount ?? '?'} columns
+                                              </div>
+                                            )}
+                                          </div>
+                                      </div>
+                                    )}
                                     {backendPreview?.workspace?.row_count != null && backendPreview.workspace.column_count != null && (
                                       <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                                           <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500">Preview Workspace Shape</div>

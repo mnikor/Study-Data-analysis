@@ -109,6 +109,40 @@ Primary entry points:
 - chart rendering and HTML export
 - client-side orchestration of backend requests
 
+### Frontend runtime schema
+
+```mermaid
+flowchart TD
+    APP["App.tsx"] --> VIEWS["Feature Views"]
+    VIEWS --> CHAT["Analysis.tsx (AI Chat)"]
+    VIEWS --> STATS["Statistics.tsx (Structured Workbench)"]
+    VIEWS --> AUTO["Autopilot.tsx (Saved Runs + Guided Execution)"]
+    VIEWS --> INGEST["Ingestion / QC / ETL Views"]
+
+    CHAT --> CHAT_SVC["geminiService.ts"]
+    CHAT --> RAG["rag.ts"]
+
+    STATS --> EXEC["fastapiAnalysisService.ts"]
+    STATS --> TYPES["types.ts"]
+
+    AUTO --> EXEC
+    AUTO --> TYPES
+
+    CHAT_SVC --> EXEC
+    CHAT_SVC --> LOCAL_STATS["statisticsEngine.ts"]
+    CHAT_SVC --> FORMAT["deterministicAnalysisFormatter.ts"]
+```
+
+The frontend is effectively split into three layers:
+- `View components`
+  - user interaction, panels, forms, tables, charts, saved-run browsers
+- `Service/orchestration layer`
+  - analysis routing, backend calls, AI fallbacks, response formatting
+- `Utility layer`
+  - retrieval, dataset profiling, local deterministic helpers, import helpers
+
+That split is still imperfect in code because several files are large, but architecturally this is the intended shape.
+
 ### Important frontend modules
 
 - [components/Analysis.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Analysis.tsx)
@@ -145,6 +179,54 @@ Primary entry points:
 
 - [utils/statisticsEngine.ts](/Users/mikhailnikonorov/Clinical-trial-insight/utils/statisticsEngine.ts)
   - legacy/local deterministic engine for simpler single-dataset execution
+
+### Frontend request flows
+
+#### AI Chat
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FE as Analysis.tsx
+    participant ORCH as geminiService.ts
+    participant RAG as rag.ts
+    participant NODE as Node /api/ai or /api/v1 proxy
+    participant PY as FastAPI
+
+    U->>FE: Ask question
+    FE->>ORCH: submit question + selected sources
+    ORCH->>RAG: retrieve relevant chunks (when RAG mode)
+    ORCH->>ORCH: decide execution path
+    alt General explanation / doc answer
+        ORCH->>NODE: /api/ai/generate
+        NODE-->>ORCH: model response
+    else Local deterministic analysis
+        ORCH->>ORCH: execute via statisticsEngine.ts
+    else Advanced deterministic analysis
+        ORCH->>NODE: /api/v1/analysis/*
+        NODE->>PY: proxy request
+        PY-->>NODE: plan / workspace / result
+        NODE-->>ORCH: deterministic response
+    end
+    ORCH-->>FE: formatted response + citations/metrics
+```
+
+#### Statistical Analysis / Autopilot
+
+```mermaid
+sequenceDiagram
+    participant FE as React Workbench
+    participant CLIENT as fastapiAnalysisService.ts
+    participant NODE as Node Proxy
+    participant PY as FastAPI
+
+    FE->>CLIENT: capabilities / plan / build / run
+    CLIENT->>NODE: /api/v1/analysis/*
+    NODE->>PY: proxy request
+    PY-->>NODE: typed response
+    NODE-->>CLIENT: typed response
+    CLIENT-->>FE: plan, workspace preview, metrics, receipt
+```
 
 ## Backend Architecture
 
@@ -183,6 +265,7 @@ Core services:
   - plan construction
   - workspace lifecycle
   - deterministic family dispatch
+  - persistent workspace coordination
 
 - [backend/app/services/workspace_builder.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/workspace_builder.py)
   - dataset role inference
@@ -196,6 +279,10 @@ Core services:
 
 - [backend/app/services/endpoint_templates.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/endpoint_templates.py)
   - reusable endpoint templates for common question shapes
+
+- [backend/app/services/workspace_repository.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/workspace_repository.py)
+  - file-backed workspace persistence
+  - stores workspace tables and manifests under `.app-data/analysis-workspaces`
 
 Models and contracts:
 - [backend/app/models/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/models/analysis.py)
@@ -215,6 +302,53 @@ This split matters because the app can:
 - then execute a deterministic analysis family
 
 That is the main safety mechanism that prevents the app from inventing complex outputs from chat summaries alone.
+
+### Backend execution schema
+
+```mermaid
+flowchart TD
+    API["FastAPI Route"] --> SERVICE["AnalysisService"]
+    SERVICE --> CLASSIFY["Capability Classification"]
+    SERVICE --> SPEC["AnalysisSpec Builder"]
+    SERVICE --> WS_BUILD["workspace_builder.build_workspace"]
+    WS_BUILD --> ROLE["Role Inference"]
+    WS_BUILD --> FILTER["Cohort Filtering"]
+    WS_BUILD --> DERIVE["Endpoint / Feature Derivation"]
+    WS_BUILD --> FRAME["Subject-level or row-level workspace"]
+
+    SERVICE --> WS_REPO["workspace_repository.py"]
+    WS_REPO --> CSV["workspace.csv"]
+    WS_REPO --> MANIFEST["manifest.json"]
+
+    SERVICE --> RUNNER["deterministic_runner.py"]
+    RUNNER --> OUT["Metrics + Tables + Interpretation + Receipt"]
+```
+
+### Backend data contracts
+
+The backend uses typed request/response models in [backend/app/models/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/models/analysis.py):
+- `AnalysisCapabilityRequest` / `AnalysisCapabilityResponse`
+- `AnalysisPlanRequest` / `AnalysisPlanResponse`
+- `WorkspaceBuildRequest` / `WorkspaceBuildResponse`
+- `AnalysisRunRequest` / `AnalysisRunResponse`
+- `AnalysisSpec`
+- `AnalysisExecutionReceipt`
+
+The most important contract is `AnalysisSpec`, because it turns a natural-language question into a deterministic execution request:
+- analysis family
+- endpoint definition
+- treatment variable
+- outcome variable
+- time variable
+- cohort filters
+- interaction terms
+- requested outputs
+
+The `AnalysisExecutionReceipt` is the audit-oriented payload returned with executed analyses. It tells the frontend:
+- which datasets were used
+- which derived columns were created
+- which cohort filters were applied
+- which endpoint/target definition was actually run
 
 ## Analysis Execution Model
 
@@ -255,6 +389,18 @@ flowchart TD
     PLAN --> WS["Build Workspace"]
     WS --> RUN["Run Deterministic Family"]
     RUN --> RESP["Metrics + Tables + Charts + Narrative"]
+```
+
+### What happens inside workspace building
+
+```mermaid
+flowchart LR
+    DATA["Selected Datasets"] --> ROLE["Infer analysis roles (ADSL / ADAE / ADLB / ADTTE / EX / DS)"]
+    ROLE --> JOIN["Pick required sources for the chosen AnalysisSpec"]
+    JOIN --> FILTER["Apply cohort filters"]
+    FILTER --> DERIVE["Derive endpoint and helper fields"]
+    DERIVE --> MERGE["Merge subject/event/lab/exposure/disposition features"]
+    MERGE --> SAVE["Persist workspace and manifest"]
 ```
 
 ### Why some answers are very fast
@@ -421,6 +567,8 @@ npm run api:benchmark
 
 Relevant validation assets:
 - [backend/tests/test_reference_validation.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_reference_validation.py)
+- [backend/tests/test_analysis_service.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_analysis_service.py)
+- [backend/tests/test_workspace_builder.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_workspace_builder.py)
 - [docs/reference-validation-report.md](/Users/mikhailnikonorov/Clinical-trial-insight/docs/reference-validation-report.md)
 
 ## Current Strengths And Limits
@@ -431,8 +579,10 @@ Relevant validation assets:
 - the app has explicit capability/plan/workspace/run stages for safer execution
 - AI Chat no longer has to fabricate advanced charts when deterministic execution is required
 - project persistence is backend-backed instead of browser-only
+- analysis workspaces are now file-backed and can be reloaded across backend service instances
 - SAS ingestion is supported through a server-side Python path
 - the UI now supports saved-run review in Autopilot and structured workbench analysis in Statistical Analysis
+- deterministic results can include an execution receipt describing cohort, endpoint, variables, and derived fields
 
 ### Important limits
 
@@ -441,7 +591,7 @@ Relevant validation assets:
   - [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
   - [components/Statistics.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Statistics.tsx)
   - [services/geminiService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/geminiService.ts)
-- backend workspace storage is currently in-memory inside the FastAPI service
+- workspace persistence is file-backed for local use, but it is not yet a multi-user database-backed repository
 - backend test depth is still lighter than ideal for the number of supported families
 - this is a strong clinical analytics POC, not yet a fully general production-grade clinical platform
 

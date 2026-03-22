@@ -417,25 +417,25 @@ def _normalize_token(value: str) -> str:
 
 
 def _requires_survival_workspace(question: str, spec: AnalysisSpec | None) -> bool:
-    if spec and spec.analysis_family in {"kaplan_meier", "cox"}:
-        return True
+    if spec is not None:
+        return spec.analysis_family in {"kaplan_meier", "cox"}
 
     lower_question = question.lower()
     return any(token in lower_question for token in ("kaplan", "survival", "hazard", "cox", "time-to-event", "time to event"))
 
 
 def _requires_repeated_workspace(question: str, spec: AnalysisSpec | None) -> bool:
-    if spec and spec.analysis_family == "mixed_model":
-        return True
+    if spec is not None:
+        return spec.analysis_family == "mixed_model"
     lower_question = question.lower()
     return any(token in lower_question for token in ("repeated measures", "repeated-measures", "longitudinal", "mixed model", "trajectory", "trend over time", "visit-level", "repeated visit"))
 
 
 def _requires_competing_risks_workspace(question: str, spec: AnalysisSpec | None) -> bool:
-    if spec and spec.analysis_family == "competing_risks":
-        return True
+    if spec is not None:
+        return spec.analysis_family == "competing_risks"
     lower_question = question.lower()
-    return any(token in lower_question for token in ("competing risk", "competing risks", "cumulative incidence"))
+    return any(token in lower_question for token in ("competing risk", "competing risks"))
 
 
 def _find_column(frame: pd.DataFrame, hints: tuple[str, ...]) -> str | None:
@@ -484,7 +484,52 @@ def _apply_cohort_filters(frame: pd.DataFrame, spec: AnalysisSpec | None) -> tup
 def _cohort_filter_labels(spec: AnalysisSpec | None) -> list[str]:
     if spec is None or not spec.cohort_filters:
         return []
-    return [cohort_filter.label or f"{cohort_filter.field} {cohort_filter.operator} {cohort_filter.value}" for cohort_filter in spec.cohort_filters]
+    labels = [cohort_filter.label or f"{cohort_filter.field} {cohort_filter.operator} {cohort_filter.value}" for cohort_filter in spec.cohort_filters]
+    summary = _summarize_cohort_filters(spec)
+    if summary:
+        return [summary, *labels]
+    return labels
+
+
+def _summarize_cohort_filters(spec: AnalysisSpec | None) -> str | None:
+    if spec is None or not spec.cohort_filters:
+        return None
+
+    race_value = None
+    sex_value = None
+    age_gte = None
+    age_lte = None
+
+    for cohort_filter in spec.cohort_filters:
+        field = cohort_filter.field.upper()
+        operator = cohort_filter.operator
+        value = cohort_filter.value.strip()
+        if field == "RACE" and operator in {"contains", "equals"}:
+            race_value = value.title()
+        elif field == "SEX" and operator == "equals":
+            lowered = value.lower()
+            if lowered in {"f", "female"}:
+                sex_value = "women"
+            elif lowered in {"m", "male"}:
+                sex_value = "men"
+        elif field == "AGE" and operator == "gte":
+            age_gte = value
+        elif field == "AGE" and operator == "lte":
+            age_lte = value
+
+    parts: list[str] = []
+    if race_value:
+        parts.append(race_value)
+    if sex_value:
+        parts.append(sex_value)
+    if age_gte:
+        parts.append(f">={age_gte}")
+    elif age_lte:
+        parts.append(f"<={age_lte}")
+
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _build_filter_mask(series: pd.Series, cohort_filter: AnalysisFilter) -> pd.Series:

@@ -202,6 +202,20 @@ export interface StatAnalysisResult {
       | 'unknown';
     workspaceId?: string | null;
     sourceNames?: string[];
+    receipt?: {
+      sourceNames: string[];
+      derivedColumns: string[];
+      rowCount?: number | null;
+      columnCount?: number | null;
+      subjectIdentifier?: string | null;
+      treatmentVariable?: string | null;
+      outcomeVariable?: string | null;
+      timeVariable?: string | null;
+      eventVariable?: string | null;
+      endpointLabel?: string | null;
+      targetDefinition?: string | null;
+      cohortFiltersApplied: string[];
+    };
   };
   aiCommentary?: {
     source: 'AI' | 'FALLBACK';

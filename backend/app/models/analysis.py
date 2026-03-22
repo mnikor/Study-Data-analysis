@@ -31,6 +31,21 @@ class AnalysisTable(BaseModel):
     rows: List[dict[str, str | float | int]]
 
 
+class AnalysisExecutionReceipt(BaseModel):
+    source_names: List[str] = Field(default_factory=list)
+    derived_columns: List[str] = Field(default_factory=list)
+    row_count: Optional[int] = None
+    column_count: Optional[int] = None
+    subject_identifier: Optional[str] = None
+    treatment_variable: Optional[str] = None
+    outcome_variable: Optional[str] = None
+    time_variable: Optional[str] = None
+    event_variable: Optional[str] = None
+    endpoint_label: Optional[str] = None
+    target_definition: Optional[str] = None
+    cohort_filters_applied: List[str] = Field(default_factory=list)
+
+
 class AnalysisFilter(BaseModel):
     field: str
     operator: FilterOperator
@@ -134,5 +149,6 @@ class AnalysisRunResponse(BaseModel):
     interpretation: Optional[str] = None
     metrics: List[AnalysisMetric] = Field(default_factory=list)
     table: Optional[AnalysisTable] = None
+    receipt: Optional[AnalysisExecutionReceipt] = None
     warnings: List[str] = Field(default_factory=list)
     explanation: str

@@ -45,7 +45,7 @@ def resolve_endpoint_template(question: str, family: AnalysisFamily) -> Endpoint
             notes=("Uses derived adverse-event onset timing when ADTTE is not available.",),
         )
 
-    if any(token in lowered for token in ("competing risk", "competing risks", "cumulative incidence")):
+    if family == "competing_risks" or any(token in lowered for token in ("competing risk", "competing risks")):
         return EndpointTemplate(
             target_definition="cumulative_incidence_of_discontinuation",
             endpoint_label="Cumulative incidence with competing events",

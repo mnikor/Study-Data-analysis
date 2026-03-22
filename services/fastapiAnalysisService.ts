@@ -98,6 +98,20 @@ export interface FastApiRunResponse {
   interpretation?: string | null;
   metrics: FastApiRunMetric[];
   table?: FastApiAnalysisTable | null;
+  receipt?: {
+    source_names: string[];
+    derived_columns: string[];
+    row_count?: number | null;
+    column_count?: number | null;
+    subject_identifier?: string | null;
+    treatment_variable?: string | null;
+    outcome_variable?: string | null;
+    time_variable?: string | null;
+    event_variable?: string | null;
+    endpoint_label?: string | null;
+    target_definition?: string | null;
+    cohort_filters_applied: string[];
+  } | null;
   warnings: string[];
   explanation: string;
 }

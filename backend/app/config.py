@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic import Field
@@ -29,6 +30,10 @@ class Settings(BaseSettings):
     cors_origin_regex: str = Field(
         default=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         alias="ECP_CORS_ORIGIN_REGEX",
+    )
+    workspace_store_dir: str = Field(
+        default=str(Path(__file__).resolve().parents[2] / ".app-data" / "analysis-workspaces"),
+        alias="ECP_WORKSPACE_STORE_DIR",
     )
 
 

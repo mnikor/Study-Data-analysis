@@ -5,6 +5,7 @@ import re
 from typing import Iterable
 from uuid import uuid4
 
+from ..config import get_settings
 from .deterministic_runner import (
     run_competing_risks_analysis,
     run_cox_analysis,
@@ -17,10 +18,12 @@ from .deterministic_runner import (
     run_threshold_search_analysis,
 )
 from .endpoint_templates import resolve_endpoint_template
+from .workspace_repository import FileWorkspaceRepository
 from .workspace_builder import build_workspace, infer_role
 from ..models.analysis import (
     AnalysisCapabilityRequest,
     AnalysisCapabilityResponse,
+    AnalysisExecutionReceipt,
     AnalysisFamily,
     AnalysisFilter,
     AnalysisMetric,
@@ -83,7 +86,8 @@ class CapabilityResult:
 
 class AnalysisService:
     def __init__(self) -> None:
-        self._workspace_store: dict[str, dict[str, object]] = {}
+        settings = get_settings()
+        self._workspace_store = FileWorkspaceRepository(settings.workspace_store_dir)
 
     def classify_capabilities(self, payload: AnalysisCapabilityRequest) -> AnalysisCapabilityResponse:
         result = self._classify(payload.question, payload.datasets)
@@ -101,26 +105,7 @@ class AnalysisService:
         result = self._classify(payload.question, payload.datasets)
         spec = None
         if result.status != "unsupported":
-            lower_question = payload.question.lower()
-            family = self._resolve_planned_family(result.family, lower_question)
-            endpoint_template = resolve_endpoint_template(lower_question, family)
-            spec = AnalysisSpec(
-                analysis_family=family,
-                target_definition=endpoint_template.target_definition or self._extract_target_definition(lower_question, family),
-                endpoint_label=endpoint_template.endpoint_label,
-                grade_threshold=self._extract_grade_threshold(lower_question),
-                term_filters=list(endpoint_template.term_filters) or self._extract_term_filters(lower_question),
-                cohort_filters=self._extract_cohort_filters(lower_question),
-                interaction_terms=list(endpoint_template.interaction_terms) or self._extract_interaction_terms(lower_question),
-                threshold_variables=list(endpoint_template.threshold_variables),
-                threshold_metric=endpoint_template.threshold_metric,  # type: ignore[arg-type]
-                time_window_days=endpoint_template.time_window_days or self._extract_time_window_days(lower_question),
-                requested_outputs=list(endpoint_template.requested_outputs) or self._default_outputs(family),
-                notes=[
-                    "FastAPI plan generated from question classification.",
-                    *list(endpoint_template.notes),
-                ],
-            )
+            spec = self._build_spec(payload.question, result.family)
 
         return AnalysisPlanResponse(
             status=result.status,
@@ -142,7 +127,8 @@ class AnalysisService:
             )
 
         try:
-            built = build_workspace(payload.question, payload.datasets, payload.spec)
+            effective_spec = payload.spec or self._build_spec(payload.question, result.family)
+            built = build_workspace(payload.question, payload.datasets, effective_spec)
         except ValueError as error:
             return WorkspaceBuildResponse(
                 status="missing_data",
@@ -152,13 +138,14 @@ class AnalysisService:
             )
 
         workspace_id = f"ws_{uuid4().hex[:12]}"
-        self._workspace_store[workspace_id] = {
-            "dataframe": built.dataframe,
-            "metadata": built.metadata,
-            "source_names": built.source_names,
-            "notes": built.notes,
-            "derived_columns": built.derived_columns,
-        }
+        self._workspace_store.save(
+            workspace_id,
+            built.dataframe,
+            built.metadata,
+            built.source_names,
+            built.notes,
+            built.derived_columns,
+        )
 
         preview_columns = list(built.dataframe.columns[: min(8, len(built.dataframe.columns))])
         preview_table = AnalysisTable(
@@ -190,13 +177,14 @@ class AnalysisService:
                 explanation=result.explanation,
             )
 
-        family = payload.spec.analysis_family if payload.spec else result.family
+        effective_spec = payload.spec or self._build_spec(payload.question, result.family)
+        family = effective_spec.analysis_family if effective_spec else result.family
         workspace_id = payload.workspace_id or f"ws_{uuid4().hex[:12]}"
-        workspace_entry = self._workspace_store.get(payload.workspace_id or "")
+        workspace_entry = self._workspace_store.load(payload.workspace_id or "")
 
         if workspace_entry is None:
             try:
-                built = build_workspace(payload.question, payload.datasets, payload.spec)
+                built = build_workspace(payload.question, payload.datasets, effective_spec)
             except ValueError as error:
                 return AnalysisRunResponse(
                     status="missing_data",
@@ -211,8 +199,17 @@ class AnalysisService:
                 "source_names": built.source_names,
                 "notes": built.notes,
                 "derived_columns": built.derived_columns,
+                "row_count": int(built.dataframe.shape[0]),
+                "column_count": int(built.dataframe.shape[1]),
             }
-            self._workspace_store[workspace_id] = workspace_entry
+            self._workspace_store.save(
+                workspace_id,
+                built.dataframe,
+                built.metadata,
+                built.source_names,
+                built.notes,
+                built.derived_columns,
+            )
         elif payload.workspace_id:
             workspace_id = payload.workspace_id
 
@@ -225,6 +222,7 @@ class AnalysisService:
                     family,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, payload.spec)
                 return response
 
             if family == "logistic_regression":
@@ -232,9 +230,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "kaplan_meier":
@@ -245,6 +244,7 @@ class AnalysisService:
                     family,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, payload.spec)
                 return response
 
             if family == "cox":
@@ -252,9 +252,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "feature_importance":
@@ -262,9 +263,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "partial_dependence":
@@ -272,9 +274,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "mixed_model":
@@ -282,9 +285,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "threshold_search":
@@ -292,9 +296,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
 
             if family == "competing_risks":
@@ -302,9 +307,10 @@ class AnalysisService:
                     workspace_id,
                     workspace_entry["dataframe"],  # type: ignore[arg-type]
                     workspace_entry["metadata"],  # type: ignore[arg-type]
-                    payload.spec,
+                    effective_spec,
                 )
                 response.warnings.extend(result.warnings)
+                response.receipt = self._build_execution_receipt(workspace_entry, effective_spec)
                 return response
         except ValueError as error:
             return AnalysisRunResponse(
@@ -321,9 +327,52 @@ class AnalysisService:
             executed=False,
             analysis_family=family,
             workspace_id=workspace_id,
+            receipt=self._build_execution_receipt(workspace_entry, effective_spec),
             metrics=[AnalysisMetric(name="backend_status", value="unsupported_family")],
             warnings=["This analysis family has not been implemented yet in the deterministic FastAPI runner."],
             explanation="Workspace build is live, but this model family is still pending implementation.",
+        )
+
+    def _build_execution_receipt(
+        self,
+        workspace_entry: dict[str, object],
+        spec: AnalysisSpec | None,
+    ) -> AnalysisExecutionReceipt:
+        metadata = workspace_entry.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        cohort_filters_applied = metadata.get("cohort_filter_labels")
+        if isinstance(cohort_filters_applied, list):
+            filters = [str(value).strip() for value in cohort_filters_applied if str(value).strip()]
+        else:
+            filters = []
+        safe_spec = spec or AnalysisSpec()
+        return AnalysisExecutionReceipt(
+            source_names=[str(name) for name in workspace_entry.get("source_names", []) if str(name).strip()],
+            derived_columns=[str(name) for name in workspace_entry.get("derived_columns", []) if str(name).strip()],
+            row_count=int(workspace_entry.get("row_count") or 0) or None,
+            column_count=int(workspace_entry.get("column_count") or 0) or None,
+            subject_identifier=str(metadata.get("subject_id_column") or "") or None,
+            treatment_variable=str(metadata.get("treatment_column") or safe_spec.treatment_variable or "") or None,
+            outcome_variable=str(metadata.get("outcome_column") or safe_spec.outcome_variable or "") or None,
+            time_variable=str(
+                metadata.get("survival_time_column")
+                or metadata.get("repeated_time_column")
+                or metadata.get("competing_time_column")
+                or safe_spec.time_variable
+                or ""
+            )
+            or None,
+            event_variable=str(
+                metadata.get("survival_event_column")
+                or metadata.get("competing_event_column")
+                or safe_spec.event_variable
+                or ""
+            )
+            or None,
+            endpoint_label=str(metadata.get("endpoint_label") or safe_spec.endpoint_label or "") or None,
+            target_definition=str(metadata.get("target_definition") or safe_spec.target_definition or "") or None,
+            cohort_filters_applied=filters,
         )
 
     def _classify(self, question: str, datasets: Iterable[DatasetReference]) -> CapabilityResult:
@@ -500,6 +549,8 @@ class AnalysisService:
             return "mixed_model"
         if any(token in question for token in ("threshold", "cutoff", "cut-off", "early warning", "warning threshold", "best predict")):
             return "threshold_search"
+        if "risk difference" in question:
+            return "risk_difference"
         if any(token in question for token in ("competing risk", "competing risks", "cumulative incidence")):
             return "competing_risks"
         if any(token in question for token in ("adherence", "compliance", "discontinuation", "interrupt", "reduction", "non-persistence")):
@@ -559,6 +610,28 @@ class AnalysisService:
             return ["coefficient_table", "odds_ratios", "confidence_interval"]
         return ["summary"]
 
+    def _build_spec(self, question: str, inferred_family: AnalysisFamily) -> AnalysisSpec:
+        lower_question = question.lower()
+        family = self._resolve_planned_family(inferred_family, lower_question)
+        endpoint_template = resolve_endpoint_template(lower_question, family)
+        return AnalysisSpec(
+            analysis_family=family,
+            target_definition=endpoint_template.target_definition or self._extract_target_definition(lower_question, family),
+            endpoint_label=endpoint_template.endpoint_label,
+            grade_threshold=self._extract_grade_threshold(lower_question),
+            term_filters=list(endpoint_template.term_filters) or self._extract_term_filters(lower_question),
+            cohort_filters=self._extract_cohort_filters(lower_question),
+            interaction_terms=list(endpoint_template.interaction_terms) or self._extract_interaction_terms(lower_question),
+            threshold_variables=list(endpoint_template.threshold_variables),
+            threshold_metric=endpoint_template.threshold_metric,  # type: ignore[arg-type]
+            time_window_days=endpoint_template.time_window_days or self._extract_time_window_days(lower_question),
+            requested_outputs=list(endpoint_template.requested_outputs) or self._default_outputs(family),
+            notes=[
+                "Deterministic analysis plan generated from question classification.",
+                *list(endpoint_template.notes),
+            ],
+        )
+
     def _supports_derived_ae_survival(self, question: str) -> bool:
         return (
             ("week" in question or "onset" in question or "time to first" in question or "resolution" in question)
@@ -566,6 +639,8 @@ class AnalysisService:
         )
 
     def _resolve_planned_family(self, family: AnalysisFamily, question: str) -> AnalysisFamily:
+        if family == "competing_risks" and ("risk difference" in question or "week 12" in question):
+            return "risk_difference"
         if family == "incidence" and ("predict" in question or "predictor" in question or "predictors" in question):
             return "logistic_regression"
         return family
@@ -584,6 +659,8 @@ class AnalysisService:
         return []
 
     def _extract_target_definition(self, question: str, family: AnalysisFamily) -> str | None:
+        if family in {"incidence", "risk_difference", "logistic_regression"} and "week 12" in question:
+            return "grade_2_plus_dae_by_week_12"
         if "time to resolution" in question or "resolution" in question:
             return "time_to_resolution_grade_2_plus_dae"
         if "competing risk" in question or "cumulative incidence" in question:
@@ -594,8 +671,6 @@ class AnalysisService:
             return "repeated_measure_change"
         if any(token in question for token in ("earlier onset", "time to onset", "time to first", "onset")):
             return "time_to_first_grade_2_plus_dae"
-        if family in {"incidence", "risk_difference", "logistic_regression"} and "week 12" in question:
-            return "grade_2_plus_dae_by_week_12"
         return None
 
     def _extract_time_window_days(self, question: str) -> int | None:

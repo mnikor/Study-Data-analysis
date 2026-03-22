@@ -176,7 +176,7 @@ describe('executeStatisticalCode', () => {
           executed: true,
           analysis_family: 'cox',
           workspace_id: 'ws_mock',
-          interpretation: 'Computed a Cox proportional hazards model from the FastAPI survival workspace.',
+          interpretation: 'Computed a Cox proportional hazards model from the survival workspace.',
           metrics: [
             { name: 'analysis_method', value: 'cox_proportional_hazards' },
             { name: 'subjects_used', value: 4 },
@@ -214,7 +214,7 @@ describe('executeStatisticalCode', () => {
 
     expect(result.metrics.analysis_method).toBe('cox_proportional_hazards');
     expect(result.tableConfig?.title).toMatch(/Cox proportional hazards/i);
-    expect(result.executedCode).toMatch(/FastAPI deterministic backend execution/i);
+    expect(result.executedCode).toMatch(/Deterministic analysis engine execution/i);
     expect(result.backendExecution?.analysisFamily).toBe('cox');
     expect(result.backendExecution?.workspaceId).toBe('ws_mock');
   });
@@ -449,7 +449,7 @@ describe('generateAnalysis', () => {
       []
     );
 
-    expect(response.answer).toMatch(/FastAPI execution path/i);
+    expect(response.answer).toMatch(/executed analysis workflow/i);
     expect(response.tableConfig).toBeUndefined();
   });
 
@@ -487,7 +487,7 @@ describe('generateAnalysis', () => {
     );
 
     expect(response.answer).toMatch(/Advanced analysis requires/i);
-    expect(response.answer).toMatch(/summary-only AI Chat path|validated result yet/i);
+    expect(response.answer).toMatch(/summary-only chat path|validated result yet/i);
     expect(response.chartConfig).toBeUndefined();
   });
 
