@@ -119,6 +119,16 @@ const defaultStepState = (): Record<StepKey, StepState> => ({
   analysis: { status: 'PENDING', detail: 'Waiting' },
 });
 
+const TARGET_DOMAIN_OPTIONS = [
+  { value: 'DM', label: 'DM — Demographics / subject-level data' },
+  { value: 'AE', label: 'AE — Adverse events' },
+  { value: 'LB', label: 'LB — Labs' },
+  { value: 'EX', label: 'EX — Exposure / dosing' },
+  { value: 'DS', label: 'DS — Disposition / treatment status' },
+];
+
+const CUSTOM_TARGET_DOMAIN_VALUE = '__OTHER__';
+
 const deriveSavedStepState = (session: AnalysisSession | null): Record<StepKey, StepState> => {
   if (!session) return defaultStepState();
 
@@ -186,6 +196,34 @@ const baseName = (name: string) => name.replace(/\.[^/.]+$/, '');
 const deriveSourceDomain = (name: string) => baseName(name).toUpperCase().replace(/[^A-Z0-9_]/g, '_');
 const prettifyDatasetName = (name: string) => baseName(name).replace(/^raw_/i, '').replace(/^sdtm_/i, '').replace(/_/g, ' ');
 const formatVariablesForDisplay = (left?: string, right?: string) => formatComparisonLabel(left, right);
+
+const inferPrimaryClinicalDomain = (file: ClinicalFile | undefined): string => {
+  if (!file) return 'DM';
+
+  const name = file.name.toLowerCase();
+  if (/(adae|adverse[_-]?events|\bae\b|rash|derm|safety)/i.test(name)) return 'AE';
+  if (/(adlb|labs?|\blb\b|chemistry|hematology|anthro)/i.test(name)) return 'LB';
+  if (/(adex|exposure|\bex\b|dose|dosing|treatment[_-]?administration)/i.test(name)) return 'EX';
+  if (/(disposition|\bds\b|adherence|compliance|discontinuation|persist)/i.test(name)) return 'DS';
+  if (/(adsl|demographics|\bdm\b|baseline|subjects?|comorbidit)/i.test(name)) return 'DM';
+
+  try {
+    const { headers } = parseCsv(file.content);
+    const upperHeaders = headers.map((header) => header.toUpperCase());
+    const hasAny = (candidates: string[]) =>
+      candidates.some((candidate) => upperHeaders.some((header) => header === candidate || header.includes(candidate)));
+
+    if (hasAny(['AETERM', 'AEDECOD', 'AETOXGR', 'AESTDY'])) return 'AE';
+    if (hasAny(['PARAM', 'PARAMCD', 'LBTEST', 'LBTESTCD', 'AVAL', 'RESULT', 'VALUE'])) return 'LB';
+    if (hasAny(['EXDOSE', 'DOSE', 'EXSTDY', 'EXENDY'])) return 'EX';
+    if (hasAny(['DSTERM', 'DSDECOD', 'DSSTDY', 'DSDY'])) return 'DS';
+    if (hasAny(['AGE', 'SEX', 'RACE', 'ARM', 'TRT01A'])) return 'DM';
+  } catch {
+    return 'DM';
+  }
+
+  return 'DM';
+};
 
 const isIssueAutoFixable = (issue: QCIssue): boolean => {
   if (typeof issue.autoFixable === 'boolean') return issue.autoFixable;
@@ -573,6 +611,18 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     [sourceFiles, selectedSourceId]
   );
   const selectedSupportingFiles = supportingSourceFiles.filter((file) => selectedSupportingIds.includes(file.id));
+  const selectedTargetDomainOption = TARGET_DOMAIN_OPTIONS.some((option) => option.value === targetDomain)
+    ? targetDomain
+    : CUSTOM_TARGET_DOMAIN_VALUE;
+  const suggestedTargetDomain = useMemo(() => inferPrimaryClinicalDomain(selectedSource), [selectedSource]);
+
+  useEffect(() => {
+    if (!selectedSource) {
+      setTargetDomain('DM');
+      return;
+    }
+    setTargetDomain(suggestedTargetDomain);
+  }, [selectedSourceId, selectedSource, suggestedTargetDomain]);
 
   useEffect(() => {
     if (experienceMode !== 'RUN_CONFIRMED') return;
@@ -2312,14 +2362,46 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Target Domain</label>
-            <input
-              type="text"
-              value={targetDomain}
-              onChange={(e) => setTargetDomain(e.target.value.toUpperCase())}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm font-mono"
-              placeholder="DM"
-            />
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">
+              Primary Clinical Domain
+            </label>
+            <select
+              value={selectedTargetDomainOption}
+              onChange={(e) => {
+                const nextValue = e.target.value;
+                if (nextValue === CUSTOM_TARGET_DOMAIN_VALUE) {
+                  setTargetDomain('');
+                  return;
+                }
+                setTargetDomain(nextValue);
+              }}
+              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
+            >
+              {TARGET_DOMAIN_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+              <option value={CUSTOM_TARGET_DOMAIN_VALUE}>Other / Custom...</option>
+            </select>
+            {selectedTargetDomainOption === CUSTOM_TARGET_DOMAIN_VALUE ? (
+              <input
+                type="text"
+                value={targetDomain}
+                onChange={(e) => setTargetDomain(e.target.value.toUpperCase())}
+                className="mt-2 w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm font-mono"
+                placeholder="Enter domain code, e.g. CM, MH, VS"
+              />
+            ) : null}
+            <p className="mt-2 text-xs font-medium text-slate-600">
+              Suggested from selected source file: {suggestedTargetDomain}
+            </p>
+            <p className="mt-2 text-xs leading-5 text-slate-500">
+              Choose the main clinical data area this run should focus on. Use
+              <span className="font-medium"> Other / Custom...</span> if your study uses a different domain such as
+              <span className="font-medium"> CM</span>, <span className="font-medium">MH</span>, or
+              <span className="font-medium"> VS</span>.
+            </p>
           </div>
 
           {analysisMode === 'SINGLE' ? (
