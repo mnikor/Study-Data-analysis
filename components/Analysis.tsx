@@ -4,6 +4,7 @@ import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, Pr
 import { generateAnalysis } from '../services/geminiService';
 import { Chart } from './Chart';
 import { buildChatQuickActions, ChatQuickActionIcon } from '../utils/chatQuickActions';
+import { InfoTooltip } from './InfoTooltip';
 
 interface AnalysisProps {
   files: ClinicalFile[];
@@ -432,7 +433,8 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                  mode === AnalysisMode.RAG ? 'bg-white text-medical-600 shadow-sm' : 'text-slate-500'
                }`}
              >
-               <Search className="w-3 h-3 mr-1" /> RAG (Search)
+               <Search className="w-3 h-3 mr-1" /> Search Selected Sources
+               <InfoTooltip className="ml-1" content="Searches your selected files and uses the most relevant sections to answer your question." />
              </button>
              <button
                onClick={() => setMode(AnalysisMode.STUFFING)}
@@ -440,7 +442,8 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                  mode === AnalysisMode.STUFFING ? 'bg-white text-medical-600 shadow-sm' : 'text-slate-500'
                }`}
              >
-               <FileText className="w-3 h-3 mr-1" /> Stuffing (Select)
+               <FileText className="w-3 h-3 mr-1" /> Use Selected Sources Directly
+               <InfoTooltip className="ml-1" content="Uses the selected files directly as context, without first searching for the most relevant sections." />
              </button>
           </div>
           <p className="text-xs text-slate-500">
@@ -591,8 +594,9 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
 
                   {msg.citations && msg.citations.length > 0 && (
                     <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                      <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">
-                        Retrieved Sources
+                      <div className="mb-2 flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        <span>Retrieved Sources</span>
+                        <InfoTooltip content="These are the file sections the app relied on most heavily when preparing the answer." />
                       </div>
                       <div className="space-y-2">
                         {msg.citations.map((citation, idx) => (

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { History, Search, Code, FileText, Activity, Download, ShieldCheck, Fingerprint, Trash2, AlertOctagon, Filter, X, FlaskConical, Map as MapIcon } from 'lucide-react';
 import { ProvenanceRecord, ProvenanceType } from '../types';
+import { InfoTooltip } from './InfoTooltip';
 
 interface ProvenanceProps {
   records: ProvenanceRecord[];
@@ -59,7 +60,10 @@ export const Provenance: React.FC<ProvenanceProps> = ({ records }) => {
     <div className="p-6 h-full flex flex-col">
       <div className="flex justify-between items-end mb-6">
         <div>
-          <h2 className="text-2xl font-bold text-slate-800">Provenance Registry</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-2xl font-bold text-slate-800">Provenance Registry</h2>
+            <InfoTooltip content="A record of important actions taken in the project, such as mappings, transformations, and analyses." />
+          </div>
           <p className="text-slate-500">Complete, tamper-evident audit trail of all ingestion, transformation, and analysis events.</p>
         </div>
         <div className="flex space-x-3 items-center">

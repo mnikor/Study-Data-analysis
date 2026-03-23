@@ -4,6 +4,7 @@ import { MappingSpec, ClinicalFile, DataType } from '../types';
 import { generateMappingSuggestion } from '../services/geminiService';
 import { parseCsv } from '../utils/dataProcessing';
 import { parseReferenceMapping } from '../utils/mappingReference';
+import { InfoTooltip } from './InfoTooltip';
 
 interface MappingProps {
   files: ClinicalFile[];
@@ -168,7 +169,10 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
           {/* Configuration Panel */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">0. Import Reference Mapping (Optional)</label>
+                <div className="mb-2 flex items-center gap-1">
+                  <label className="block text-xs font-semibold text-slate-500 uppercase">0. Import Reference Mapping (Optional)</label>
+                  <InfoTooltip content="An optional template mapping that helps align source columns to standardized columns." />
+                </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                     <select
                         value={selectedReferenceId}
@@ -227,7 +231,10 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
                 <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">2. Verify Domain Names</label>
                 <div className="space-y-3">
                     <div>
-                        <span className="text-[10px] text-slate-400 uppercase">Source Domain</span>
+                        <span className="flex items-center gap-1 text-[10px] text-slate-400 uppercase">
+                          <span>Source Domain</span>
+                          <InfoTooltip content="The structure of the incoming dataset before standardization." />
+                        </span>
                         <input 
                           value={sourceDomain}
                           onChange={(e) => setSourceDomain(e.target.value)}
@@ -235,7 +242,10 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
                         />
                     </div>
                     <div>
-                         <span className="text-[10px] text-slate-400 uppercase">Target Domain (CDISC)</span>
+                         <span className="flex items-center gap-1 text-[10px] text-slate-400 uppercase">
+                           <span>Target Domain (CDISC)</span>
+                           <InfoTooltip content="The standardized clinical dataset structure you want to map into, such as DM, AE, or LB." />
+                         </span>
                         <input 
                           value={targetDomain}
                           onChange={(e) => setTargetDomain(e.target.value)}

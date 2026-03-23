@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { ShieldCheck, Scale, AlertTriangle, CheckCircle, Users, Activity, Play, Loader2, Info, Building2 } from 'lucide-react';
 import { ClinicalFile, DataType, BiasReport, ProvenanceRecord, ProvenanceType } from '../types';
 import { generateBiasAudit } from '../services/geminiService';
+import { InfoTooltip } from './InfoTooltip';
 
 interface BiasAuditProps {
   files: ClinicalFile[];
@@ -76,6 +77,7 @@ export const BiasAudit: React.FC<BiasAuditProps> = ({ files, onRecordProvenance,
         <h2 className="text-2xl font-bold text-slate-800 flex items-center">
             <Scale className="w-6 h-6 mr-3 text-medical-600" />
             Bias Audit
+            <InfoTooltip className="ml-2" content="Checks whether the dataset or analysis setup may systematically favor one group or outcome over another." />
         </h2>
         <p className="text-slate-500">
             AI-driven assessment of demographic parity, site heterogeneity, and safety signal reporting bias.

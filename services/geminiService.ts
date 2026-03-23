@@ -452,17 +452,40 @@ const runAdvancedAnalysisGuard = async (
     .map(buildDatasetReference);
 
   const fallbackAnswer = [
-    '### Advanced analysis requires executed analysis workflow',
-    'This request was blocked from the summary-only chat path because it needs row-level workspace construction and deterministic execution.',
+    '### This question needs a full analysis run',
+    'This question cannot be answered from summaries alone because it depends on row-level data across one or more datasets.',
     '',
-    'The current chat context for multiple tabular files only includes dataset profiles and summaries, which is not sufficient for feature importance, partial dependence, Week 12 endpoint derivation, or similar multi-domain analyses.',
+    'The current chat context for multiple tabular files only includes dataset profiles and summaries, which is not enough for questions such as Week 12 endpoint derivation, time-to-event analysis, feature importance, or partial dependence.',
     '',
-    'Start the full stack with `npm run dev` or run the analysis service separately with `npm run api:start`, then run the question again.',
+    '**What to do next:** keep the needed datasets selected and ask the question again after the full app is running.',
   ].join('\n');
 
   try {
     const capability = await classifyAnalysisCapabilities(query, datasetRefs);
     const feasibilityQuestion = isDatasetFeasibilityQuestion(query);
+    const roleConflictDetails = parseRoleConflictDetails(capability.explanation || '');
+
+    if (roleConflictDetails.length > 0) {
+      const roleLines = roleConflictDetails.map(
+        ({ role, files }) => `- **${describeRole(role)}:** ${files.join(', ')}`
+      );
+
+      return {
+        answer: [
+          '### Too many similar files are selected',
+          'The app found more than one selected file for the same dataset type, so it cannot tell which one to use for the analysis.',
+          '',
+          '**What to do next:** keep only one file for each dataset type needed for the question, then ask the question again.',
+          '',
+          '**Conflicting file groups:**',
+          ...roleLines,
+          '',
+          '**Good first files to deselect:** extra `workspace_...` files, duplicate `sdtm_...` files, or multiple versions of the same AE / demographics dataset.',
+          '',
+          'For this question, a good starting set is usually one subject-level demographics file, one adverse-events file, and one exposure or dosing file.',
+        ].join('\n'),
+      };
+    }
 
     if (feasibilityQuestion) {
       const missingDescriptions = capability.missing_roles.map(describeRole);
@@ -473,7 +496,7 @@ const runAdvancedAnalysisGuard = async (
               '### Yes, this dataset looks capable of supporting that analysis',
               `Based on the selected files, the app can map this request to ${familyDescription}.`,
               '',
-              'To actually compute the result, the backend still needs to run the row-level analysis workflow.',
+              'To actually compute the result, the app still needs to run the full row-level analysis on the selected files.',
             ]
           : [
               '### Not yet, this dataset selection is not sufficient',
@@ -523,9 +546,9 @@ const runAdvancedAnalysisGuard = async (
 
     return {
       answer: [
-        '### This question needs a full backend analysis run',
+        '### This question needs a full analysis run',
         capability.status === 'executable'
-          ? `The selected files look structurally suitable for ${describeFamily(capability.analysis_family)}, but chat has not produced a validated result yet.`
+          ? `The selected files look structurally suitable for ${describeFamily(capability.analysis_family)}, but the app has not produced a validated result yet.`
           : capability.explanation,
         '',
         capability.missing_roles.length > 0
@@ -533,7 +556,9 @@ const runAdvancedAnalysisGuard = async (
           : '**Selected data:** enough to recognize the needed analysis workflow.',
         ...(capability.warnings.length > 0 ? ['', '### Things to check', ...capability.warnings.map((warning) => `- ${warning}`)] : []),
         '',
-        'Chat is intentionally not inventing a chart or a result table here. To answer the question, the app needs to execute the full row-level analysis workflow on the selected data.',
+        '**What to do next:** clean up the selected files if needed, then ask the app to run the analysis again.',
+        '',
+        'The app is intentionally not inventing a chart or result table here.',
       ].join('\n'),
     };
   } catch (error) {
@@ -552,6 +577,35 @@ const runAdvancedAnalysisGuard = async (
       ].join('\n'),
     };
   }
+};
+
+const parseRoleConflictDetails = (explanation: string): Array<{ role: string; files: string[] }> => {
+  const marker = 'Conflicts:';
+  const markerIndex = explanation.indexOf(marker);
+  if (markerIndex === -1) return [];
+
+  const raw = explanation.slice(markerIndex + marker.length).trim();
+  if (!raw) return [];
+
+  return raw
+    .split(';')
+    .map((group) => group.trim())
+    .filter(Boolean)
+    .map((group) => {
+      const colonIndex = group.indexOf(':');
+      if (colonIndex === -1) {
+        return null;
+      }
+      const role = group.slice(0, colonIndex).trim();
+      const files = group
+        .slice(colonIndex + 1)
+        .split(',')
+        .map((file) => file.trim())
+        .filter(Boolean);
+      if (!role || files.length === 0) return null;
+      return { role, files };
+    })
+    .filter((value): value is { role: string; files: string[] } => value != null);
 };
 
 const median = (values: number[]): number | null => {

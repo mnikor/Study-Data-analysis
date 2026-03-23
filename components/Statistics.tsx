@@ -13,6 +13,7 @@ import {
   type FastApiWorkspaceResponse,
 } from '../services/fastapiAnalysisService';
 import { Chart } from './Chart';
+import { InfoTooltip } from './InfoTooltip';
 import { parseCsv } from '../utils/dataProcessing';
 import { inferDatasetProfileFromHeaders, mapProfileKindToAnalysisRole } from '../utils/datasetProfile';
 import { planAnalysisFromQuestion } from '../utils/queryPlanner';
@@ -1695,7 +1696,10 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                               </select>
                             </div>
                             <div>
-                              <label className="block text-sm font-semibold text-slate-700 mb-2">Supporting Datasets (Optional, for advanced row-level analysis)</label>
+                              <div className="mb-2 flex items-center gap-1">
+                                <label className="block text-sm font-semibold text-slate-700">Supporting Datasets (Optional, for advanced row-level analysis)</label>
+                                <InfoTooltip content="Optional additional datasets used when the analysis needs row-level joins across domains." />
+                              </div>
                               <div className="rounded-xl border border-slate-200 bg-slate-50 max-h-52 overflow-y-auto divide-y divide-slate-200">
                                 {!selectedFile ? (
                                   <div className="p-3 text-sm text-slate-500">Choose a primary dataset first to unlock supporting sources.</div>
@@ -1739,7 +1743,8 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                       <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
                           <h3 className="font-bold text-slate-800 mb-4 flex items-center">
                             <div className="w-6 h-6 rounded-full bg-slate-100 text-slate-500 flex items-center justify-center text-xs mr-3">2</div>
-                            Protocol Context (RAG)
+                            Protocol Context
+                            <InfoTooltip className="ml-2" content="Documents used to guide the analysis setup, such as a protocol or SAP." />
                          </h3>
                          <p className="text-xs text-slate-500 mb-3">Select documents to ground the code generation (e.g. SAP rules, Exclusion criteria).</p>
                          <div className="max-h-40 overflow-y-auto space-y-2 border border-slate-100 rounded-lg p-2 bg-slate-50">
@@ -1760,9 +1765,12 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                          </div>
 
                          <div className="mt-4 p-3 border border-emerald-100 rounded-lg bg-emerald-50">
-                            <label className="block text-[11px] font-semibold text-emerald-800 uppercase mb-2">
-                              Pre-Specified Analysis Plan (Protocol/SAP)
-                            </label>
+                            <div className="mb-2 flex items-center gap-1">
+                              <label className="block text-[11px] font-semibold text-emerald-800 uppercase">
+                                Pre-Specified Analysis Plan (Protocol/SAP)
+                              </label>
+                              <InfoTooltip content="A reviewed analysis plan extracted from the protocol or SAP and used to constrain execution." />
+                            </div>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                               <select
                                 value={selectedPlanDocId}
@@ -2237,6 +2245,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                    <div className="flex items-center mb-1">
                                        <FlaskConical className={`w-4 h-4 mr-2 ${usageMode === UsageMode.EXPLORATORY ? 'text-blue-600' : 'text-slate-400'}`} />
                                        <span className={`font-bold text-sm ${usageMode === UsageMode.EXPLORATORY ? 'text-blue-800' : 'text-slate-700'}`}>Explore Fast</span>
+                                       <InfoTooltip className="ml-1" content="Best for quick exploratory analysis and hypothesis generation. Results may need follow-up validation." />
                                    </div>
                                    <p className="text-xs text-slate-500">Low-friction mode for fast iteration, hypothesis generation, and analyst-led exploration.</p>
                                </button>
@@ -2248,6 +2257,7 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                    <div className="flex items-center mb-1">
                                        <ShieldAlert className={`w-4 h-4 mr-2 ${usageMode === UsageMode.OFFICIAL ? 'text-green-600' : 'text-slate-400'}`} />
                                        <span className={`font-bold text-sm ${usageMode === UsageMode.OFFICIAL ? 'text-green-800' : 'text-slate-700'}`}>Run Confirmed</span>
+                                       <InfoTooltip className="ml-1" content="Best for controlled, reviewable analysis based on a selected protocol or pre-specified plan." />
                                    </div>
                                    <p className="text-xs text-slate-500">Controlled mode for pre-specified analyses. Requires a reviewed Protocol/SAP plan before execution.</p>
                                </button>
@@ -2286,7 +2296,10 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                        <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
                            <div className="flex items-start justify-between gap-3 mb-4">
                              <div>
-                               <h3 className="font-bold text-slate-800">Advanced Analysis Plan Preview</h3>
+                               <div className="flex items-center gap-1">
+                                 <h3 className="font-bold text-slate-800">Advanced Analysis Plan Preview</h3>
+                                 <InfoTooltip content="Shows the analysis structure the app plans to run before execution." />
+                               </div>
                                <p className="text-xs text-slate-500 mt-1">
                                  Preview the recommended analysis family, required roles, and joined workspace before you generate code.
                                </p>

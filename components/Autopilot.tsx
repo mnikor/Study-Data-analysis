@@ -62,6 +62,7 @@ import {
 import { formatComparisonLabel } from '../utils/displayNames';
 import { assessAutopilotQuestionMatch } from '../utils/autopilotQuestionMatch';
 import { Chart } from './Chart';
+import { InfoTooltip } from './InfoTooltip';
 
 type StepKey = 'qc' | 'cleaning' | 'mapping' | 'transform' | 'plan' | 'analysis';
 type StepStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'SKIPPED';
@@ -2230,7 +2231,10 @@ export const Autopilot: React.FC<AutopilotProps> = ({
 
           {experienceMode === 'RUN_CONFIRMED' ? (
             <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
-              <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700 mb-1">Run Confirmed Checklist</div>
+              <div className="mb-1 flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-emerald-700">
+                <span>Run Confirmed Checklist</span>
+                <InfoTooltip content="Run Confirmed is for controlled, reviewable analysis based on a protocol or pre-specified plan." />
+              </div>
               <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
               <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
               <ul className="mt-3 space-y-2 text-sm text-slate-700">
@@ -2255,7 +2259,10 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             </div>
           ) : (
             <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
-              <div className="text-xs font-semibold uppercase tracking-wide text-indigo-600 mb-1">Explore Fast</div>
+              <div className="mb-1 flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-indigo-600">
+                <span>Explore Fast</span>
+                <InfoTooltip content="Best for quick exploratory analysis and idea generation. Results may need follow-up validation." />
+              </div>
               <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
               <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
             </div>
@@ -2280,7 +2287,10 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           {analysisScope === 'LINKED_WORKSPACE' && (
             <div>
               <div className="flex items-center justify-between gap-3 mb-2">
-                <label className="block text-xs font-semibold text-slate-500 uppercase">Supporting Datasets</label>
+                <div className="flex items-center gap-1">
+                  <label className="block text-xs font-semibold text-slate-500 uppercase">Supporting Datasets</label>
+                  <InfoTooltip content="Optional additional datasets used to build one joined analysis table across subject-level domains." />
+                </div>
                 <div className="text-[11px] text-slate-400">
                   {selectedSupportingIds.length}/{supportingSourceFiles.length} selected
                 </div>
@@ -2328,7 +2338,10 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           )}
 
           <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Reference Mapping (Optional)</label>
+            <div className="mb-2 flex items-center gap-1">
+              <label className="block text-xs font-semibold text-slate-500 uppercase">Reference Mapping (Optional)</label>
+              <InfoTooltip content="An optional mapping file that helps standardize source columns into a known clinical structure." />
+            </div>
             <select
               value={selectedReferenceId}
               onChange={(e) => setSelectedReferenceId(e.target.value)}
@@ -2344,9 +2357,12 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">
-              Protocol/SAP {experienceMode === 'RUN_CONFIRMED' ? '(Required)' : '(Optional)'}
-            </label>
+            <div className="mb-2 flex items-center gap-1">
+              <label className="block text-xs font-semibold text-slate-500 uppercase">
+                Protocol/SAP {experienceMode === 'RUN_CONFIRMED' ? '(Required)' : '(Optional)'}
+              </label>
+              <InfoTooltip content="An optional protocol or statistical analysis plan document used to guide or constrain the analysis." />
+            </div>
             <select
               value={selectedProtocolId}
               onChange={(e) => setSelectedProtocolId(e.target.value)}
@@ -2362,9 +2378,12 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">
-              Primary Clinical Domain
-            </label>
+            <div className="mb-2 flex items-center gap-1">
+              <label className="block text-xs font-semibold text-slate-500 uppercase">
+                Primary Clinical Domain
+              </label>
+              <InfoTooltip content="The main clinical data area this run should focus on, such as demographics, adverse events, labs, exposure, or disposition." />
+            </div>
             <select
               value={selectedTargetDomainOption}
               onChange={(e) => {
