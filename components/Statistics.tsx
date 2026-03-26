@@ -860,8 +860,10 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
 
       <div class="section grid two">
         <div class="card" style="background:#eef2ff;border-color:#c7d2fe;">
-          <div class="section-title" style="color:#4338ca;">Clinical Interpretation</div>
-          <div class="body-copy">${escapeHtml(result.interpretation)}</div>
+          <div class="section-title" style="color:#4338ca;">${escapeHtml(
+            result.aiCommentary?.sections?.directAnswer ? 'Direct Answer' : 'Clinical Interpretation'
+          )}</div>
+          <div class="body-copy">${escapeHtml(result.aiCommentary?.sections?.directAnswer || result.interpretation)}</div>
         </div>
         <div class="card">
           <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
@@ -2674,10 +2676,10 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                             <div className="bg-indigo-50 p-6 rounded-xl border border-indigo-100 shadow-sm">
                                 <h3 className="font-bold text-indigo-900 mb-3 flex items-center">
                                     <Lightbulb className="w-5 h-5 mr-2" />
-                                    Clinical Interpretation
+                                    {result.aiCommentary?.sections?.directAnswer ? 'Direct Answer' : 'Clinical Interpretation'}
                                 </h3>
                                 <p className="text-indigo-800 text-sm leading-relaxed">
-                                    {result.interpretation}
+                                    {result.aiCommentary?.sections?.directAnswer || result.interpretation}
                                 </p>
                             </div>
 

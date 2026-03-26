@@ -1,21 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  BarChart3,
   Bot,
-  CheckCircle2,
-  Clock3,
   Download,
   ExternalLink,
-  FileText,
-  FolderOpen,
-  Loader2,
-  PencilLine,
-  Play,
-  Save,
-  Sparkles,
   Table2,
   X,
-  XCircle,
 } from 'lucide-react';
 import {
   AnalysisPlanEntry,
@@ -32,12 +21,14 @@ import {
   QCIssue,
   ResultTable,
   StatAnalysisResult,
+  StatTestType,
   StudyType,
   UsageMode,
   User,
 } from '../types';
 import {
   applyCleaning,
+  buildDatasetReference,
   executeStatisticalCode,
   extractPreSpecifiedAnalysisPlan,
   generateClinicalCommentary,
@@ -49,6 +40,13 @@ import {
   runQualityCheck,
   runTransformation,
 } from '../services/geminiService';
+import { generateQuestionPlanningAssist, type QuestionPlanningAssist } from '../services/planningAssistService';
+import {
+  requestAnalysisPlan,
+  type FastApiAnalysisSpec,
+  type FastApiCapabilityResponse,
+  type FastApiDatasetReference,
+} from '../services/fastapiAnalysisService';
 import { parseCsv } from '../utils/dataProcessing';
 import { parseReferenceMapping } from '../utils/mappingReference';
 import { planAnalysisFromQuestion } from '../utils/queryPlanner';
@@ -61,8 +59,12 @@ import {
 } from '../utils/linkedAnalysisWorkspace';
 import { formatComparisonLabel } from '../utils/displayNames';
 import { assessAutopilotQuestionMatch } from '../utils/autopilotQuestionMatch';
+import { buildQuestionFileRecommendation, inferDatasetProfile, mapProfileKindToAnalysisRole } from '../utils/datasetProfile';
 import { Chart } from './Chart';
-import { InfoTooltip } from './InfoTooltip';
+import { AutopilotControlPanel } from './AutopilotControlPanel';
+import { AutopilotRunBrowser } from './AutopilotRunBrowser';
+import { AutopilotWorkspaceSection } from './AutopilotWorkspaceSection';
+import { AutopilotWorkflowPanel } from './AutopilotWorkflowPanel';
 
 type StepKey = 'qc' | 'cleaning' | 'mapping' | 'transform' | 'plan' | 'analysis';
 type StepStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'SKIPPED';
@@ -87,6 +89,24 @@ interface AutopilotRunGroup {
   scopeLabel: string;
   workflowMode: UsageMode;
   questionPreview: string;
+}
+
+interface HypothesisDraft {
+  id: string;
+  question: string;
+  enabled: boolean;
+  suggestedTestType: StatTestType;
+  suggestedVar1: string;
+  suggestedVar2: string;
+  rationale?: string;
+}
+
+type BackendAnalysisFamily = FastApiCapabilityResponse['analysis_family'];
+
+interface PlannedAutopilotTask extends AutopilotAnalysisTask {
+  backendSpec?: FastApiAnalysisSpec | null;
+  backendPlannedFamily?: BackendAnalysisFamily | null;
+  backendPlanExplanation?: string;
 }
 
 interface AutopilotProps {
@@ -129,6 +149,35 @@ const TARGET_DOMAIN_OPTIONS = [
 ];
 
 const CUSTOM_TARGET_DOMAIN_VALUE = '__OTHER__';
+const AUTOPILOT_ROLE_LABELS: Record<string, string> = {
+  ADSL: 'Subject baseline',
+  ADAE: 'Adverse events',
+  ADLB: 'Labs',
+  ADTTE: 'Time to event',
+  ADEX: 'Exposure / dosing',
+  DS: 'Disposition / adherence',
+};
+
+const recommendationConfidenceClass = (confidence?: string) =>
+  confidence === 'High'
+    ? 'bg-emerald-50 text-emerald-700'
+    : confidence === 'Medium'
+      ? 'bg-amber-50 text-amber-700'
+      : 'bg-slate-100 text-slate-600';
+
+const recommendationSupportStatusClass = (status?: 'READY' | 'PARTIAL' | 'MISSING') =>
+  status === 'READY'
+    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+    : status === 'PARTIAL'
+      ? 'border-amber-200 bg-amber-50 text-amber-800'
+      : 'border-red-200 bg-red-50 text-red-800';
+
+const recommendationSupportCheckClass = (status?: 'MET' | 'PARTIAL' | 'MISSING') =>
+  status === 'MET'
+    ? 'text-emerald-700'
+    : status === 'PARTIAL'
+      ? 'text-amber-700'
+      : 'text-red-700';
 
 const deriveSavedStepState = (session: AnalysisSession | null): Record<StepKey, StepState> => {
   if (!session) return defaultStepState();
@@ -152,6 +201,10 @@ const deriveSavedStepState = (session: AnalysisSession | null): Record<StepKey, 
   const questionMismatch =
     session.params.autopilotQuestionMatchStatus === 'FAILED'
       ? session.params.autopilotQuestionMatchSummary || 'Saved result did not match the original question.'
+      : null;
+  const partialQuestionMatch =
+    session.params.autopilotQuestionMatchStatus === 'PARTIAL'
+      ? session.params.autopilotQuestionMatchSummary || 'Saved result only partially answered the original question.'
       : null;
 
   return {
@@ -185,6 +238,7 @@ const deriveSavedStepState = (session: AnalysisSession | null): Record<StepKey, 
       status: questionMismatch ? 'FAILED' : 'DONE',
       detail:
         questionMismatch ||
+        partialQuestionMatch ||
         `${review.analysisPlan.tasks.length} task(s) completed${
           review.analysisPlan.multiplicityMethod ? ` with ${review.analysisPlan.multiplicityMethod}` : ''
         }`,
@@ -266,22 +320,7 @@ const mergeMappings = (
   });
 };
 
-const stepStatusClass: Record<StepStatus, string> = {
-  PENDING: 'bg-slate-100 text-slate-500 border-slate-200',
-  RUNNING: 'bg-blue-50 text-blue-700 border-blue-200',
-  DONE: 'bg-green-50 text-green-700 border-green-200',
-  FAILED: 'bg-red-50 text-red-700 border-red-200',
-  SKIPPED: 'bg-amber-50 text-amber-700 border-amber-200',
-};
-
-const StepIcon: React.FC<{ status: StepStatus }> = ({ status }) => {
-  if (status === 'RUNNING') return <Loader2 className="w-4 h-4 animate-spin" />;
-  if (status === 'DONE') return <CheckCircle2 className="w-4 h-4" />;
-  if (status === 'FAILED') return <XCircle className="w-4 h-4" />;
-  return <Clock3 className="w-4 h-4" />;
-};
-
-const planEntriesToTasks = (entries: AnalysisPlanEntry[]): AutopilotAnalysisTask[] =>
+const planEntriesToTasks = (entries: AnalysisPlanEntry[]): PlannedAutopilotTask[] =>
   entries.slice(0, 4).map((entry) => ({
     id: entry.id,
     label: entry.name,
@@ -304,6 +343,179 @@ const formatTimestamp = (timestamp: string) =>
   });
 
 const formatMetricLabel = (value: string) => value.replace(/_/g, ' ');
+
+const mapBackendFamilyToStatTestType = (family: BackendAnalysisFamily): StatTestType => {
+  switch (family) {
+    case 'kaplan_meier':
+      return StatTestType.KAPLAN_MEIER;
+    case 'cox':
+    case 'mixed_model':
+    case 'competing_risks':
+      return StatTestType.COX_PH;
+    case 'logistic_regression':
+    case 'feature_importance':
+    case 'partial_dependence':
+    case 'threshold_search':
+      return StatTestType.REGRESSION;
+    case 'incidence':
+    case 'risk_difference':
+      return StatTestType.CHI_SQUARE;
+    default:
+      return StatTestType.REGRESSION;
+  }
+};
+
+const humanizeBackendFamily = (family: BackendAnalysisFamily | null | undefined) => {
+  switch (family) {
+    case 'incidence':
+      return 'Incidence comparison';
+    case 'risk_difference':
+      return 'Risk difference';
+    case 'logistic_regression':
+      return 'Logistic regression';
+    case 'kaplan_meier':
+      return 'Kaplan-Meier';
+    case 'cox':
+      return 'Cox proportional hazards';
+    case 'mixed_model':
+      return 'Repeated-measures model';
+    case 'threshold_search':
+      return 'Threshold search';
+    case 'competing_risks':
+      return 'Competing risks';
+    case 'feature_importance':
+      return 'Feature importance';
+    case 'partial_dependence':
+      return 'Partial dependence';
+    default:
+      return null;
+  }
+};
+
+const sessionAnalysisLabel = (session: AnalysisSession) =>
+  humanizeBackendFamily(session.backendExecution?.analysisFamily) || session.params.testType;
+
+const sessionVariableSummary = (session: AnalysisSession) => {
+  const receipt = session.backendExecution?.receipt;
+  const primary =
+    receipt?.treatmentVariable ||
+    receipt?.outcomeVariable ||
+    session.params.var1;
+  const candidateSecondary = receipt?.timeVariable || receipt?.eventVariable || receipt?.outcomeVariable || session.params.var2;
+  const secondary = candidateSecondary && candidateSecondary !== primary ? candidateSecondary : session.params.var2;
+  return formatVariablesForDisplay(primary, secondary);
+};
+
+const sessionCardTitle = (session: AnalysisSession) =>
+  sessionVariableSummary(session) || sessionAnalysisLabel(session) || session.params.autopilotQuestion || session.name;
+
+const backendFamiliesAreCompatible = (
+  planned: BackendAnalysisFamily | null | undefined,
+  executed: BackendAnalysisFamily | null | undefined
+) => {
+  if (!planned || !executed) return false;
+  if (planned === executed) return true;
+  const incidenceFamily = new Set<BackendAnalysisFamily>(['incidence', 'risk_difference']);
+  return incidenceFamily.has(planned) && incidenceFamily.has(executed);
+};
+
+const BACKEND_PLANNING_QUERY_HINTS =
+  /time to resolution|resolution|earlier onset|time to onset|time to first|cumulative incidence|risk difference|predictors?|feature importance|partial dependence|mixed model|threshold|competing risk|hazard|kaplan|cox|survival|dose|dosing|weight|mitigat|differ by arm|interaction|recovery/i;
+
+const shouldPreferBackendPlanning = (question: string, scope: AutopilotDataScope) =>
+  scope === 'LINKED_WORKSPACE' || BACKEND_PLANNING_QUERY_HINTS.test(question);
+
+const buildAutopilotPlanError = (
+  question: string,
+  planStatus: 'executable' | 'missing_data' | 'unsupported',
+  explanation: string,
+  missingRoles: string[]
+) => {
+  if (missingRoles.length > 0) {
+    return `This question cannot be planned yet because the data is still missing ${missingRoles.join(', ')}. ${explanation}`.trim();
+  }
+  if (planStatus === 'unsupported') {
+    return `Autopilot could not translate this question into a supported deterministic analysis yet. ${explanation}`.trim();
+  }
+  return explanation || `Autopilot could not build a valid analysis plan for: ${question}`;
+};
+
+const buildBackendPlannedTask = async (
+  question: string,
+  sourceFiles: ClinicalFile[]
+): Promise<PlannedAutopilotTask> => {
+  const datasetRefs: FastApiDatasetReference[] = sourceFiles
+    .filter((file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content))
+    .map((file) => {
+      const reference = buildDatasetReference(file);
+      if (reference.role) return reference;
+      const profile = inferDatasetProfile(file);
+      return {
+        ...reference,
+        role: mapProfileKindToAnalysisRole(profile.kind),
+      };
+    });
+
+  const plan = await requestAnalysisPlan(question, datasetRefs);
+  if (plan.status !== 'executable' || !plan.spec) {
+    throw new Error(buildAutopilotPlanError(question, plan.status, plan.explanation, plan.missing_roles));
+  }
+
+  const spec = plan.spec;
+  const primaryVariable =
+    spec.treatment_variable ||
+    spec.subject_variable ||
+    spec.outcome_variable ||
+    spec.repeated_measure_variable ||
+    spec.endpoint_label ||
+    spec.target_definition ||
+    'analysis target';
+  const secondaryVariable =
+    spec.time_variable ||
+    spec.repeated_time_variable ||
+    spec.event_variable ||
+    (spec.outcome_variable && spec.outcome_variable !== primaryVariable ? spec.outcome_variable : '') ||
+    '';
+  const familyLabel = humanizeBackendFamily(spec.analysis_family) || spec.analysis_family;
+
+  return {
+    id: crypto.randomUUID(),
+    label: `${familyLabel}: ${formatVariablesForDisplay(primaryVariable, secondaryVariable)}`,
+    question: question.trim(),
+    testType: mapBackendFamilyToStatTestType(spec.analysis_family),
+    var1: primaryVariable,
+    var2: secondaryVariable,
+    covariates: spec.covariates,
+    rationale: plan.explanation || spec.notes[0],
+    backendSpec: spec,
+    backendPlannedFamily: spec.analysis_family,
+    backendPlanExplanation: plan.explanation,
+  };
+};
+
+const buildQuestionTask = async (
+  analysisFile: ClinicalFile,
+  question: string,
+  customSynonymsList: string[],
+  sourceFiles: ClinicalFile[],
+  scope: AutopilotDataScope
+): Promise<PlannedAutopilotTask> => {
+  if (shouldPreferBackendPlanning(question, scope)) {
+    return buildBackendPlannedTask(question, sourceFiles);
+  }
+
+  const planned = planAnalysisFromQuestion(analysisFile, question, customSynonymsList);
+  return {
+    id: crypto.randomUUID(),
+    label: `${planned.testType}: ${planned.var1} vs ${planned.var2}`,
+    question: question.trim(),
+    testType: planned.testType,
+    var1: planned.var1,
+    var2: planned.var2,
+    concept: planned.concept,
+    rationale: planned.explanation,
+  };
+};
 
 const getModeLabel = (mode: AutopilotExecutionMode | null | undefined) => (mode === 'SINGLE' ? 'One question' : 'Analysis pack');
 const getScopeLabel = (scope: AutopilotDataScope | null | undefined) =>
@@ -343,6 +555,7 @@ const buildDefaultRunName = (
 
 const getQuestionMatchBadgeClass = (status: AnalysisSession['params']['autopilotQuestionMatchStatus']) => {
   if (status === 'FAILED') return 'border-red-200 bg-red-50 text-red-700';
+  if (status === 'PARTIAL') return 'border-amber-200 bg-amber-50 text-amber-800';
   return 'border-emerald-200 bg-emerald-50 text-emerald-700';
 };
 
@@ -364,6 +577,92 @@ const slugifyFileName = (value: string) =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'autopilot-report';
+
+const FOCUS_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'into',
+  'that',
+  'this',
+  'what',
+  'which',
+  'does',
+  'would',
+  'could',
+  'should',
+  'have',
+  'has',
+  'had',
+  'are',
+  'was',
+  'were',
+  'using',
+  'among',
+  'across',
+  'between',
+  'than',
+  'into',
+  'then',
+  'when',
+  'only',
+  'over',
+  'best',
+  'most',
+  'show',
+  'find',
+  'explore',
+  'analysis',
+  'question',
+  'questions',
+  'dataset',
+  'datasets',
+  'data',
+  'pack',
+]);
+
+const tokenizeFocus = (value: string) =>
+  Array.from(
+    new Set(
+      value
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 2 && !FOCUS_STOP_WORDS.has(token))
+    )
+  );
+
+const rankTasksByFocus = (tasks: AutopilotAnalysisTask[], focusQuestion: string): AutopilotAnalysisTask[] => {
+  const focusTokens = tokenizeFocus(focusQuestion);
+  if (focusTokens.length === 0) return tasks;
+
+  return [...tasks]
+    .map((task, index) => {
+      const haystack = [task.question, task.rationale, task.label, task.var1, task.var2]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      const overlap = focusTokens.reduce((score, token) => (haystack.includes(token) ? score + 1 : score), 0);
+      return { task, index, overlap };
+    })
+    .sort((a, b) => {
+      if (b.overlap !== a.overlap) return b.overlap - a.overlap;
+      return a.index - b.index;
+    })
+    .map(({ task }) => task);
+};
+
+const taskToHypothesisDraft = (task: AutopilotAnalysisTask): HypothesisDraft => ({
+  id: task.id,
+  question: task.question,
+  enabled: true,
+  suggestedTestType: task.testType,
+  suggestedVar1: task.var1,
+  suggestedVar2: task.var2,
+  rationale: task.rationale,
+});
 
 const renderHtmlDataTable = (table?: ResultTable) => {
   if (!table || table.rows.length === 0) return '';
@@ -579,9 +878,12 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const [analysisMode, setAnalysisMode] = useState<AutopilotExecutionMode>('PACK');
   const [analysisScope, setAnalysisScope] = useState<AutopilotDataScope>('SINGLE_DATASET');
   const [analysisQuestion, setAnalysisQuestion] = useState('');
+  const [packFocusQuestion, setPackFocusQuestion] = useState('');
   const [customSynonyms, setCustomSynonyms] = useState('');
   const [generateSasDraft, setGenerateSasDraft] = useState(false);
   const [selectedSupportingIds, setSelectedSupportingIds] = useState<string[]>([]);
+  const [proposedHypotheses, setProposedHypotheses] = useState<HypothesisDraft[]>([]);
+  const [hypothesisGenerationError, setHypothesisGenerationError] = useState<string | null>(null);
 
   const [isRunning, setIsRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -596,6 +898,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const [isEditingRunName, setIsEditingRunName] = useState(false);
   const [runNameDraft, setRunNameDraft] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [planningAssist, setPlanningAssist] = useState<QuestionPlanningAssist | null>(null);
+  const [isPlanningAssistLoading, setIsPlanningAssistLoading] = useState(false);
+  const [planningAssistError, setPlanningAssistError] = useState<string | null>(null);
 
   const sourceFiles = useMemo(
     () => files.filter((f) => f.type === DataType.RAW || f.type === DataType.STANDARDIZED || f.type === DataType.COHORT_DEF),
@@ -616,6 +921,67 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     ? targetDomain
     : CUSTOM_TARGET_DOMAIN_VALUE;
   const suggestedTargetDomain = useMemo(() => inferPrimaryClinicalDomain(selectedSource), [selectedSource]);
+  const activeAutopilotPrompt = analysisMode === 'SINGLE' ? analysisQuestion.trim() : packFocusQuestion.trim();
+  const autopilotRecommendation = useMemo(
+    () => (activeAutopilotPrompt ? buildQuestionFileRecommendation(activeAutopilotPrompt, sourceFiles) : null),
+    [activeAutopilotPrompt, sourceFiles]
+  );
+  const recommendedSourceFile = useMemo(() => {
+    if (!autopilotRecommendation) return null;
+    return (
+      autopilotRecommendation.selectedByRole.ADSL ||
+      autopilotRecommendation.selectedByRole.ADAE ||
+      autopilotRecommendation.selectedByRole.ADTTE ||
+      autopilotRecommendation.selectedByRole.ADEX ||
+      autopilotRecommendation.selectedByRole.ADLB ||
+      autopilotRecommendation.selectedByRole.DS ||
+      null
+    );
+  }, [autopilotRecommendation]);
+  const recommendedSupportingFiles = useMemo(() => {
+    if (!autopilotRecommendation || !recommendedSourceFile) return [];
+    return Object.values(autopilotRecommendation.selectedByRole)
+      .filter((file): file is ClinicalFile => Boolean(file))
+      .filter((file) => file.id !== recommendedSourceFile.id);
+  }, [autopilotRecommendation, recommendedSourceFile]);
+  const recommendedExecutionFiles = useMemo(() => {
+    if (!autopilotRecommendation || !recommendedSourceFile) return [];
+    return [recommendedSourceFile, ...recommendedSupportingFiles];
+  }, [autopilotRecommendation, recommendedSourceFile, recommendedSupportingFiles]);
+  const applyRecommendedAutopilotFiles = () => {
+    if (!recommendedSourceFile) return;
+    setSelectedSourceId(recommendedSourceFile.id);
+    setSelectedSupportingIds(recommendedSupportingFiles.map((file) => file.id));
+  };
+  const handleGeneratePlanningAssist = async () => {
+    if (!activeAutopilotPrompt || sourceFiles.length === 0 || isPlanningAssistLoading) return;
+    setIsPlanningAssistLoading(true);
+    setPlanningAssistError(null);
+    try {
+      const assist = await generateQuestionPlanningAssist(activeAutopilotPrompt, sourceFiles);
+      if (!assist) {
+        setPlanningAssistError('AI planning assist could not propose advice from the current files.');
+        setPlanningAssist(null);
+      } else {
+        setPlanningAssist(assist);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'AI planning assist failed.';
+      setPlanningAssistError(message);
+      setPlanningAssist(null);
+    } finally {
+      setIsPlanningAssistLoading(false);
+    }
+  };
+  const enabledHypotheses = useMemo(
+    () => proposedHypotheses.filter((hypothesis) => hypothesis.enabled && hypothesis.question.trim()),
+    [proposedHypotheses]
+  );
+
+  useEffect(() => {
+    setPlanningAssist(null);
+    setPlanningAssistError(null);
+  }, [activeAutopilotPrompt, sourceFiles]);
 
   useEffect(() => {
     if (!selectedSource) {
@@ -631,6 +997,19 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     if (analysisScope !== 'SINGLE_DATASET') setAnalysisScope('SINGLE_DATASET');
   }, [experienceMode, analysisMode, analysisScope]);
 
+  useEffect(() => {
+    setProposedHypotheses([]);
+    setHypothesisGenerationError(null);
+  }, [
+    selectedSourceId,
+    selectedSupportingIds.join('|'),
+    analysisMode,
+    analysisScope,
+    experienceMode,
+    customSynonyms,
+    packFocusQuestion,
+  ]);
+
   const confirmedBlockingReason = useMemo(() => {
     if (experienceMode !== 'RUN_CONFIRMED') return null;
     if (!selectedProtocol) return 'Run Confirmed requires a Protocol or SAP document.';
@@ -638,6 +1017,15 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     if (analysisMode !== 'PACK') return 'Run Confirmed only supports Analysis Pack mode.';
     return null;
   }, [experienceMode, selectedProtocol, analysisScope, analysisMode]);
+
+  const hypothesisGenerationBlockingReason = useMemo(() => {
+    if (analysisMode !== 'PACK') return null;
+    if (!selectedSource) return 'Select a source dataset first.';
+    if (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) {
+      return 'Select at least one supporting dataset for linked workspace mode.';
+    }
+    return null;
+  }, [analysisMode, analysisScope, selectedSource, selectedSupportingFiles.length]);
 
   const runMode = useMemo(() => {
     if (experienceMode === 'RUN_CONFIRMED') {
@@ -658,7 +1046,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       }
       return {
         label: 'Linked exploratory analysis pack',
-        helper: 'Autopilot will join the selected datasets by subject, scan for cross-domain signals, and adjust p-values across the exploratory run.',
+        helper: 'Autopilot will join the selected datasets by subject, propose distinct cross-domain hypotheses, and run the approved exploratory analyses.',
         button: 'Run Linked Analysis Pack',
       };
     }
@@ -678,7 +1066,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     }
     return {
       label: 'Autopilot analysis pack',
-      helper: 'Autopilot will choose several clinically relevant analyses and save them as one reusable run.',
+      helper: 'Autopilot will propose several distinct clinically relevant hypotheses, let you review them, and save the approved analyses as one reusable run.',
       button: 'Run Analysis Pack',
     };
   }, [analysisMode, analysisScope, experienceMode, selectedProtocol]);
@@ -748,12 +1136,13 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const selectedResult = selectedRunResults.find((session) => session.id === selectedResultId) || selectedRunResults[0] || null;
   const activeResultTable = selectedResult?.tableConfig;
   const activeReview = selectedResult?.params.autopilotReview || null;
+  const hasUnsavedFailedAttempt = !isRunning && Boolean(runError) && runLog.length > 0;
   const displayedStepState = useMemo(
-    () => (isRunning ? stepState : deriveSavedStepState(selectedResult)),
-    [isRunning, stepState, selectedResult]
+    () => (isRunning || hasUnsavedFailedAttempt ? stepState : deriveSavedStepState(selectedResult)),
+    [hasUnsavedFailedAttempt, isRunning, stepState, selectedResult]
   );
   const displayedRunLog = useMemo(() => {
-    if (isRunning) return runLog;
+    if (isRunning || hasUnsavedFailedAttempt) return runLog;
 
     const persistedLog = selectedRunResults.reduce<string[]>((best, session) => {
       const candidate = session.params.autopilotExecutionLog || [];
@@ -792,7 +1181,11 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     }
 
     return fallbackLog;
-  }, [isRunning, runLog, selectedRun, selectedResult, selectedRunResults]);
+  }, [hasUnsavedFailedAttempt, isRunning, runLog, selectedRun, selectedResult, selectedRunResults]);
+  const failureLogPreview = useMemo(() => {
+    if (!hasUnsavedFailedAttempt) return [];
+    return displayedRunLog.slice(-5);
+  }, [displayedRunLog, hasUnsavedFailedAttempt]);
 
   const updateStep = (key: StepKey, status: StepStatus, detail: string) => {
     setStepState((prev) => ({ ...prev, [key]: { status, detail } }));
@@ -860,12 +1253,69 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     setSelectedSupportingIds([]);
   };
 
+  const generatePackHypotheses = () => {
+    if (!selectedSource) {
+      setHypothesisGenerationError('Select a source dataset first.');
+      return;
+    }
+
+    if (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) {
+      setHypothesisGenerationError('Select at least one supporting dataset before generating linked-workspace hypotheses.');
+      return;
+    }
+
+    try {
+      const customSynonymList = customSynonyms
+        .split(',')
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean);
+
+      const planningFile =
+        analysisScope === 'LINKED_WORKSPACE'
+          ? buildLinkedAnalysisWorkspace(selectedSource, selectedSupportingFiles, customSynonymList).workspaceFile
+          : selectedSource;
+
+      const rawTasks =
+        analysisScope === 'LINKED_WORKSPACE'
+          ? buildExploratorySignalTasks(planningFile, 6)
+          : buildAutopilotAnalysisSuite(planningFile, customSynonymList);
+
+      const rankedTasks = rankTasksByFocus(rawTasks, packFocusQuestion).slice(0, 6);
+      if (rankedTasks.length === 0) {
+        setHypothesisGenerationError('Autopilot could not propose distinct hypotheses from the currently selected data.');
+        setProposedHypotheses([]);
+        return;
+      }
+
+      setProposedHypotheses(rankedTasks.map(taskToHypothesisDraft));
+      setHypothesisGenerationError(null);
+      setRunError(null);
+    } catch (error: any) {
+      setProposedHypotheses([]);
+      setHypothesisGenerationError(error?.message || 'Autopilot could not generate hypotheses from the selected files.');
+    }
+  };
+
+  const toggleHypothesisEnabled = (id: string) => {
+    setProposedHypotheses((prev) =>
+      prev.map((hypothesis) => (hypothesis.id === id ? { ...hypothesis, enabled: !hypothesis.enabled } : hypothesis))
+    );
+  };
+
+  const updateHypothesisQuestion = (id: string, question: string) => {
+    setProposedHypotheses((prev) =>
+      prev.map((hypothesis) => (hypothesis.id === id ? { ...hypothesis, question } : hypothesis))
+    );
+  };
+
   const startNewAnalysis = () => {
     setIsCreatingNewAnalysis(true);
     setRunError(null);
     setSelectedRunId(CURRENT_RUN_SENTINEL);
     setSelectedResultId('');
     setShowWorkflowPanels(false);
+    setProposedHypotheses([]);
+    setHypothesisGenerationError(null);
   };
 
   const closeNewAnalysis = () => {
@@ -919,6 +1369,33 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     setRenameError(null);
   };
 
+  const handleDeleteRun = (runId: string) => {
+    const runToDelete = autopilotRuns.find((run) => run.runId === runId);
+    if (!runToDelete) return;
+
+    const confirmed = window.confirm(
+      `Delete the Autopilot run "${runToDelete.runName}"?\n\nThis will remove ${runToDelete.analysisCount} saved analysis result${runToDelete.analysisCount === 1 ? '' : 's'} from the workspace.`
+    );
+    if (!confirmed) return;
+
+    const runSessionIds = new Set(runToDelete.sessions.map((session) => session.id));
+
+    setSessions((prev) => prev.filter((session) => !runSessionIds.has(session.id)));
+    setSelectedResultId((prev) => (runSessionIds.has(prev) ? '' : prev));
+    setSelectedRunId((prev) => (prev === runId ? '' : prev));
+
+    onRecordProvenance({
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      userId: currentUser.name,
+      userRole: currentUser.role,
+      actionType: ProvenanceType.STATISTICS,
+      details: `Deleted Autopilot run ${runToDelete.runName}.`,
+      inputs: runToDelete.sessions.map((session) => session.id),
+      outputs: [],
+    });
+  };
+
   const downloadHtmlReport = (fileName: string, html: string) => {
     const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -934,9 +1411,12 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const buildResultExportHtml = (run: AutopilotRunGroup, session: AnalysisSession) => {
     const title = `Evidence CoPilot | ${run.runName}`;
     const plotId = `plot-${session.id}`;
-    const variables = formatVariablesForDisplay(session.params.var1, session.params.var2);
+    const variables = sessionVariableSummary(session);
+    const analysisLabel = sessionAnalysisLabel(session);
     const linkedSources = session.params.autopilotSourceNames?.length ? session.params.autopilotSourceNames.join(', ') : session.params.autopilotSourceName || '';
-    const questionMismatch = session.params.autopilotQuestionMatchStatus === 'FAILED';
+    const questionMatchStatus = session.params.autopilotQuestionMatchStatus;
+    const questionMismatch = questionMatchStatus === 'FAILED';
+    const questionPartial = questionMatchStatus === 'PARTIAL';
 
     return `
       <!DOCTYPE html>
@@ -985,7 +1465,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             <div class="hero">
               <div class="eyebrow">Autopilot Result Export</div>
               <div class="title">${escapeHtml(run.runName)}</div>
-              <div class="subtitle">${escapeHtml(session.params.testType)} | ${escapeHtml(variables)}</div>
+              <div class="subtitle">${escapeHtml(analysisLabel)} | ${escapeHtml(variables)}</div>
               <div style="margin-top:16px;"><span class="badge">${escapeHtml(getWorkflowLabel(session.usageMode))}</span></div>
               ${
                 session.params.autopilotQuestion
@@ -995,8 +1475,8 @@ export const Autopilot: React.FC<AutopilotProps> = ({
               ${
                 session.params.autopilotQuestionMatchSummary
                   ? `<div style="margin-top:14px;border:1px solid ${
-                      questionMismatch ? '#fecaca' : '#bbf7d0'
-                    };background:${questionMismatch ? '#fef2f2' : '#f0fdf4'};color:${questionMismatch ? '#991b1b' : '#166534'};border-radius:14px;padding:12px 14px;font-size:14px;">${escapeHtml(
+                      questionMismatch ? '#fecaca' : questionPartial ? '#fde68a' : '#bbf7d0'
+                    };background:${questionMismatch ? '#fef2f2' : questionPartial ? '#fffbeb' : '#f0fdf4'};color:${questionMismatch ? '#991b1b' : questionPartial ? '#92400e' : '#166534'};border-radius:14px;padding:12px 14px;font-size:14px;">${escapeHtml(
                       session.params.autopilotQuestionMatchSummary
                     )}</div>`
                   : ''
@@ -1029,31 +1509,171 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             </div>
 
             ${
+              session.backendExecution?.receipt
+                ? `
+              <div class="section">
+                <div class="section-title">Executed Analysis Receipt</div>
+                <div class="grid meta">
+                  ${
+                    session.backendExecution.receipt.endpointLabel
+                      ? `<div class="card"><div class="card-label">Endpoint</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.endpointLabel
+                        )}</div></div>`
+                      : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.targetDefinition
+                      ? `<div class="card"><div class="card-label">Target Definition</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.targetDefinition
+                        )}</div></div>`
+                      : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.treatmentVariable
+                      ? `<div class="card"><div class="card-label">Grouping Variable</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.treatmentVariable
+                        )}</div></div>`
+                      : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.timeVariable
+                      ? `<div class="card"><div class="card-label">Time Variable</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.timeVariable
+                        )}</div></div>`
+                      : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.eventVariable
+                      ? `<div class="card"><div class="card-label">Event Variable</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.eventVariable
+                        )}</div></div>`
+                      : session.backendExecution.receipt.outcomeVariable
+                        ? `<div class="card"><div class="card-label">Outcome Variable</div><div class="card-value">${escapeHtml(
+                            session.backendExecution.receipt.outcomeVariable
+                          )}</div></div>`
+                        : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.outcomeVariable &&
+                    session.backendExecution.receipt.eventVariable &&
+                    session.backendExecution.receipt.outcomeVariable !== session.backendExecution.receipt.eventVariable
+                      ? `<div class="card"><div class="card-label">Derived Outcome Flag</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.outcomeVariable
+                        )}</div></div>`
+                      : ''
+                  }
+                  ${
+                    session.backendExecution.receipt.cohortFiltersApplied.length > 0
+                      ? `<div class="card" style="grid-column:1/-1;"><div class="card-label">Cohort Filters</div><div class="card-value">${escapeHtml(
+                          session.backendExecution.receipt.cohortFiltersApplied.join(', ')
+                        )}</div></div>`
+                      : ''
+                  }
+                </div>
+              </div>
+            `
+                : ''
+            }
+
+            ${
               session.chartConfig
                 ? `<div class="section"><div class="section-title">Visualization</div>${buildPlotMarkup(session.chartConfig, plotId)}</div>`
                 : ''
             }
 
-            <div class="section">
-              <div class="section-title">Summary</div>
-              <div class="grid summary">
-                <div class="card" style="background:#ffffff;">
-                  <div class="card-label">Statistical Interpretation</div>
-                  <div class="body-copy" style="margin-top:8px;">${escapeHtml(session.interpretation)}</div>
-                </div>
-                <div>
-                  <div class="section-title" style="margin-bottom:10px;">Metrics</div>
-                  <div class="grid meta">${buildMetricsMarkup(session.metrics)}</div>
+            ${
+              session.aiCommentary
+                ? `
+              <div class="section">
+                <div class="section-title">Metrics</div>
+                <div class="grid meta">${buildMetricsMarkup(session.metrics)}</div>
+              </div>
+            `
+                : `
+              <div class="section">
+                <div class="section-title">Summary</div>
+                <div class="grid summary">
+                  <div class="card" style="background:#ffffff;">
+                    <div class="card-label">Statistical Interpretation</div>
+                    <div class="body-copy" style="margin-top:8px;">${escapeHtml(session.interpretation)}</div>
+                  </div>
+                  <div>
+                    <div class="section-title" style="margin-bottom:10px;">Metrics</div>
+                    <div class="grid meta">${buildMetricsMarkup(session.metrics)}</div>
+                  </div>
                 </div>
               </div>
-            </div>
+            `
+            }
 
             ${
               session.aiCommentary
                 ? `
               <div class="section">
                 <div class="section-title">AI Clinical Commentary</div>
-                <div class="body-copy">${escapeHtml(session.aiCommentary.summary)}</div>
+                ${
+                  session.aiCommentary.sections?.status
+                    ? `<div style="margin-bottom:16px;border:1px solid #dbeafe;background:#eff6ff;color:#1e3a8a;border-radius:14px;padding:12px 14px;font-size:14px;"><strong>Status:</strong> ${escapeHtml(
+                        session.aiCommentary.sections.status
+                      )}</div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.directAnswer
+                    ? `<div style="margin-top:6px;"><div class="card-label">Direct Answer</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.directAnswer
+                      )}</div></div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.population
+                    ? `<div style="margin-top:16px;"><div class="card-label">Analysis Population</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.population
+                      )}</div></div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.endpointDefinition
+                    ? `<div style="margin-top:16px;"><div class="card-label">Endpoint Definition</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.endpointDefinition
+                      )}</div></div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.mainFindings
+                    ? `<div style="margin-top:16px;"><div class="card-label">Main Findings</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.mainFindings
+                      )}</div></div>`
+                    : `<div class="body-copy">${escapeHtml(session.aiCommentary.summary)}</div>`
+                }
+                ${
+                  session.aiCommentary.sections?.interactionFindings
+                    ? `<div style="margin-top:16px;"><div class="card-label">Arm Interaction Findings</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.interactionFindings
+                      )}</div></div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.modelStrength
+                    ? `<div style="margin-top:16px;"><div class="card-label">Model Strength</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.sections.modelStrength
+                      )}</div></div>`
+                    : ''
+                }
+                ${
+                  session.aiCommentary.sections?.nextSteps && session.aiCommentary.sections.nextSteps.length > 0
+                    ? `<div style="margin-top:16px;"><div class="card-label">What to Do Next</div><ul style="margin-top:10px;" class="muted">${session.aiCommentary.sections.nextSteps
+                        .map((item) => `<li>${escapeHtml(item)}</li>`)
+                        .join('')}</ul></div>`
+                    : ''
+                }
+                ${
+                  !session.aiCommentary.sections?.mainFindings
+                    ? ''
+                    : `<div style="margin-top:16px;"><div class="card-label">Summary</div><div class="body-copy" style="margin-top:8px;">${escapeHtml(
+                        session.aiCommentary.summary
+                      )}</div></div>`
+                }
                 ${
                   session.aiCommentary.limitations.length
                     ? `<div style="margin-top:16px;"><div class="card-label">Limitations</div><ul style="margin-top:10px;" class="muted">${session.aiCommentary.limitations
@@ -1101,7 +1721,8 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const buildRunExportHtml = (run: AutopilotRunGroup) => {
     const sessionMarkup = run.sessions
       .map((session, index) => {
-        const variables = formatVariablesForDisplay(session.params.var1, session.params.var2);
+        const variables = sessionVariableSummary(session);
+        const analysisLabel = sessionAnalysisLabel(session);
         const keyMetrics = Object.entries(session.metrics)
           .slice(0, 4)
           .map(
@@ -1137,9 +1758,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
                       )}</div>`
                     : ''
                 }
-                <div style="margin-top:6px;font-size:14px;color:#64748b;">${escapeHtml(session.params.testType)} | ${escapeHtml(
-          variables
-        )}</div>
+                <div style="margin-top:6px;font-size:14px;color:#64748b;">${escapeHtml(analysisLabel)} | ${escapeHtml(
+        variables
+      )}</div>
               </div>
               <div style="padding:8px 12px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;">
                 ${escapeHtml(getWorkflowLabel(session.usageMode))}
@@ -1540,6 +2161,11 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       return;
     }
 
+    if (experienceMode !== 'RUN_CONFIRMED' && analysisMode === 'PACK' && enabledHypotheses.length === 0) {
+      setRunError('Generate and select at least one proposed hypothesis before running the analysis pack.');
+      return;
+    }
+
     setRunError(null);
     runLogRef.current = [];
     setRunLog([]);
@@ -1755,26 +2381,64 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           );
         }
       } else {
-        updateStep('plan', 'SKIPPED', analysisMode === 'SINGLE' ? 'Single Question mode selected' : 'No Protocol/SAP selected');
+        if (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED') {
+          updateStep('plan', 'DONE', `${enabledHypotheses.length} reviewed hypothesis${enabledHypotheses.length === 1 ? '' : 'es'} selected`);
+        } else {
+          updateStep('plan', 'SKIPPED', analysisMode === 'SINGLE' ? 'Single Question mode selected' : 'No Protocol/SAP selected');
+        }
       }
 
       updateStep('analysis', 'RUNNING', 'Selecting clinically meaningful analyses');
-      let tasks: AutopilotAnalysisTask[] = [];
-      if (analysisMode === 'PACK' && extractedPlanEntries.length > 0) {
+      const rawLinkedSourceFiles =
+        analysisScope === 'LINKED_WORKSPACE'
+          ? [workingFile, ...selectedSupportingFiles]
+          : [analysisFile];
+      const recommendedLinkedExecutionFiles =
+        analysisScope === 'LINKED_WORKSPACE' &&
+        analysisMode === 'SINGLE' &&
+        shouldPreferBackendPlanning(activeAutopilotPrompt, analysisScope) &&
+        recommendedExecutionFiles.length > 0
+          ? recommendedExecutionFiles
+          : null;
+      const getPlanningSourceFilesForQuestion = (question: string) =>
+        analysisScope === 'LINKED_WORKSPACE' && shouldPreferBackendPlanning(question, analysisScope)
+          ? rawLinkedSourceFiles
+          : analysisScope === 'LINKED_WORKSPACE'
+            ? [transformedFile, ...selectedSupportingFiles]
+            : [analysisFile];
+      let tasks: PlannedAutopilotTask[] = [];
+      if (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED') {
+        for (const hypothesis of enabledHypotheses) {
+          try {
+            const plannedTask = await buildQuestionTask(
+              analysisFile,
+              hypothesis.question,
+              customSynonymList,
+              getPlanningSourceFilesForQuestion(hypothesis.question),
+              analysisScope
+            );
+            tasks.push({
+              ...plannedTask,
+              id: hypothesis.id,
+              rationale: hypothesis.rationale || plannedTask.rationale,
+            });
+          } catch (e: any) {
+            const message = e?.message || 'Unknown planning error';
+            appendLog(`Skipped hypothesis planning: ${message}`);
+            rejectedAnalyses.push(message);
+          }
+        }
+      } else if (analysisMode === 'PACK' && extractedPlanEntries.length > 0) {
         tasks = planEntriesToTasks(extractedPlanEntries);
       } else if (analysisMode === 'SINGLE') {
-        const planned = planAnalysisFromQuestion(analysisFile, analysisQuestion, customSynonymList);
         tasks = [
-          {
-            id: crypto.randomUUID(),
-            label: `${planned.testType}: ${planned.var1} vs ${planned.var2}`,
-            question: analysisQuestion.trim(),
-            testType: planned.testType,
-            var1: planned.var1,
-            var2: planned.var2,
-            concept: planned.concept,
-            rationale: planned.explanation,
-          },
+          await buildQuestionTask(
+            analysisFile,
+            analysisQuestion,
+            customSynonymList,
+            getPlanningSourceFilesForQuestion(analysisQuestion),
+            analysisScope
+          ),
         ];
       } else if (analysisScope === 'LINKED_WORKSPACE') {
         tasks = buildExploratorySignalTasks(analysisFile);
@@ -1799,6 +2463,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
         analysisScope === 'LINKED_WORKSPACE' ? linkedWorkspaceInfo?.sourceNames.length || 1 : 1
       );
       const createdSessions: AnalysisSession[] = [];
+      const rejectedAnalyses: string[] = [];
       const contextDocs = selectedProtocol ? [selectedProtocol] : [];
 
       for (let index = 0; index < tasks.length; index += 1) {
@@ -1830,6 +2495,25 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             );
           }
 
+          const executionSourceFiles =
+            analysisScope === 'LINKED_WORKSPACE' && task.backendPlannedFamily
+              ? recommendedLinkedExecutionFiles || rawLinkedSourceFiles
+              : analysisScope === 'LINKED_WORKSPACE'
+                ? [transformedFile, ...selectedSupportingFiles]
+                : [analysisFile];
+          if (analysisScope === 'LINKED_WORKSPACE' && task.backendPlannedFamily) {
+            appendLog(
+              'Using cleaned source datasets directly for backend execution because this question needs row-level analysis rather than the linked workspace summary.'
+            );
+            if (recommendedLinkedExecutionFiles && recommendedLinkedExecutionFiles.length > 0) {
+              appendLog(
+                `Using the recommended dataset subset for this question: ${recommendedLinkedExecutionFiles
+                  .map((file) => file.name)
+                  .join(', ')}.`
+              );
+            }
+          }
+
           const result = await executeStatisticalCode(
             generatedCode,
             analysisFile,
@@ -1839,15 +2523,24 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             task.concept || null,
             {
               question: task.question,
-              sourceFiles:
-                analysisScope === 'LINKED_WORKSPACE'
-                  ? [transformedFile, ...selectedSupportingFiles]
-                  : [analysisFile],
+              sourceFiles: executionSourceFiles,
               covariates: task.covariates || [],
               imputationMethod: task.imputationMethod,
               applyPSM: Boolean(task.applyPSM),
+              backendSpec: task.backendSpec || null,
             }
           );
+          if (task.backendPlannedFamily) {
+            const executedFamily = result.backendExecution?.analysisFamily || null;
+            if (!backendFamiliesAreCompatible(task.backendPlannedFamily, executedFamily)) {
+              const plannedFamilyLabel = humanizeBackendFamily(task.backendPlannedFamily) || task.backendPlannedFamily;
+              const executedFamilyLabel = humanizeBackendFamily(executedFamily) || executedFamily || 'local fallback';
+              const mismatchMessage = `Planned ${plannedFamilyLabel}, but the executed result was ${executedFamilyLabel}. Autopilot will not save a mismatched run.`;
+              appendLog(`Rejected analysis ${index + 1}: ${mismatchMessage}`);
+              rejectedAnalyses.push(mismatchMessage);
+              continue;
+            }
+          }
           const questionMatch = assessAutopilotQuestionMatch(task.question, result, {
             analysisScope,
             analysisMode,
@@ -1855,10 +2548,31 @@ export const Autopilot: React.FC<AutopilotProps> = ({
             var1: task.var1,
             var2: task.var2,
           });
-          if (questionMatch.status === 'FAILED') {
+          const allowPartialExploratoryAnswer = experienceMode !== 'RUN_CONFIRMED' && questionMatch.status === 'FAILED';
+          const effectiveQuestionMatch =
+            allowPartialExploratoryAnswer && questionMatch.status === 'FAILED'
+              ? {
+                  status: 'PARTIAL' as const,
+                  summary:
+                    analysisMode === 'SINGLE'
+                      ? `Partial exploratory answer only. ${questionMatch.details[0] || 'This run only partially answered the requested question.'}`
+                      : 'Partial exploratory answer only. This saved result is informative but does not fully answer the requested question.',
+                  details: questionMatch.details,
+                }
+              : questionMatch;
+          if (questionMatch.status === 'FAILED' && !allowPartialExploratoryAnswer) {
             appendLog(`Rejected analysis ${index + 1}: ${questionMatch.summary}`);
             questionMatch.details.forEach((detail) => appendLog(`  - ${detail}`));
+            rejectedAnalyses.push(
+              questionMatch.details.length > 0
+                ? `${questionMatch.summary} ${questionMatch.details[0]}`
+                : questionMatch.summary
+            );
             continue;
+          }
+          if (effectiveQuestionMatch.status === 'PARTIAL') {
+            appendLog(`Saved analysis ${index + 1} as a partial exploratory answer.`);
+            effectiveQuestionMatch.details.forEach((detail) => appendLog(`  - ${detail}`));
           }
           const enrichedResult: StatAnalysisResult = { ...result, sasCode: sasCode || undefined };
 
@@ -1897,9 +2611,12 @@ export const Autopilot: React.FC<AutopilotProps> = ({
               autopilotDataScope: analysisScope,
               autopilotWorkspaceFileId: analysisScope === 'LINKED_WORKSPACE' ? analysisFile.id : null,
               autopilotWorkspaceFileName: analysisScope === 'LINKED_WORKSPACE' ? analysisFile.name : null,
-              autopilotQuestionMatchStatus: questionMatch.status,
-              autopilotQuestionMatchSummary: questionMatch.summary,
-              autopilotQuestionMatchDetails: questionMatch.details,
+              backendAnalysisFamily: result.backendExecution?.analysisFamily || null,
+              backendWorkspaceId: result.backendExecution?.workspaceId || null,
+              backendSourceNames: result.backendExecution?.sourceNames || null,
+              autopilotQuestionMatchStatus: effectiveQuestionMatch.status,
+              autopilotQuestionMatchSummary: effectiveQuestionMatch.summary,
+              autopilotQuestionMatchDetails: effectiveQuestionMatch.details,
             },
             ...enrichedResult,
           });
@@ -1912,7 +2629,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
         updateStep('analysis', 'FAILED', 'All planned analyses failed');
         throw new Error(
           analysisMode === 'SINGLE'
-            ? 'Autopilot could not execute an analysis that actually matched the requested question. Refine the question or use datasets that support the requested endpoint and estimands.'
+            ? rejectedAnalyses.length > 0
+              ? `Autopilot could not produce a valid answer for this question. ${rejectedAnalyses[0]}`
+              : 'Autopilot could not execute an analysis that actually matched the requested question. Refine the question or use datasets that support the requested endpoint and estimands.'
             : 'Autopilot could not complete any planned analysis successfully.'
         );
       }
@@ -2066,6 +2785,7 @@ export const Autopilot: React.FC<AutopilotProps> = ({
       const message = e?.message || 'Autopilot failed.';
       appendLog(`ERROR: ${message}`);
       setRunError(message);
+      setShowWorkflowPanels(true);
     } finally {
       setIsRunning(false);
     }
@@ -2077,830 +2797,172 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const showControlPanels =
     !reviewMode || isCreatingNewAnalysis || isRunning || Boolean(runError) || showWorkflowPanels;
 
-  const runBrowserSection =
-    autopilotRuns.length > 0 ? (
-      <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-4">
-          <div>
-            <h3 className="font-bold text-slate-800 flex items-center">
-              <FolderOpen className="w-4 h-4 mr-2 text-indigo-600" />
-              Saved Runs
-            </h3>
-            <p className="text-sm text-slate-500 mt-1">Switch between previous runs without scrolling away from the current result.</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-              {autopilotRuns.length} run{autopilotRuns.length === 1 ? '' : 's'}
-            </span>
-            <button
-              onClick={() => setShowWorkflowPanels((prev) => !prev)}
-              className="inline-flex items-center justify-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-            >
-              <FileText className="w-4 h-4 mr-2" />
-              {showWorkflowPanels ? 'Hide Workflow & Log' : 'Show Workflow & Log'}
-            </button>
-            <button
-              onClick={isCreatingNewAnalysis ? closeNewAnalysis : startNewAnalysis}
-              disabled={isRunning && isCreatingNewAnalysis}
-              className={`inline-flex items-center justify-center rounded-xl px-4 py-2 text-sm font-semibold ${
-                isCreatingNewAnalysis
-                  ? 'border border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
-                  : 'bg-indigo-600 text-white hover:bg-indigo-700'
-              } ${isRunning && isCreatingNewAnalysis ? 'cursor-not-allowed opacity-60' : ''}`}
-            >
-              {isCreatingNewAnalysis ? (
-                <>
-                  <X className="w-4 h-4 mr-2" />
-                  Close New Analysis
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4 mr-2" />
-                  New Analysis
-                </>
-              )}
-            </button>
-          </div>
-        </div>
-        <div className="flex gap-3 overflow-x-auto pb-1">
-          {autopilotRuns.map((run) => (
-            <button
-              key={run.runId}
-              onClick={() => {
-                setSelectedRunId(run.runId);
-                setSelectedResultId('');
-                setIsCreatingNewAnalysis(false);
-              }}
-              className={`shrink-0 w-[320px] text-left rounded-2xl border p-4 transition-colors ${
-                selectedRun?.runId === run.runId
-                  ? 'border-indigo-300 bg-indigo-50'
-                  : 'border-slate-200 bg-white hover:bg-slate-50'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold text-slate-800 line-clamp-2">{run.runName}</div>
-                <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
-                  {run.analysisCount} analysis{run.analysisCount === 1 ? '' : 'es'}
-                </span>
-              </div>
-              <div className="text-xs text-slate-500 mt-2">{run.modeLabel} | {run.scopeLabel}</div>
-              <div className="text-xs text-slate-600 mt-2 line-clamp-2">{run.questionPreview}</div>
-              <div className="text-[11px] text-slate-400 mt-3">Updated {formatTimestamp(run.latestTimestamp)}</div>
-            </button>
-          ))}
-        </div>
-      </div>
-    ) : null;
+  const runBrowserSection = (
+      <AutopilotRunBrowser
+        runs={autopilotRuns}
+        selectedRunId={selectedRun?.runId ?? null}
+        showWorkflowPanels={showWorkflowPanels}
+        isCreatingNewAnalysis={isCreatingNewAnalysis}
+      isRunning={isRunning}
+      formatTimestamp={formatTimestamp}
+      onSelectRun={(runId) => {
+        setSelectedRunId(runId);
+        setSelectedResultId('');
+        setIsCreatingNewAnalysis(false);
+      }}
+        onToggleWorkflowPanels={() => setShowWorkflowPanels((prev) => !prev)}
+        onStartNewAnalysis={startNewAnalysis}
+        onCloseNewAnalysis={closeNewAnalysis}
+        onDeleteRun={handleDeleteRun}
+      />
+  );
 
   const controlPanels = (
     <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)] gap-6 items-start">
-      <div className="space-y-6">
-        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-          <div>
-            <h3 className="font-bold text-slate-800">Configuration</h3>
-            <p className="text-sm text-slate-500 mt-1">Autopilot saves each completed analysis as a normal Statistical Analysis session.</p>
-          </div>
+      <AutopilotControlPanel
+        experienceMode={experienceMode}
+        analysisScope={analysisScope}
+        analysisMode={analysisMode}
+        runMode={runMode}
+        selectedProtocol={selectedProtocol}
+        confirmedBlockingReason={confirmedBlockingReason}
+        analysisQuestion={analysisQuestion}
+        defaultQuestion={buildDefaultQuestion()}
+        packFocusQuestion={packFocusQuestion}
+        proposedHypotheses={proposedHypotheses}
+        enabledHypothesesCount={enabledHypotheses.length}
+        hypothesisGenerationBlockingReason={hypothesisGenerationBlockingReason}
+        hypothesisGenerationError={hypothesisGenerationError}
+        autopilotRecommendation={autopilotRecommendation}
+        activeAutopilotPrompt={activeAutopilotPrompt}
+        recommendedSupportingFiles={recommendedSupportingFiles}
+        planningAssist={planningAssist}
+        planningAssistError={planningAssistError}
+        isPlanningAssistLoading={isPlanningAssistLoading}
+        sourceFiles={sourceFiles}
+        selectedSourceId={selectedSourceId}
+        recommendedSourceFile={recommendedSourceFile}
+        supportingSourceFiles={supportingSourceFiles}
+        selectedSupportingIds={selectedSupportingIds}
+        referenceFiles={referenceFiles}
+        selectedReferenceId={selectedReferenceId}
+        protocolFiles={protocolFiles}
+        selectedProtocolId={selectedProtocolId}
+        selectedTargetDomainOption={selectedTargetDomainOption}
+        targetDomain={targetDomain}
+        suggestedTargetDomain={suggestedTargetDomain}
+        customSynonyms={customSynonyms}
+        generateSasDraft={generateSasDraft}
+        isRunning={isRunning}
+        runDisabled={
+          isRunning ||
+          !selectedSource ||
+          (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
+          (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED' && enabledHypotheses.length === 0) ||
+          Boolean(confirmedBlockingReason)
+        }
+        targetDomainOptions={TARGET_DOMAIN_OPTIONS}
+        customTargetDomainValue={CUSTOM_TARGET_DOMAIN_VALUE}
+        roleLabels={AUTOPILOT_ROLE_LABELS}
+        recommendationConfidenceClass={recommendationConfidenceClass}
+        recommendationSupportStatusClass={recommendationSupportStatusClass}
+        recommendationSupportCheckClass={recommendationSupportCheckClass}
+        formatVariablesForDisplay={formatVariablesForDisplay}
+        onSetExperienceMode={setExperienceMode}
+        onSetAnalysisScope={setAnalysisScope}
+        onSetAnalysisMode={setAnalysisMode}
+        onSetAnalysisQuestion={setAnalysisQuestion}
+        onSetPackFocusQuestion={setPackFocusQuestion}
+        onGeneratePackHypotheses={generatePackHypotheses}
+        onToggleHypothesisEnabled={toggleHypothesisEnabled}
+        onUpdateHypothesisQuestion={updateHypothesisQuestion}
+        onApplyRecommendedAutopilotFiles={applyRecommendedAutopilotFiles}
+        onGeneratePlanningAssist={handleGeneratePlanningAssist}
+        onSetSelectedSourceId={setSelectedSourceId}
+        onSelectAllSupportingFiles={selectAllSupportingFiles}
+        onClearSupportingFiles={clearSupportingFiles}
+        onToggleSupportingFile={toggleSupportingFile}
+        onSetSelectedReferenceId={setSelectedReferenceId}
+        onSetSelectedProtocolId={setSelectedProtocolId}
+        onSetTargetDomain={setTargetDomain}
+        onSetCustomSynonyms={setCustomSynonyms}
+        onSetGenerateSasDraft={setGenerateSasDraft}
+        onRunAutopilot={runAutopilot}
+      />
 
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Path</div>
-            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-              <button
-                onClick={() => setExperienceMode('EXPLORE_FAST')}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  experienceMode === 'EXPLORE_FAST' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                Explore Fast
-              </button>
-              <button
-                onClick={() => setExperienceMode('RUN_CONFIRMED')}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  experienceMode === 'RUN_CONFIRMED' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                Run Confirmed
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Analysis Scope</div>
-            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-              <button
-                onClick={() => setAnalysisScope('SINGLE_DATASET')}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  analysisScope === 'SINGLE_DATASET' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                Single Dataset
-              </button>
-              <button
-                onClick={() => setAnalysisScope('LINKED_WORKSPACE')}
-                disabled={experienceMode === 'RUN_CONFIRMED'}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  analysisScope === 'LINKED_WORKSPACE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
-              >
-                Linked Workspace
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">Execution Mode</div>
-            <div className="inline-flex w-full rounded-xl border border-slate-200 bg-slate-100 p-1">
-              <button
-                onClick={() => setAnalysisMode('PACK')}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  analysisMode === 'PACK' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                Analysis Pack
-              </button>
-              <button
-                onClick={() => setAnalysisMode('SINGLE')}
-                disabled={experienceMode === 'RUN_CONFIRMED'}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
-                  analysisMode === 'SINGLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
-                } ${experienceMode === 'RUN_CONFIRMED' ? 'cursor-not-allowed opacity-50' : ''}`}
-              >
-                One Question
-              </button>
-            </div>
-          </div>
-
-          {experienceMode === 'RUN_CONFIRMED' ? (
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
-              <div className="mb-1 flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-emerald-700">
-                <span>Run Confirmed Checklist</span>
-                <InfoTooltip content="Run Confirmed is for controlled, reviewable analysis based on a protocol or pre-specified plan." />
-              </div>
-              <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
-              <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
-              <ul className="mt-3 space-y-2 text-sm text-slate-700">
-                <li className="flex items-start gap-2">
-                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${selectedProtocol ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                  <span>{selectedProtocol ? `Protocol selected: ${selectedProtocol.name}` : 'Select a Protocol or SAP document.'}</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisMode === 'PACK' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                  <span>Run Confirmed uses Analysis Pack only.</span>
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${analysisScope === 'SINGLE_DATASET' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                  <span>Run Confirmed currently supports single-dataset protocol-driven runs.</span>
-                </li>
-              </ul>
-              {confirmedBlockingReason && (
-                <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                  {confirmedBlockingReason}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
-              <div className="mb-1 flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-indigo-600">
-                <span>Explore Fast</span>
-                <InfoTooltip content="Best for quick exploratory analysis and idea generation. Results may need follow-up validation." />
-              </div>
-              <div className="text-sm font-semibold text-slate-800">{runMode.label}</div>
-              <div className="text-sm text-slate-600 mt-1">{runMode.helper}</div>
-            </div>
-          )}
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Source Dataset</label>
-            <select
-              value={selectedSourceId}
-              onChange={(e) => setSelectedSourceId(e.target.value)}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-            >
-              <option value="">-- Select dataset --</option>
-              {sourceFiles.map((file) => (
-                <option key={file.id} value={file.id}>
-                  {file.name} ({file.type})
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {analysisScope === 'LINKED_WORKSPACE' && (
-            <div>
-              <div className="flex items-center justify-between gap-3 mb-2">
-                <div className="flex items-center gap-1">
-                  <label className="block text-xs font-semibold text-slate-500 uppercase">Supporting Datasets</label>
-                  <InfoTooltip content="Optional additional datasets used to build one joined analysis table across subject-level domains." />
-                </div>
-                <div className="text-[11px] text-slate-400">
-                  {selectedSupportingIds.length}/{supportingSourceFiles.length} selected
-                </div>
-              </div>
-              {supportingSourceFiles.length > 0 && (
-                <div className="mb-2 flex flex-wrap gap-2">
-                  <button
-                    onClick={selectAllSupportingFiles}
-                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700"
-                  >
-                    Select All
-                  </button>
-                  <button
-                    onClick={clearSupportingFiles}
-                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-100"
-                  >
-                    Clear
-                  </button>
-                </div>
-              )}
-              <div className="rounded-xl border border-slate-200 bg-slate-50 max-h-52 overflow-y-auto divide-y divide-slate-200">
-                {supportingSourceFiles.length === 0 ? (
-                  <div className="p-3 text-sm text-slate-500">Choose a source dataset first to unlock supporting datasets.</div>
-                ) : (
-                  supportingSourceFiles.map((file) => (
-                    <label key={file.id} className="flex items-start gap-3 p-3 cursor-pointer hover:bg-white">
-                      <input
-                        type="checkbox"
-                        checked={selectedSupportingIds.includes(file.id)}
-                        onChange={() => toggleSupportingFile(file.id)}
-                        className="mt-1 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                      />
-                      <div className="min-w-0">
-                        <div className="text-sm font-medium text-slate-800 break-words">{file.name}</div>
-                        <div className="text-xs text-slate-500">{file.type}</div>
-                      </div>
-                    </label>
-                  ))
-                )}
-              </div>
-              <div className="mt-2 text-xs text-slate-500">
-                Linked workspace mode creates a subject-level analysis table using shared subject identifiers such as `USUBJID`.
-              </div>
-            </div>
-          )}
-
-          <div>
-            <div className="mb-2 flex items-center gap-1">
-              <label className="block text-xs font-semibold text-slate-500 uppercase">Reference Mapping (Optional)</label>
-              <InfoTooltip content="An optional mapping file that helps standardize source columns into a known clinical structure." />
-            </div>
-            <select
-              value={selectedReferenceId}
-              onChange={(e) => setSelectedReferenceId(e.target.value)}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-            >
-              <option value="">-- None --</option>
-              {referenceFiles.map((file) => (
-                <option key={file.id} value={file.id}>
-                  {file.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center gap-1">
-              <label className="block text-xs font-semibold text-slate-500 uppercase">
-                Protocol/SAP {experienceMode === 'RUN_CONFIRMED' ? '(Required)' : '(Optional)'}
-              </label>
-              <InfoTooltip content="An optional protocol or statistical analysis plan document used to guide or constrain the analysis." />
-            </div>
-            <select
-              value={selectedProtocolId}
-              onChange={(e) => setSelectedProtocolId(e.target.value)}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-            >
-              <option value="">-- None --</option>
-              {protocolFiles.map((file) => (
-                <option key={file.id} value={file.id}>
-                  {file.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <div className="mb-2 flex items-center gap-1">
-              <label className="block text-xs font-semibold text-slate-500 uppercase">
-                Primary Clinical Domain
-              </label>
-              <InfoTooltip content="The main clinical data area this run should focus on, such as demographics, adverse events, labs, exposure, or disposition." />
-            </div>
-            <select
-              value={selectedTargetDomainOption}
-              onChange={(e) => {
-                const nextValue = e.target.value;
-                if (nextValue === CUSTOM_TARGET_DOMAIN_VALUE) {
-                  setTargetDomain('');
-                  return;
-                }
-                setTargetDomain(nextValue);
-              }}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-            >
-              {TARGET_DOMAIN_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-              <option value={CUSTOM_TARGET_DOMAIN_VALUE}>Other / Custom...</option>
-            </select>
-            {selectedTargetDomainOption === CUSTOM_TARGET_DOMAIN_VALUE ? (
-              <input
-                type="text"
-                value={targetDomain}
-                onChange={(e) => setTargetDomain(e.target.value.toUpperCase())}
-                className="mt-2 w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm font-mono"
-                placeholder="Enter domain code, e.g. CM, MH, VS"
-              />
-            ) : null}
-            <p className="mt-2 text-xs font-medium text-slate-600">
-              Suggested from selected source file: {suggestedTargetDomain}
-            </p>
-            <p className="mt-2 text-xs leading-5 text-slate-500">
-              Choose the main clinical data area this run should focus on. Use
-              <span className="font-medium"> Other / Custom...</span> if your study uses a different domain such as
-              <span className="font-medium"> CM</span>, <span className="font-medium">MH</span>, or
-              <span className="font-medium"> VS</span>.
-            </p>
-          </div>
-
-          {analysisMode === 'SINGLE' ? (
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Analysis Question</label>
-              <textarea
-                value={analysisQuestion}
-                onChange={(e) => setAnalysisQuestion(e.target.value)}
-                rows={4}
-                className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-                placeholder={`Example: ${buildDefaultQuestion()}`}
-              />
-            </div>
-          ) : (
-            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-              Leave Autopilot in pack mode when you want several analyses created and saved together, similar to a mini workbench.
-            </div>
-          )}
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Synonyms (Optional)</label>
-            <input
-              value={customSynonyms}
-              onChange={(e) => setCustomSynonyms(e.target.value)}
-              className="w-full p-2.5 rounded-lg border border-slate-300 bg-slate-50 text-sm"
-              placeholder="rash, dermatitis, erythema"
-            />
-          </div>
-
-          <label className="flex items-center space-x-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={generateSasDraft}
-              onChange={(e) => setGenerateSasDraft(e.target.checked)}
-              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-            />
-            <span className="text-sm text-slate-600">Generate SAS validation draft</span>
-          </label>
-
-          <button
-            onClick={runAutopilot}
-            disabled={
-              isRunning ||
-              !selectedSource ||
-              (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
-              Boolean(confirmedBlockingReason)
-            }
-            className={`w-full py-3 rounded-xl font-bold text-white flex items-center justify-center ${
-              isRunning ||
-              !selectedSource ||
-              (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
-              Boolean(confirmedBlockingReason)
-                ? 'bg-slate-300 cursor-not-allowed'
-                : 'bg-indigo-600 hover:bg-indigo-700'
-            }`}
-          >
-            {isRunning ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
-            {isRunning ? 'Running Autopilot...' : runMode.button}
-          </button>
-        </div>
-
-      </div>
-
-      <div className="space-y-6 min-w-0">
-        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-bold text-slate-800 flex items-center">
-              <Sparkles className="w-4 h-4 mr-2 text-indigo-600" />
-              Workflow Status
-            </h3>
-            {reviewMode && (
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-                Secondary panel in review mode
-              </span>
-            )}
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {STEP_ORDER.map((step) => (
-              <div
-                key={step.key}
-                className={`border rounded-xl px-3 py-2 text-sm ${stepStatusClass[displayedStepState[step.key].status]}`}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold">{step.label}</span>
-                  <StepIcon status={displayedStepState[step.key].status} />
-                </div>
-                <div className="text-xs mt-1 opacity-90">{displayedStepState[step.key].detail}</div>
-              </div>
-            ))}
-          </div>
-          {runError && (
-            <div className="mt-4 border border-red-200 bg-red-50 text-red-700 rounded-xl p-3 text-sm">
-              {runError}
-            </div>
-          )}
-        </div>
-
-        <div className="bg-[#111827] border border-slate-700 rounded-2xl overflow-hidden shadow-sm">
-          <div className="px-4 py-3 border-b border-slate-700 text-slate-200 text-sm font-semibold flex items-center justify-between">
-            <div className="flex items-center">
-              <FileText className="w-4 h-4 mr-2" />
-              Autopilot Log
-            </div>
-            {reviewMode && <span className="text-[11px] uppercase tracking-wide text-slate-400">Reference</span>}
-          </div>
-          <div className={`p-4 ${logHeightClass} overflow-y-auto font-mono text-xs text-slate-300 space-y-1`}>
-            {displayedRunLog.length === 0 && <div className="text-slate-500">No execution logs yet.</div>}
-            {displayedRunLog.map((line, idx) => (
-              <div key={idx}>{line}</div>
-            ))}
-          </div>
-        </div>
-      </div>
+      <AutopilotWorkflowPanel
+        steps={STEP_ORDER.map((step) => ({
+          key: step.key,
+          label: step.label,
+          status: displayedStepState[step.key].status,
+          detail: displayedStepState[step.key].detail,
+        }))}
+        reviewMode={reviewMode}
+        runError={runError}
+        failureLogPreview={failureLogPreview}
+        displayedRunLog={displayedRunLog}
+        logHeightClass={logHeightClass}
+      />
     </div>
   );
 
   const workspaceSection = (
-    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm min-w-0">
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
-        <div>
-          <h3 className="font-bold text-slate-800 flex items-center">
-            <BarChart3 className="w-4 h-4 mr-2 text-indigo-600" />
-            Autopilot Workspace
-          </h3>
-          <p className="text-sm text-slate-500 mt-1">
-            Browse saved runs first, then compare the analyses inside the selected run.
-          </p>
-        </div>
-        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-          {sessions.filter((session) => session.params.autopilotRunId).length} saved autopilot session{sessions.filter((session) => session.params.autopilotRunId).length === 1 ? '' : 's'}
-        </div>
-      </div>
-
-      {selectedRun && selectedResult ? (
-        <div className="space-y-5 min-w-0">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 md:col-span-2">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold mb-2">Run Name</div>
-              {isEditingRunName ? (
-                <div className="space-y-2">
-                  <div className="flex flex-col sm:flex-row gap-2">
-                    <input
-                      value={runNameDraft}
-                      onChange={(e) => setRunNameDraft(e.target.value)}
-                      className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
-                      placeholder="Enter run name"
-                    />
-                    <button
-                      onClick={handleSaveRunName}
-                      className="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
-                    >
-                      <Save className="w-4 h-4 mr-2" />
-                      Save
-                    </button>
-                    <button
-                      onClick={() => {
-                        setRunNameDraft(selectedRun.runName);
-                        setIsEditingRunName(false);
-                        setRenameError(null);
-                      }}
-                      className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                    >
-                      <X className="w-4 h-4 mr-2" />
-                      Cancel
-                    </button>
-                  </div>
-                  {renameError && <div className="text-sm text-red-600">{renameError}</div>}
-                </div>
-              ) : (
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-lg font-semibold text-slate-800 break-words">{selectedRun.runName}</div>
-                  <button
-                    onClick={() => setIsEditingRunName(true)}
-                    className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 shrink-0"
-                  >
-                    <PencilLine className="w-4 h-4 mr-2" />
-                    Rename
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Type</div>
-              <div className="text-sm font-semibold text-slate-800 mt-1">{selectedRun.modeLabel}</div>
-              <div className="text-sm text-slate-500 mt-1">{selectedRun.scopeLabel}</div>
-              <div className="text-sm text-slate-500 mt-2">Updated {formatTimestamp(selectedRun.latestTimestamp)}</div>
-              <div className="mt-3">
-                <span
-                  className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
-                    selectedRun.workflowMode
-                  )}`}
-                >
-                  {getWorkflowLabel(selectedRun.workflowMode)}
-                </span>
-              </div>
-            </div>
+    <AutopilotWorkspaceSection
+      sessionCount={sessions.filter((session) => session.params.autopilotRunId).length}
+      selectedRun={selectedRun ?? null}
+      selectedRunResults={selectedRunResults}
+      selectedResult={selectedResult ?? null}
+      selectedResultId={selectedResultId}
+      isEditingRunName={isEditingRunName}
+      runNameDraft={runNameDraft}
+      renameError={renameError}
+      isRunning={isRunning}
+      runError={runError}
+      resultDetailView={resultDetailView}
+      activeResultTable={activeResultTable}
+      activeReview={activeReview}
+      detailContent={
+        selectedResult && resultDetailView === 'CHART' ? (
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 min-w-0">
+            <Chart
+              data={selectedResult.chartConfig.data}
+              layout={selectedResult.chartConfig.layout}
+              className="h-[36rem] min-h-[36rem] 2xl:h-[40rem] 2xl:min-h-[40rem]"
+            />
           </div>
-
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <div className="text-sm font-semibold text-slate-800">Analyses in This Run</div>
-                <div className="text-sm text-slate-500">Select one result to review in detail below.</div>
-              </div>
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                {selectedRun.analysisCount} saved result{selectedRun.analysisCount === 1 ? '' : 's'}
-              </div>
-            </div>
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-              {selectedRunResults.map((session, index) => (
-                <button
-                  key={session.id}
-                  onClick={() => {
-                    setSelectedResultId(session.id);
-                    setResultDetailView('CHART');
-                  }}
-                  className={`w-full text-left p-4 rounded-xl border transition-colors ${
-                    selectedResult.id === session.id
-                      ? 'border-indigo-300 bg-indigo-50'
-                      : 'border-slate-200 bg-white hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="text-[11px] uppercase tracking-wide font-semibold text-slate-500 mb-1">
-                        Analysis {index + 1}
-                      </div>
-                      <div className="text-sm font-semibold text-slate-800 leading-6">
-                        {session.params.autopilotQuestion || formatVariablesForDisplay(session.params.var1, session.params.var2) || session.name}
-                      </div>
-                    </div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 shrink-0">
-                      {session.params.testType}
-                    </div>
-                  </div>
-                  <div className="text-xs text-slate-500 mt-2">
-                    {formatVariablesForDisplay(session.params.var1, session.params.var2)}
-                  </div>
-                  {session.params.autopilotQuestionMatchSummary && (
-                    <div
-                      className={`mt-3 inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${getQuestionMatchBadgeClass(
-                        session.params.autopilotQuestionMatchStatus
-                      )}`}
-                    >
-                      {session.params.autopilotQuestionMatchSummary}
-                    </div>
-                  )}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="border border-slate-200 rounded-2xl p-5 min-w-0 bg-white">
-            <div className="flex flex-col 2xl:flex-row 2xl:items-start 2xl:justify-between gap-4 mb-4">
-              <div className="min-w-0">
-                <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Selected Result</div>
-                <div className="text-2xl font-bold text-slate-800 break-words">
-                  {`Autopilot - ${selectedResult.params.testType}: ${formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}`}
-                </div>
-                <div className="text-sm text-slate-500 mt-1">
-                  {selectedResult.params.testType} | {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
-                </div>
-                <div className="mt-3">
-                  <span
-                    className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getWorkflowBadgeClass(
-                      selectedResult.usageMode
-                    )}`}
-                  >
-                    {getWorkflowLabel(selectedResult.usageMode)}
-                  </span>
-                </div>
-                {selectedResult.params.autopilotQuestion && (
-                  <div className="mt-3 rounded-xl bg-indigo-50 border border-indigo-100 p-3 text-sm text-indigo-950 max-w-3xl">
-                    {selectedResult.params.autopilotQuestion}
-                  </div>
-                )}
-                {selectedResult.params.autopilotQuestionMatchSummary && (
-                  <div
-                    className={`mt-3 rounded-xl border p-3 text-sm max-w-3xl ${getQuestionMatchBadgeClass(
-                      selectedResult.params.autopilotQuestionMatchStatus
-                    )}`}
-                  >
-                    <div className="font-semibold">{selectedResult.params.autopilotQuestionMatchSummary}</div>
-                    {selectedResult.params.autopilotQuestionMatchDetails &&
-                      selectedResult.params.autopilotQuestionMatchDetails.length > 0 && (
-                        <ul className="mt-2 list-disc pl-5 space-y-1">
-                          {selectedResult.params.autopilotQuestionMatchDetails.map((detail, index) => (
-                            <li key={`${selectedResult.id}-match-${index}`}>{detail}</li>
-                          ))}
-                        </ul>
-                      )}
-                  </div>
-                )}
-              </div>
-              <div className="flex flex-col sm:flex-row gap-2 shrink-0">
-                <div className="inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1">
-                  <button
-                    onClick={() => setResultDetailView('CHART')}
-                    className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
-                      resultDetailView === 'CHART' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
-                    }`}
-                  >
-                    <BarChart3 className="w-4 h-4 mr-2" />
-                    Chart
-                  </button>
-                  <button
-                    onClick={() => setResultDetailView('TABLE')}
-                    disabled={!activeResultTable}
-                    className={`inline-flex items-center rounded-lg px-3 py-2 text-sm font-semibold ${
-                      resultDetailView === 'TABLE' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
-                    } ${!activeResultTable ? 'cursor-not-allowed opacity-50' : ''}`}
-                  >
-                    <Table2 className="w-4 h-4 mr-2" />
-                    Table
-                  </button>
-                </div>
-                <button
-                  onClick={handleExportSelectedResult}
-                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                >
-                  <Download className="w-4 h-4 mr-2" />
-                  Export Result
-                </button>
-                <button
-                  onClick={handleExportRun}
-                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                >
-                  <FileText className="w-4 h-4 mr-2" />
-                  Export Run
-                </button>
-                <button
-                  onClick={() => onOpenStatistics(selectedResult.id)}
-                  className="inline-flex items-center justify-center px-4 py-2 rounded-xl border border-slate-200 bg-white text-sm font-semibold text-slate-700 hover:bg-slate-50"
-                >
-                  <ExternalLink className="w-4 h-4 mr-2" />
-                  Promote to Statistical Workbench
-                </button>
-              </div>
-            </div>
-
-            <div className="min-w-0">
-              {resultDetailView === 'CHART' ? (
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 min-w-0">
-                  <Chart
-                    data={selectedResult.chartConfig.data}
-                    layout={selectedResult.chartConfig.layout}
-                    className="h-[36rem] min-h-[36rem] 2xl:h-[40rem] 2xl:min-h-[40rem]"
-                  />
-                </div>
-              ) : (
-                renderResultTable(activeResultTable)
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 2xl:grid-cols-2 gap-4 mt-4 min-w-0 items-start">
-              <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Statistical Interpretation</div>
-                <div className="text-base leading-7 text-slate-800">{selectedResult.interpretation}</div>
-              </div>
-
-              {selectedResult.aiCommentary ? (
-                <div className="rounded-2xl border border-indigo-100 p-4 bg-indigo-50/60">
-                  <div className="flex items-center justify-between gap-3 mb-2">
-                    <div className="text-xs uppercase tracking-wide text-indigo-700 font-semibold">AI Clinical Commentary</div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600">
-                      {selectedResult.aiCommentary.source === 'AI' ? 'AI generated' : 'Fallback summary'}
-                    </div>
-                  </div>
-                  <div className="text-base leading-7 text-slate-800">{selectedResult.aiCommentary.summary}</div>
-                  {selectedResult.aiCommentary.limitations.length > 0 && (
-                    <div className="mt-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Limitations</div>
-                      <ul className="space-y-2 text-sm text-slate-700 list-disc pl-5">
-                        {selectedResult.aiCommentary.limitations.map((item, index) => (
-                          <li key={index}>{item}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                  {selectedResult.aiCommentary.caution && (
-                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                      {selectedResult.aiCommentary.caution}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="rounded-2xl border border-dashed border-slate-200 p-4 bg-slate-50 text-sm text-slate-500">
-                  No AI clinical commentary is available for this result.
-                </div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px] gap-4 mt-4 min-w-0 items-start">
-              <div className="space-y-4 min-w-0">
-                <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                  <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Metrics</div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {Object.entries(selectedResult.metrics).map(([key, value]) => (
-                      <div key={key} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-3">
-                        <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">
-                          {formatMetricLabel(key)}
-                        </div>
-                        <div className="text-sm font-semibold text-slate-800 mt-1 break-words">{String(value)}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <div className="rounded-2xl border border-slate-200 p-4 bg-white">
-                  <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Run Details</div>
-                  <div className="grid grid-cols-1 gap-3 text-sm text-slate-700">
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Run Name</div>
-                      <div className="mt-1 font-medium text-slate-800 break-words">{selectedRun.runName}</div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Source Dataset</div>
-                      <div className="mt-1 font-medium text-slate-800 break-all">
-                        {selectedResult.params.autopilotSourceName || selectedRun.datasetName}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Scope</div>
-                      <div className="mt-1 font-medium text-slate-800">{getScopeLabel(selectedResult.params.autopilotDataScope)}</div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Standardized Dataset</div>
-                      <div className="mt-1 font-medium text-slate-800 break-all">{selectedResult.params.fileName}</div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Saved</div>
-                      <div className="mt-1 font-medium text-slate-800">{formatTimestamp(selectedResult.timestamp)}</div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Variables</div>
-                      <div className="mt-1 font-medium text-slate-800 break-words">
-                        {formatVariablesForDisplay(selectedResult.params.var1, selectedResult.params.var2)}
-                      </div>
-                    </div>
-                    {selectedResult.params.autopilotSourceNames && selectedResult.params.autopilotSourceNames.length > 1 && (
-                      <div className="rounded-xl bg-slate-50 border border-slate-200 px-3 py-3">
-                        <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Linked Source Datasets</div>
-                        <div className="mt-1 font-medium text-slate-800 break-words">
-                          {selectedResult.params.autopilotSourceNames.join(', ')}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 p-4 bg-slate-50 mt-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Review AI Decisions</div>
-              {renderDecisionReview(activeReview)}
-            </div>
-          </div>
-        </div>
-      ) : autopilotRuns.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center">
-          <div className="text-lg font-semibold text-slate-800">No saved Autopilot run yet</div>
-          <div className="text-sm text-slate-500 mt-2 max-w-2xl mx-auto">
-            The easiest path is: choose Explore Fast for rapid signal finding or Run Confirmed for protocol-driven execution, then review the saved run here and reopen any result later.
-          </div>
-        </div>
-      ) : (
-        <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6">
-          <div className="text-sm font-semibold text-slate-800">
-            {isRunning ? 'Autopilot is running. New results will appear here when the run completes.' : 'No current result is selected.'}
-          </div>
-          <div className="text-sm text-slate-500 mt-2">
-            {runError
-              ? 'The latest run did not save a new analysis result. Review the workflow status and Autopilot log below instead of relying on any previous saved run.'
-              : 'Select a saved run from the list, or start a new run to populate this workspace.'}
-          </div>
-        </div>
-      )}
-    </div>
+        ) : (
+          renderResultTable(activeResultTable)
+        )
+      }
+      formatTimestamp={formatTimestamp}
+      sessionCardTitle={sessionCardTitle}
+      sessionAnalysisLabel={sessionAnalysisLabel}
+      sessionVariableSummary={sessionVariableSummary}
+      getWorkflowBadgeClass={getWorkflowBadgeClass}
+      getWorkflowLabel={getWorkflowLabel}
+      getQuestionMatchBadgeClass={getQuestionMatchBadgeClass}
+      formatMetricLabel={formatMetricLabel}
+      getScopeLabel={getScopeLabel}
+      renderDecisionReview={renderDecisionReview}
+      onSelectResult={(sessionId) => {
+        setSelectedResultId(sessionId);
+        setResultDetailView('CHART');
+      }}
+      onSetRunNameDraft={setRunNameDraft}
+      onStartEditingRunName={() => setIsEditingRunName(true)}
+      onCancelEditingRunName={() => {
+        if (selectedRun) {
+          setRunNameDraft(selectedRun.runName);
+        }
+        setIsEditingRunName(false);
+        setRenameError(null);
+      }}
+      onSaveRunName={handleSaveRunName}
+      onSetResultDetailView={setResultDetailView}
+      onExportSelectedResult={handleExportSelectedResult}
+      onExportRun={handleExportRun}
+      onOpenStatistics={() => selectedResult && onOpenStatistics(selectedResult.id)}
+    />
   );
 
   return (

@@ -12,7 +12,6 @@ import {
   StatSuggestion,
   BiasReport,
   CohortFilter,
-  AnalysisConcept,
   AnalysisPlanEntry,
 } from "../types";
 import { isIsoDate, normalizeSex, parseCsv, stringifyCsv, toNumber } from "../utils/dataProcessing";
@@ -23,171 +22,33 @@ import { retrieveRelevantContext } from "../utils/rag";
 import {
   findHeaderByAlias as matchHeaderByAlias,
   inferDatasetProfileFromHeaders,
-  mapProfileKindToAnalysisRole,
 } from "../utils/datasetProfile";
 import {
   buildAnalysisWorkspace,
   classifyAnalysisCapabilities,
   requestAnalysisPlan,
   runBackendAnalysis,
-  type FastApiAnalysisSpec,
   type FastApiDatasetReference,
 } from "./fastapiAnalysisService";
+import { formatDeterministicChatResponse } from "./deterministicAnalysisFormatter";
+import { callAiModel, formatAiServiceError, JsonType } from "./aiProxy";
+export { generateClinicalCommentary } from "./commentaryService";
 import {
-  buildDeterministicChartConfig,
-  buildDeterministicExecutedCode,
-  formatDeterministicChatResponse,
-  metricsListToRecord,
-} from "./deterministicAnalysisFormatter";
-
-const JsonType = {
-  OBJECT: 'OBJECT',
-  STRING: 'STRING',
-  BOOLEAN: 'BOOLEAN',
-  ARRAY: 'ARRAY',
-  NUMBER: 'NUMBER',
-} as const;
-
-const AI_MODEL = 'gemini-3.1-pro-preview';
-const AI_ENDPOINT = '/api/ai/generate';
-const isBrowserRuntime = typeof window !== 'undefined';
-
-interface ProxyGenerateRequest {
-  prompt: string;
-  model?: string;
-  systemInstruction?: string;
-  temperature?: number;
-  responseMimeType?: string;
-  responseSchema?: Record<string, unknown>;
-}
-
-interface StatisticalExecutionOptions {
-  question?: string;
-  sourceFiles?: ClinicalFile[];
-  covariates?: string[];
-  imputationMethod?: string;
-  applyPSM?: boolean;
-  backendSpec?: FastApiAnalysisSpec | null;
-}
-
-const getNodeClient = async () => {
-  if (isBrowserRuntime) return null;
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn('GEMINI_API_KEY not found in environment.');
-    return null;
-  }
-  const { GoogleGenAI } = await import('@google/genai');
-  return new GoogleGenAI({ apiKey });
-};
-
-const callAiModel = async (request: ProxyGenerateRequest): Promise<{ text: string }> => {
-  const model = request.model || AI_MODEL;
-
-  if (isBrowserRuntime) {
-    return withRetry(async () => {
-      let response: Response;
-      try {
-        response = await fetch(AI_ENDPOINT, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...request, model }),
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(
-          message.includes('Failed to fetch')
-            ? 'Unable to reach the AI service. Restart the integrated app server with `npm run dev` and try again.'
-            : message
-        );
-      }
-
-      const rawPayload = await response.text().catch(() => '');
-      let payload: Record<string, unknown> = {};
-      if (rawPayload) {
-        try {
-          payload = JSON.parse(rawPayload);
-        } catch {
-          payload = { error: rawPayload };
-        }
-      }
-
-      if (!response.ok) {
-        const serverError = typeof payload?.error === 'string' ? payload.error : '';
-        if (response.status === 404) {
-          throw new Error('AI endpoint is unavailable. The app is probably running without the integrated Node server. Restart with `npm run dev`.');
-        }
-        throw new Error(serverError || `AI proxy request failed (${response.status})`);
-      }
-      return { text: String(payload?.text || '') };
-    });
-  }
-
-  const ai = await getNodeClient();
-  if (!ai) {
-    throw new Error('GEMINI_API_KEY not found in environment.');
-  }
-
-  const response = await withRetry(() =>
-    ai.models.generateContent({
-      model,
-      contents: { parts: [{ text: request.prompt }] },
-      config: {
-        ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
-        ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-        ...(request.responseMimeType ? { responseMimeType: request.responseMimeType } : {}),
-        ...(request.responseSchema ? { responseSchema: request.responseSchema } : {}),
-      },
-    })
-  );
-
-  return { text: response.text || '' };
-};
-
-// Helper function to retry API calls
-const withRetry = async <T>(operation: () => Promise<T>, maxRetries = 3, delayMs = 2000): Promise<T> => {
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            return await operation();
-        } catch (error: any) {
-            const isTransient = error?.message?.includes("Model isn't available right now") || 
-                                error?.message?.includes("503") ||
-                                error?.message?.includes("429") ||
-                                error?.status === 503 ||
-                                error?.status === 429;
-            
-            if (isTransient && i < maxRetries - 1) {
-                console.warn(`Gemini API transient error. Retrying in ${delayMs}ms... (Attempt ${i + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-            }
-            throw error;
-        }
-    }
-    throw new Error("Max retries reached");
-};
-
-const formatAiServiceError = (error: unknown): string => {
-  const message = error instanceof Error ? error.message : String(error);
-
-  if (!message) {
-    return 'AI service error: Unknown failure while generating the response.';
-  }
-
-  if (message.includes('Unable to reach the AI service')) {
-    return message;
-  }
-
-  if (message.includes('AI endpoint is unavailable')) {
-    return message;
-  }
-
-  if (message.includes('AI service is not configured on the server') || message.includes('GEMINI_API_KEY')) {
-    return 'AI service is not configured on the server. Add `GEMINI_API_KEY` to `.env.local`, restart `npm run dev`, and try again.';
-  }
-
-  return `AI service error: ${message}`;
-};
+  buildDatasetReference,
+  executeStatisticalCode,
+  type StatisticalExecutionOptions,
+} from "./executionBridge";
+export {
+  buildDatasetReference,
+  executeStatisticalCode,
+  type StatisticalExecutionOptions,
+} from "./executionBridge";
+export {
+  generateExplorationQuestionSuggestions,
+  generateQuestionPlanningAssist,
+  type ExplorationQuestionSuggestion,
+  type QuestionPlanningAssist,
+} from "./planningAssistService";
 
 const CHAT_EXECUTION_INTENT = /compare|difference|association|correlat|regress|incidence|rate|frequency|distribution|trend|outlier|analy[sz]e|analysis|run|test|chart|kaplan|survival|hazard|cox|anova|chi[- ]?square|t[- ]?test/i;
 const CHAT_GUIDANCE_INTENT = /what can i do|which workflow|how should i|what does this dataset|review the selected|explain the dataset|what files|how to start/i;
@@ -206,169 +67,6 @@ const canRunExploratoryChatAnalysis = (query: string, contextFiles: ClinicalFile
   );
 
   return dataFiles.length === 1 ? dataFiles[0] : null;
-};
-
-const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReference => {
-  if (!file.content) {
-    return {
-      file_id: file.id,
-      name: file.name,
-      role: file.metadata?.datasetRole as string | undefined,
-      column_names: [],
-    };
-  }
-
-  try {
-    const { headers, rows } = parseCsv(file.content);
-    const profile = inferDatasetProfileFromHeaders(file.name, file.type, headers);
-    const role = mapProfileKindToAnalysisRole(profile.kind) || file.metadata?.datasetRole as string | undefined;
-
-    return {
-      file_id: file.id,
-      name: file.name,
-      role,
-      row_count: rows.length,
-      column_names: headers,
-      content: file.content,
-    };
-  } catch {
-    return {
-      file_id: file.id,
-      name: file.name,
-      role: file.metadata?.datasetRole as string | undefined,
-      column_names: [],
-    };
-  }
-};
-
-const buildBackendExecutionQuestion = (
-  testType: StatTestType,
-  var1: string,
-  var2: string,
-  question?: string
-): string => {
-  if (question?.trim()) return question.trim();
-
-  switch (testType) {
-    case StatTestType.KAPLAN_MEIER:
-      return `Compare survival between ${var1} groups using ${var2} as the time variable.`;
-    case StatTestType.COX_PH:
-      return `Estimate the hazard ratio by ${var1} using ${var2} as the time variable.`;
-    case StatTestType.CHI_SQUARE:
-      return `Compare incidence or proportions across ${var1} using ${var2} as the outcome.`;
-    case StatTestType.T_TEST:
-      return `Compare the mean of ${var2} across ${var1} groups.`;
-    case StatTestType.ANOVA:
-      return `Compare the mean of ${var2} across ${var1} categories using ANOVA.`;
-    case StatTestType.REGRESSION:
-      return `Model ${var2} using ${var1} as a predictor.`;
-    case StatTestType.CORRELATION:
-      return `Assess the correlation between ${var1} and ${var2}.`;
-    default:
-      return `${testType}: ${var1} vs ${var2}`;
-  }
-};
-
-const maybeExecuteFastApiStatisticalAnalysis = async (
-  code: string,
-  file: ClinicalFile,
-  testType: StatTestType,
-  resolvedVar1: string,
-  resolvedVar2: string,
-  options?: StatisticalExecutionOptions
-): Promise<StatAnalysisResult | null> => {
-  const sourceFiles = (options?.sourceFiles && options.sourceFiles.length > 0 ? options.sourceFiles : [file])
-    .filter((candidate) => (candidate.type === DataType.RAW || candidate.type === DataType.STANDARDIZED) && Boolean(candidate.content));
-  if (sourceFiles.length === 0) {
-    return null;
-  }
-
-  const question = buildBackendExecutionQuestion(testType, resolvedVar1, resolvedVar2, options?.question);
-  const datasetRefs = sourceFiles.map(buildDatasetReference);
-
-  try {
-    const capability = await classifyAnalysisCapabilities(question, datasetRefs);
-    if (
-      capability.status !== 'executable' ||
-      !['incidence', 'risk_difference', 'logistic_regression', 'kaplan_meier', 'cox', 'mixed_model', 'threshold_search', 'competing_risks', 'feature_importance', 'partial_dependence'].includes(capability.analysis_family)
-    ) {
-      return null;
-    }
-
-    const plan = await requestAnalysisPlan(question, datasetRefs);
-    const spec: FastApiAnalysisSpec | undefined =
-      plan.spec || options?.backendSpec
-        ? ({
-            ...(plan.spec || {}),
-            ...(options?.backendSpec || {}),
-          } as FastApiAnalysisSpec)
-        : undefined;
-    if (spec) {
-      if (options?.covariates && options.covariates.length > 0) {
-        spec.covariates = options.covariates;
-      }
-      if (testType === StatTestType.KAPLAN_MEIER || testType === StatTestType.COX_PH) {
-        spec.treatment_variable = resolvedVar1 || spec.treatment_variable;
-        spec.time_variable = resolvedVar2 || spec.time_variable;
-      }
-    }
-
-    const workspace = await buildAnalysisWorkspace(question, datasetRefs, spec);
-    const executed = await runBackendAnalysis(question, datasetRefs, spec, workspace.workspace_id);
-    if (!executed.executed) {
-      if (sourceFiles.length > 1) {
-        throw new Error(executed.explanation || 'FastAPI backend did not return an executed result.');
-      }
-      return null;
-    }
-
-    return {
-      metrics: metricsListToRecord(executed.metrics),
-      interpretation: executed.interpretation || executed.explanation,
-      chartConfig: buildDeterministicChartConfig(executed.analysis_family, executed.table),
-      tableConfig: executed.table
-        ? {
-            title: executed.table.title,
-            columns: executed.table.columns,
-            rows: executed.table.rows,
-          }
-        : undefined,
-      executedCode: buildDeterministicExecutedCode(code, executed.analysis_family, executed.workspace_id, sourceFiles),
-      backendExecution: {
-        engine: 'FASTAPI',
-        analysisFamily: executed.analysis_family,
-        workspaceId: executed.workspace_id,
-        sourceNames: sourceFiles.map((candidate) => candidate.name),
-        receipt: executed.receipt
-          ? {
-              sourceNames: executed.receipt.source_names,
-              derivedColumns: executed.receipt.derived_columns,
-              rowCount: executed.receipt.row_count,
-              columnCount: executed.receipt.column_count,
-              subjectIdentifier: executed.receipt.subject_identifier,
-              treatmentVariable: executed.receipt.treatment_variable,
-              outcomeVariable: executed.receipt.outcome_variable,
-              timeVariable: executed.receipt.time_variable,
-              eventVariable: executed.receipt.event_variable,
-              endpointLabel: executed.receipt.endpoint_label,
-              targetDefinition: executed.receipt.target_definition,
-              cohortFiltersApplied: executed.receipt.cohort_filters_applied,
-            }
-          : undefined,
-      },
-      aiCommentary: {
-        source: 'FALLBACK',
-        summary: executed.interpretation || executed.explanation,
-        limitations: executed.warnings.length > 0 ? executed.warnings : ['Result came from the deterministic analysis engine.'],
-      },
-    };
-  } catch (error) {
-    if (sourceFiles.length > 1) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(message || 'FastAPI backend execution failed.');
-    }
-    return null;
-  }
 };
 
 const requiresAdvancedAnalysisGuard = (query: string, contextFiles: ClinicalFile[]): boolean => {
@@ -540,7 +238,7 @@ const runAdvancedAnalysisGuard = async (
       const executed = await runBackendAnalysis(query, datasetRefs, plan.spec || undefined, workspace.workspace_id);
 
       if (executed.executed) {
-        return formatDeterministicChatResponse(executed);
+        return formatDeterministicChatResponse(executed, query);
       }
     }
 
@@ -1356,152 +1054,6 @@ export const generateStatisticalCode = async (
       '# This script stub documents intended logic.',
       '# Actual execution is performed in the app deterministic engine.',
     ].join('\n');
-  }
-};
-
-/**
- * Step 2: Execute the analysis deterministically and return results.
- */
-export const executeStatisticalCode = async (
-  code: string,
-  file: ClinicalFile,
-  testType: StatTestType,
-  var1?: string,
-  var2?: string,
-  concept?: AnalysisConcept | null,
-  options?: StatisticalExecutionOptions
-): Promise<StatAnalysisResult> => {
-  try {
-    const { headers } = parseCsv(file.content);
-    const resolvedVar1 = var1 && headers.includes(var1) ? var1 : headers[0];
-    const resolvedVar2 = var2 && headers.includes(var2) ? var2 : headers.find((h) => h !== resolvedVar1) || '';
-
-    if (!resolvedVar1) {
-      throw new Error("Unable to infer analysis variables from dataset headers.");
-    }
-
-    const backendResult = await maybeExecuteFastApiStatisticalAnalysis(
-      code,
-      file,
-      testType,
-      resolvedVar1,
-      resolvedVar2,
-      options
-    );
-    if (backendResult) {
-      return backendResult;
-    }
-
-    const result = executeLocalStatisticalAnalysis(file, testType, resolvedVar1, resolvedVar2, concept);
-    return { ...result, executedCode: code || result.executedCode };
-  } catch (error) {
-    console.error("Deterministic execution error", error);
-    const message = error instanceof Error ? error.message : "Analysis execution failed.";
-    throw new Error(message);
-  }
-};
-
-const buildFallbackClinicalCommentary = (
-  result: StatAnalysisResult,
-  context: {
-    question: string;
-    dataScope: 'SINGLE_DATASET' | 'LINKED_WORKSPACE';
-    sourceNames: string[];
-    var1: string;
-    var2: string;
-  }
-) => {
-  const adjusted = result.metrics.adjusted_p_value;
-  const scopeLabel = context.dataScope === 'LINKED_WORKSPACE' ? 'linked multi-file workspace' : 'single dataset';
-  const comparison = formatComparisonLabel(context.var1, context.var2);
-
-  const limitations = [
-    context.dataScope === 'LINKED_WORKSPACE'
-      ? 'This is an exploratory linked-workspace result; derived subject-level summaries may smooth over visit-level or event-level timing.'
-      : 'This result is based on one dataset only and may omit confounding context from related domains.',
-  ];
-
-  if (adjusted) {
-    limitations.push(`Multiple-testing adjustment was applied (${result.metrics.multiple_testing_method || 'Benjamini-Hochberg FDR'}).`);
-  } else if (context.dataScope === 'LINKED_WORKSPACE') {
-    limitations.push('Cross-domain signal scans can generate false positives and should be treated as hypothesis-generating.');
-  }
-
-  return {
-    source: 'FALLBACK' as const,
-    summary: `${result.interpretation} This commentary is based on the ${scopeLabel} result for ${comparison} across ${context.sourceNames.length} source dataset(s).`,
-    limitations,
-    caution:
-      context.dataScope === 'LINKED_WORKSPACE'
-        ? 'Use linked-workspace findings to prioritize follow-up analyses, not as confirmatory evidence.'
-        : 'Interpret in conjunction with protocol context, sample size, and missing-data patterns.',
-  };
-};
-
-export const generateClinicalCommentary = async (
-  result: StatAnalysisResult,
-  context: {
-    question: string;
-    dataScope: 'SINGLE_DATASET' | 'LINKED_WORKSPACE';
-    sourceNames: string[];
-    sourceDatasetName: string;
-    var1: string;
-    var2: string;
-    testType: StatTestType;
-  }
-): Promise<NonNullable<StatAnalysisResult['aiCommentary']>> => {
-  const fallback = buildFallbackClinicalCommentary(result, context);
-
-  const prompt = `
-  You are a clinical analytics copilot writing a short, careful commentary for an exploratory analysis result.
-
-  REQUIREMENTS:
-  - Stay grounded in the provided result only.
-  - Do not invent effect sizes, causality, or medical claims beyond the metrics.
-  - Explicitly acknowledge exploratory status when the scope is LINKED_WORKSPACE.
-  - Keep the summary to 2-4 sentences.
-  - Provide 2-4 limitations.
-
-  RESULT CONTEXT:
-  - Scope: ${context.dataScope}
-  - Source datasets: ${context.sourceNames.join(', ')}
-  - Primary dataset label: ${context.sourceDatasetName}
-  - User question: ${context.question || 'Autopilot-selected exploratory analysis'}
-  - Test type: ${context.testType}
-  - Variables: ${formatDisplayName(context.var1)} vs ${formatDisplayName(context.var2)}
-  - Deterministic interpretation: ${result.interpretation}
-  - Metrics JSON: ${JSON.stringify(result.metrics)}
-  `;
-
-  const schema = {
-    type: JsonType.OBJECT,
-    properties: {
-      summary: { type: JsonType.STRING },
-      limitations: { type: JsonType.ARRAY, items: { type: JsonType.STRING } },
-      caution: { type: JsonType.STRING },
-    },
-    required: ['summary', 'limitations'],
-  };
-
-  try {
-    const response = await callAiModel({
-      prompt,
-      responseMimeType: 'application/json',
-      responseSchema: schema,
-      temperature: 0.2,
-    });
-
-    if (!response.text) return fallback;
-    const parsed = JSON.parse(response.text);
-    return {
-      source: 'AI',
-      summary: parsed.summary || fallback.summary,
-      limitations: Array.isArray(parsed.limitations) && parsed.limitations.length > 0 ? parsed.limitations : fallback.limitations,
-      caution: parsed.caution || fallback.caution,
-    };
-  } catch (error) {
-    console.error('Clinical commentary generation error', error);
-    return fallback;
   }
 };
 

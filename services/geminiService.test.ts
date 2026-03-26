@@ -219,6 +219,138 @@ describe('executeStatisticalCode', () => {
     expect(result.backendExecution?.workspaceId).toBe('ws_mock');
   });
 
+  it('does not overwrite backend-planned survival variables from transformed workspace headers in multi-file execution', async () => {
+    const transformedWorkspaceFile: ClinicalFile = {
+      id: 'workspace_dm',
+      name: 'workspace_dm.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'DM_ARM_MODE,SITEID,DERIVED_SCORE',
+        'ArmA,S1,1.2',
+        'ArmB,S2,2.1',
+      ].join('\n'),
+    };
+
+    const adslFile: ClinicalFile = {
+      id: 'adsl_backend',
+      name: 'NCT06120140_ADSL.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,TRT01A,AGE,SEX,RACE',
+        '01,DrugA,70,F,ASIAN',
+        '02,DrugA,68,F,ASIAN',
+        '03,DrugB,73,F,ASIAN',
+      ].join('\n'),
+    };
+
+    const adaeFile: ClinicalFile = {
+      id: 'adae_backend',
+      name: 'NCT06120140_ADAE.csv',
+      type: DataType.STANDARDIZED,
+      uploadDate: new Date().toISOString(),
+      size: '1 KB',
+      content: [
+        'USUBJID,AETOXGR,AESTDY,AEENDY,AETERM',
+        '01,2,20,28,Rash',
+        '02,2,18,31,Dermatitis',
+        '03,3,17,27,Rash',
+      ].join('\n'),
+    };
+
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'executable',
+          analysis_family: 'cox',
+          executable: true,
+          requires_row_level_data: true,
+          missing_roles: [],
+          warnings: [],
+          explanation: 'supported',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'executable',
+          spec: {
+            analysis_family: 'cox',
+            target_definition: 'time_to_resolution_grade_2_plus_dae',
+            term_filters: [],
+            cohort_filters: [],
+            covariates: [],
+            interaction_terms: ['treatment*all'],
+            requested_outputs: ['hazard_ratio', 'confidence_interval'],
+            notes: [],
+          },
+          missing_roles: [],
+          warnings: [],
+          explanation: 'planned',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'executable',
+          workspace_id: 'ws_mock',
+          source_names: ['NCT06120140_ADSL.csv', 'NCT06120140_ADAE.csv'],
+          missing_roles: [],
+          row_count: 3,
+          column_count: 6,
+          derived_columns: ['AE_TIME_TO_RESOLUTION', 'AE_RESOLUTION_EVENT'],
+          notes: [],
+          explanation: 'built',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'executable',
+          executed: true,
+          analysis_family: 'cox',
+          workspace_id: 'ws_mock',
+          interpretation: 'Computed a Cox proportional hazards model for time to resolution.',
+          metrics: [{ name: 'analysis_method', value: 'cox_proportional_hazards' }],
+          warnings: [],
+          explanation: 'executed',
+        }),
+      });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    await executeStatisticalCode(
+      'print("backend")',
+      transformedWorkspaceFile,
+      StatTestType.COX_PH,
+      'DM_ARM_MODE',
+      'SITEID',
+      null,
+      {
+        question:
+          'Among participants who develop Grade >=2 DAEIs, what factors predict time to resolution (faster vs slower recovery), and do these predictors differ by arm?',
+        sourceFiles: [adslFile, adaeFile],
+        backendSpec: {
+          analysis_family: 'cox',
+          target_definition: 'time_to_resolution_grade_2_plus_dae',
+          interaction_terms: ['treatment*all'],
+          cohort_filters: [],
+          covariates: [],
+          requested_outputs: ['hazard_ratio'],
+          notes: [],
+        },
+      }
+    );
+
+    const workspaceRequest = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body || '{}'));
+    expect(workspaceRequest.spec?.treatment_variable).toBeUndefined();
+    expect(workspaceRequest.spec?.time_variable).toBeUndefined();
+  });
+
   it('supports exploratory feature importance through the FastAPI execution bridge', async () => {
     const adslFile: ClinicalFile = {
       id: 'adsl_backend',
@@ -449,7 +581,7 @@ describe('generateAnalysis', () => {
       []
     );
 
-    expect(response.answer).toMatch(/executed analysis workflow/i);
+    expect(response.answer).toMatch(/full analysis run/i);
     expect(response.tableConfig).toBeUndefined();
   });
 
@@ -486,8 +618,8 @@ describe('generateAnalysis', () => {
       []
     );
 
-    expect(response.answer).toMatch(/Advanced analysis requires/i);
-    expect(response.answer).toMatch(/summary-only chat path|validated result yet/i);
+    expect(response.answer).toMatch(/full analysis run/i);
+    expect(response.answer).toMatch(/cannot be answered from summaries alone|not enough for questions such as/i);
     expect(response.chartConfig).toBeUndefined();
   });
 

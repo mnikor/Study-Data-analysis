@@ -163,7 +163,7 @@ class AnalysisService:
             derived_columns=built.derived_columns,
             preview_table=preview_table,
             notes=built.notes,
-            explanation="Row-level FastAPI workspace built successfully.",
+            explanation="Row-level analysis workspace built successfully.",
         )
 
     def run_analysis(self, payload: AnalysisRunRequest) -> AnalysisRunResponse:
@@ -329,7 +329,7 @@ class AnalysisService:
             workspace_id=workspace_id,
             receipt=self._build_execution_receipt(workspace_entry, effective_spec),
             metrics=[AnalysisMetric(name="backend_status", value="unsupported_family")],
-            warnings=["This analysis family has not been implemented yet in the deterministic FastAPI runner."],
+            warnings=["This analysis family has not been implemented yet in the deterministic analysis engine."],
             explanation="Workspace build is live, but this model family is still pending implementation.",
         )
 
@@ -407,7 +407,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs a row-level subject-event workspace with baseline covariates and a derived target."
                     if missing
-                    else "This request matches the exploratory ML workflow implemented in the FastAPI runner."
+                    else "This request matches the exploratory ML workflow implemented in the analysis engine."
                 ),
             )
 
@@ -425,7 +425,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs subject-level denominators plus term-level adverse event rows."
                     if missing
-                    else "This request matches the deterministic incidence workflow implemented in the FastAPI runner."
+                    else "This request matches the deterministic incidence workflow implemented in the analysis engine."
                 ),
             )
 
@@ -446,7 +446,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs subject-level baseline covariates plus derived adverse-event outcomes."
                     if missing
-                    else "This request matches the deterministic logistic regression workflow implemented in the FastAPI runner."
+                    else "This request matches the deterministic logistic regression workflow implemented in the analysis engine."
                 ),
             )
 
@@ -472,7 +472,7 @@ class AnalysisService:
                     "This request needs an ADTTE time-to-event dataset or a derivable AE onset endpoint with explicit timing."
                     if status != "executable"
                     else (
-                        "This request matches the deterministic survival workflow implemented in the FastAPI runner."
+                        "This request matches the deterministic survival workflow implemented in the analysis engine."
                         if has_adtte
                         else "This request can use a derived AE time-to-first-event workflow because the selected ADSL + ADAE datasets expose explicit event timing."
                     )
@@ -494,7 +494,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs subject-level baseline context plus repeated measurement rows."
                     if missing
-                    else "This request matches the repeated-measures workflow implemented in the FastAPI runner."
+                    else "This request matches the repeated-measures workflow implemented in the analysis engine."
                 ),
             )
 
@@ -513,7 +513,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs early-event predictors plus a downstream persistence endpoint."
                     if missing
-                    else "This request matches the exploratory threshold-search workflow implemented in the FastAPI runner."
+                    else "This request matches the exploratory threshold-search workflow implemented in the analysis engine."
                 ),
             )
 
@@ -531,7 +531,7 @@ class AnalysisService:
                 explanation=(
                     "This request needs event timing with distinguishable event-of-interest and competing-event definitions."
                     if missing
-                    else "This request matches the competing-risks workflow implemented in the FastAPI runner."
+                    else "This request matches the competing-risks workflow implemented in the analysis engine."
                 ),
             )
 
@@ -541,7 +541,7 @@ class AnalysisService:
             missing_roles=[],
             requires_row_level_data=False,
             warnings=[],
-            explanation="The FastAPI planner could not classify this question yet. Extend the planner before allowing fallback analysis.",
+            explanation="The planner could not classify this question yet. Extend the supported analysis rules before allowing fallback analysis.",
         )
 
     def _infer_family(self, question: str) -> AnalysisFamily:

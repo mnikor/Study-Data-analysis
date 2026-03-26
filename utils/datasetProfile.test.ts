@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ClinicalFile, DataType } from '../types';
-import { inferDatasetProfile, mapProfileKindToAnalysisRole } from './datasetProfile';
+import { buildQuestionFileRecommendation, inferDatasetProfile, mapProfileKindToAnalysisRole } from './datasetProfile';
 
 const makeFile = (overrides: Partial<ClinicalFile>): ClinicalFile => ({
   id: crypto.randomUUID(),
@@ -94,5 +94,54 @@ describe('datasetProfile', () => {
 
     expect(dsProfile.kind).toBe('DISPOSITION');
     expect(mapProfileKindToAnalysisRole(dsProfile.kind)).toBe('DS');
+  });
+
+  it('recognizes adherence and interruption style files as disposition datasets', () => {
+    const dsProfile = inferDatasetProfile(
+      makeFile({
+        name: 'simulated_adherence_and_interruptions.csv',
+        type: DataType.RAW,
+        content: 'USUBJID,DOSE_REDUCTION_FLAG,INTERRUPTION_COUNT,COMPLIANCE_STATUS\n01,Y,2,LOW',
+      })
+    );
+
+    expect(dsProfile.kind).toBe('DISPOSITION');
+    expect(mapProfileKindToAnalysisRole(dsProfile.kind)).toBe('DS');
+  });
+
+  it('requires subject-level baseline data for dose interruption AE outcome questions', () => {
+    const recommendation = buildQuestionFileRecommendation(
+      'How do amivantamab dose reductions and interruptions correlate with the overall incidence and maximum severity of adverse events?',
+      [
+        makeFile({
+          id: 'adsl',
+          name: 'NCT06120140_ADSL.csv',
+          type: DataType.STANDARDIZED,
+          content: 'USUBJID,TRT01A,AGE,SEX,RACE\n01,ArmA,65,F,ASIAN',
+        }),
+        makeFile({
+          id: 'adae',
+          name: 'NCT06120140_ADAE.csv',
+          type: DataType.STANDARDIZED,
+          content: 'USUBJID,AETERM,AETOXGR,AESTDY\n01,Rash,2,14',
+        }),
+        makeFile({
+          id: 'ex',
+          name: 'simulated_exposure.csv',
+          type: DataType.RAW,
+          content: 'USUBJID,EXDOSE,WEIGHT_KG\n01,1050,82',
+        }),
+        makeFile({
+          id: 'ds',
+          name: 'simulated_adherence_and_interruptions.csv',
+          type: DataType.RAW,
+          content: 'USUBJID,DOSE_REDUCTION_FLAG,INTERRUPTION_COUNT,COMPLIANCE_STATUS\n01,Y,2,LOW',
+        }),
+      ]
+    );
+
+    expect(recommendation.requiredRoles).toEqual(expect.arrayContaining(['ADSL', 'ADAE', 'ADEX', 'DS']));
+    expect(recommendation.selectedByRole.ADSL?.name).toBe('NCT06120140_ADSL.csv');
+    expect(recommendation.selectedByRole.DS?.name).toBe('simulated_adherence_and_interruptions.csv');
   });
 });

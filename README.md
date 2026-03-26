@@ -1,232 +1,443 @@
 # Evidence CoPilot
 
-Evidence CoPilot is a clinical analytics workspace for ingestion, QC, mapping, linked dataset analysis, AI-assisted reasoning, deterministic statistical execution, and exportable reports.
+Evidence CoPilot is a clinical analytics workspace for:
+- ingesting raw clinical datasets and study documents
+- running QC and mapping workflows
+- standardizing data through ETL
+- asking exploratory questions in AI Chat
+- running guided workflows in Autopilot
+- executing structured analyses in Statistical Analysis
+- returning deterministic tables, metrics, charts, narrative interpretation, and exportable HTML reports
 
-This repository currently contains a hybrid architecture:
-- a React + TypeScript frontend
-- a Node server that serves the app, proxies AI calls, persists local project state, and proxies advanced analysis requests
-- a FastAPI backend that performs row-level workspace building and deterministic clinical/statistical execution
+This repository is a hybrid application, not a pure LLM chatbot:
+- `React + TypeScript` provides the product UI
+- `Node` provides the local application shell, project persistence, SAS parsing entrypoints, and API proxying
+- `FastAPI + Python` performs row-level workspace building and deterministic analysis execution
 
-The product is beyond a simple UI prototype. It now supports real backend execution for a growing set of analysis families, while still using AI for planning, explanation, RAG-style retrieval, and user assistance.
+The most important design principle is:
+
+> LLMs help interpret, plan, explain, and propose.  
+> Deterministic code builds cohorts, derives endpoints, runs analyses, and produces auditable results.
 
 ## Table of Contents
 
-- [What The App Does](#what-the-app-does)
-- [Architecture Overview](#architecture-overview)
+- [What The Product Does](#what-the-product-does)
+- [How A New User Should Think About The App](#how-a-new-user-should-think-about-the-app)
+- [System Architecture](#system-architecture)
+- [Request Lifecycles](#request-lifecycles)
+- [Role Of The LLM](#role-of-the-llm)
+- [Role Of Deterministic Analysis](#role-of-deterministic-analysis)
+- [Data And Execution Schemas](#data-and-execution-schemas)
 - [Frontend Architecture](#frontend-architecture)
 - [Backend Architecture](#backend-architecture)
-- [Analysis Execution Model](#analysis-execution-model)
+- [Feature Surface Overview](#feature-surface-overview)
+- [Supported Analysis Families](#supported-analysis-families)
 - [Repository Structure](#repository-structure)
-- [Supported Analysis Types](#supported-analysis-types)
 - [Local Development](#local-development)
-- [Environment Variables](#environment-variables)
 - [Testing And Validation](#testing-and-validation)
-- [Current Strengths And Limits](#current-strengths-and-limits)
-- [Deployment Model In This Repo](#deployment-model-in-this-repo)
+- [Current Limits](#current-limits)
+- [Architecture Strengths](#architecture-strengths)
 
-## What The App Does
+## What The Product Does
 
-Evidence CoPilot is designed around a clinical data workflow:
+Evidence CoPilot is designed around a realistic clinical data workflow:
 
-1. Ingest source datasets and documents.
-2. Run quality checks and identify issues.
+1. Upload source datasets and protocol-like documents.
+2. Run QC to identify structural and content issues.
 3. Generate or review mapping logic.
-4. Standardize datasets and build linked analysis workspaces.
-5. Ask questions in AI Chat or run structured analyses in Statistical Analysis / Autopilot.
-6. Produce tables, charts, narrative interpretation, provenance, and HTML exports.
+4. Standardize raw files through ETL.
+5. Build linked workspaces or analysis-ready subsets.
+6. Explore questions in AI Chat or run guided workflows in Autopilot.
+7. Execute deterministic analyses for supported question types.
+8. Return:
+   - charts
+   - tables
+   - metrics
+   - structured commentary
+   - execution receipts
+   - exportable HTML reports
 
-The app supports several product surfaces:
-- `Ingestion & QC`
-- `Mapping Specs`
-- `ETL Pipeline`
-- `AI Insights Chat`
-- `AI Autopilot`
-- `Statistical Analysis`
-- `Bias Audit`
-- `Provenance Log`
+This means the app is not just “chat over files.” It is a local clinical analytics workbench with an AI planning layer and a deterministic execution layer.
 
-## Architecture Overview
+## How A New User Should Think About The App
 
-The codebase now has three major layers.
+The main surfaces have different jobs.
+
+### `AI Insights Chat`
+Use this when the user wants to:
+- explore what the selected data can answer
+- ask a question quickly
+- get file recommendations
+- compare a few ideas before committing
+
+### `AI Autopilot`
+Use this when the user wants to:
+- run a guided workflow
+- save a reusable run
+- review saved analyses
+- export a tracked analysis result
+
+### `Statistical Analysis`
+Use this when the user wants:
+- tighter control over the final analysis
+- explicit workbench-style execution
+- plan review
+- code review / execution review
+
+### `ETL Pipeline`
+Use this when the raw files are messy, inconsistent, or not analysis-ready.
+
+The simplest user model is:
+- `AI Chat` = explore and decide
+- `Autopilot` = run and document
+- `Statistical Analysis` = control and finalize
+- `ETL` = prepare data so the other three work reliably
+
+## System Architecture
 
 ```mermaid
 flowchart LR
-    U["Browser User"] --> FE["React + TypeScript Frontend"]
+    U["Browser User"] --> FE["React Frontend"]
     FE --> NODE["Node App Server"]
-    NODE --> AI["LLM Provider Proxy (/api/ai/generate)"]
-    NODE --> STORE["Local Project Store (/api/projects)"]
-    NODE --> SAS["Python SAS Parser (/api/ingestion/parse-sas)"]
-    NODE --> FASTAPI["FastAPI Analysis API (/api/v1/*)"]
 
-    FASTAPI --> PLAN["Question Classification + Plan Building"]
-    FASTAPI --> WS["Row-level Workspace Builder"]
-    FASTAPI --> RUN["Deterministic Analysis Runner"]
+    NODE --> AI["LLM Proxy"]
+    NODE --> STORE["Project Store"]
+    NODE --> SAS["SAS Parsing Path"]
+    NODE --> FASTAPI["FastAPI Analysis API"]
 
-    STORE --> META[".app-data/projects.metadata.json"]
-    STORE --> ART[".app-data/file-artifacts/"]
+    FASTAPI --> CAP["Capability Check"]
+    FASTAPI --> PLAN["Analysis Plan"]
+    FASTAPI --> WS["Workspace Builder"]
+    FASTAPI --> RUN["Deterministic Runner"]
+
+    STORE --> META["Project Metadata"]
+    STORE --> ART["File Artifacts"]
+    WS --> REPO["Workspace Repository"]
 ```
 
-### Why the architecture is split this way
+### Why It Is Split This Way
 
-- The frontend owns user interaction, view state, charts, and workbench UX.
-- The Node server remains the local application shell and backend boundary for persistence, AI proxying, and local dev orchestration.
-- FastAPI handles heavier clinical/statistical logic because Python is the right execution environment for row-level derivation, survival methods, regression, and validation workflows.
+- The frontend is best for interaction, workbench UX, charts, and session state.
+- Node is the local app shell and persistence boundary.
+- Python is the right execution environment for:
+  - row-level derivation
+  - cohort filtering
+  - survival and regression workflows
+  - statistical validation
 
-### High-level request paths
+## Request Lifecycles
 
-1. `General AI question`
-   - frontend -> Node AI proxy -> model provider
+### 1. General AI Question
 
-2. `Project save/load`
-   - frontend -> Node `/api/projects` -> local metadata + artifact storage
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FE as AI Chat UI
+    participant ORCH as Frontend Orchestrator
+    participant RAG as Retrieval Layer
+    participant NODE as Node Server
+    participant LLM as Model Provider
 
-3. `SAS ingestion`
-   - frontend -> Node `/api/ingestion/parse-sas` -> Python `pyreadstat`
+    U->>FE: Ask question
+    FE->>ORCH: question + selected sources
+    ORCH->>RAG: retrieve relevant chunks if RAG mode
+    ORCH->>NODE: AI request
+    NODE->>LLM: prompt
+    LLM-->>NODE: response
+    NODE-->>ORCH: structured response
+    ORCH-->>FE: answer + citations + optional chart/table
+```
 
-4. `Advanced deterministic analysis`
-   - frontend -> Node proxy `/api/v1/*` -> FastAPI -> workspace builder + deterministic runner
+### 2. Advanced Deterministic Analysis
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant NODE as Node Proxy
+    participant API as FastAPI
+
+    FE->>NODE: /api/v1/analysis/capabilities
+    NODE->>API: capabilities request
+    API-->>NODE: supported or not
+
+    FE->>NODE: /api/v1/analysis/plan
+    NODE->>API: plan request
+    API-->>NODE: deterministic AnalysisSpec
+
+    FE->>NODE: /api/v1/analysis/build-workspace
+    NODE->>API: workspace build request
+    API-->>NODE: workspace id + receipt
+
+    FE->>NODE: /api/v1/analysis/run
+    NODE->>API: run request
+    API-->>NODE: metrics + tables + interpretation + receipt
+```
+
+### 3. Saved Run / Project Persistence
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant NODE as Project API
+    participant FS as Local File Store
+
+    FE->>NODE: save project or session
+    NODE->>FS: write metadata and artifacts
+    FS-->>NODE: ok
+    NODE-->>FE: saved response
+```
+
+## Role Of The LLM
+
+The LLM is used as an advisory and explanatory layer.
+
+### LLM responsibilities
+
+- explain what a dataset or workflow means
+- answer general document and context questions
+- support RAG-style retrieval
+- suggest candidate questions to explore
+- help propose file roles and predictor families
+- generate planning-assist text
+- generate narrative commentary
+- explain partial answers and next steps
+
+### LLM is not authoritative for:
+
+- final cohort derivation
+- endpoint derivation
+- censoring logic
+- model fitting
+- hazard ratios, p-values, or inferential outputs
+- final execution receipts
+
+### Practical rule
+
+If a result requires real analytical trust, the LLM should describe the result, not create it.
+
+## Role Of Deterministic Analysis
+
+Deterministic analysis is the part of the system that actually produces the numbers.
+
+### Deterministic responsibilities
+
+- capability checks
+- plan building for supported question families
+- role inference for selected datasets
+- row-level workspace construction
+- endpoint derivation
+- cohort filtering
+- covariate assembly
+- model execution
+- metrics, result tables, receipts
+- question-match validation
+
+### Why deterministic analysis matters
+
+Without deterministic execution, an advanced clinical analysis UI will eventually return polished but untrustworthy answers. This app explicitly avoids that by separating:
+- `planning and explanation`
+- from `execution and evidence`
+
+## Data And Execution Schemas
+
+### Core app runtime schema
+
+```mermaid
+graph TD
+    APP["App Shell"] --> CHAT["AI Chat"]
+    APP --> AUTO["Autopilot"]
+    APP --> STATS["Statistical Analysis"]
+    APP --> ETL["ETL Pipeline"]
+
+    CHAT --> PLANASSIST["Planning Assist Service"]
+    CHAT --> EXECBRIDGE["Execution Bridge"]
+    CHAT --> COMMENTARY["Commentary Service"]
+
+    AUTO --> PLANASSIST
+    AUTO --> EXECBRIDGE
+    STATS --> EXECBRIDGE
+
+    EXECBRIDGE --> NODE["Node Server"]
+    NODE --> FASTAPI["FastAPI Backend"]
+```
+
+### Deterministic backend schema
+
+```mermaid
+graph TD
+    API["FastAPI Route"] --> SERVICE["Analysis Service"]
+    SERVICE --> CAP["Capability Classifier"]
+    SERVICE --> SPEC["Analysis Spec Builder"]
+    SERVICE --> WORK["Workspace Builder"]
+    WORK --> ROLE["Dataset Role Inference"]
+    WORK --> FILTER["Cohort Filters"]
+    WORK --> DERIVE["Endpoint Derivation"]
+    WORK --> MERGE["Feature Assembly"]
+    WORK --> SAVE["Workspace Repository"]
+    SERVICE --> RUN["Deterministic Runner"]
+    RUN --> OUT["Metrics + Tables + Interpretation + Receipt"]
+```
+
+### Project persistence schema
+
+Projects are persisted locally by the Node layer.
+
+Stored concepts:
+- project metadata
+- uploaded file artifacts
+- saved statistical sessions
+- saved Autopilot sessions
+- provenance records
+
+### Analysis session schema
+
+The core persisted analytical object is `AnalysisSession` in [types.ts](/Users/mikhailnikonorov/Clinical-trial-insight/types.ts).
+
+At a high level, a saved session contains:
+- analysis name
+- timestamp
+- chart/table result
+- deterministic metrics
+- AI commentary
+- execution code or summary
+- parameters used to run the analysis
+- Autopilot metadata when relevant
+
+### Analysis API schema
+
+The FastAPI backend uses typed request/response models in [backend/app/models/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/models/analysis.py).
+
+Key contracts:
+- `AnalysisCapabilityRequest` / `AnalysisCapabilityResponse`
+- `AnalysisPlanRequest` / `AnalysisPlanResponse`
+- `WorkspaceBuildRequest` / `WorkspaceBuildResponse`
+- `AnalysisRunRequest` / `AnalysisRunResponse`
+- `AnalysisSpec`
+- `AnalysisExecutionReceipt`
+
+### What `AnalysisSpec` represents
+
+`AnalysisSpec` is the deterministic bridge between plain-language question and executable analysis.
+
+It includes concepts such as:
+- analysis family
+- endpoint definition
+- outcome variable
+- time variable
+- treatment variable
+- covariates
+- interaction terms
+- cohort filters
+- requested outputs
+
+### What `AnalysisExecutionReceipt` represents
+
+It is the audit-oriented description of what really ran:
+- source datasets used
+- workspace identifier
+- derived fields
+- endpoint label
+- target definition
+- cohort filters applied
+- row and column shape
+- analysis-family-specific variables
+
+This receipt is what allows the UI to say:
+- what dataset was really used
+- what endpoint was really modeled
+- whether the result was a strong match or only a partial answer
 
 ## Frontend Architecture
 
 The frontend is a React 19 + TypeScript Vite application.
 
-Primary entry points:
-- [App.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/App.tsx): top-level shell, routing-by-view, project lifecycle, persistence initialization
-- [types.ts](/Users/mikhailnikonorov/Clinical-trial-insight/types.ts): shared application types
-- [components](/Users/mikhailnikonorov/Clinical-trial-insight/components): main feature surfaces
-- [services](/Users/mikhailnikonorov/Clinical-trial-insight/services): frontend service layer
-- [utils](/Users/mikhailnikonorov/Clinical-trial-insight/utils): deterministic helpers, retrieval, project helpers, dataset profiling
+### Primary frontend entry points
 
-### Frontend responsibilities
+- [App.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/App.tsx)
+  - app shell
+  - top-level feature routing
+  - project lifecycle
+  - persistence initialization
 
-- workspace and project selection
-- file upload and file browsing
-- QC issue display and remediation UI
-- mapping review and transformation workflow
-- AI Chat interaction and retrieved-source display
-- Statistical Analysis workbench
-- Autopilot execution and saved-run workspace
-- chart rendering and HTML export
-- client-side orchestration of backend requests
+- [types.ts](/Users/mikhailnikonorov/Clinical-trial-insight/types.ts)
+  - shared application types
 
-### Frontend runtime schema
+- [components](/Users/mikhailnikonorov/Clinical-trial-insight/components)
+  - main feature surfaces
 
-```mermaid
-flowchart TD
-    APP["App.tsx"] --> VIEWS["Feature Views"]
-    VIEWS --> CHAT["Analysis.tsx (AI Chat)"]
-    VIEWS --> STATS["Statistics.tsx (Structured Workbench)"]
-    VIEWS --> AUTO["Autopilot.tsx (Saved Runs + Guided Execution)"]
-    VIEWS --> INGEST["Ingestion / QC / ETL Views"]
+- [services](/Users/mikhailnikonorov/Clinical-trial-insight/services)
+  - orchestration and backend clients
 
-    CHAT --> CHAT_SVC["geminiService.ts"]
-    CHAT --> RAG["rag.ts"]
+- [utils](/Users/mikhailnikonorov/Clinical-trial-insight/utils)
+  - retrieval, parsing, profiling, deterministic helpers
 
-    STATS --> EXEC["fastapiAnalysisService.ts"]
-    STATS --> TYPES["types.ts"]
+### Current frontend service boundaries
 
-    AUTO --> EXEC
-    AUTO --> TYPES
+Recent refactors intentionally split the large orchestration layer:
 
-    CHAT_SVC --> EXEC
-    CHAT_SVC --> LOCAL_STATS["statisticsEngine.ts"]
-    CHAT_SVC --> FORMAT["deterministicAnalysisFormatter.ts"]
-```
+- [services/aiProxy.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/aiProxy.ts)
+  - low-level AI provider request logic
 
-The frontend is effectively split into three layers:
-- `View components`
-  - user interaction, panels, forms, tables, charts, saved-run browsers
-- `Service/orchestration layer`
-  - analysis routing, backend calls, AI fallbacks, response formatting
-- `Utility layer`
-  - retrieval, dataset profiling, local deterministic helpers, import helpers
+- [services/planningAssistService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/planningAssistService.ts)
+  - AI planning assist
+  - suggested exploration questions
+  - suggestion support gating
 
-That split is still imperfect in code because several files are large, but architecturally this is the intended shape.
+- [services/commentaryService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/commentaryService.ts)
+  - structured AI commentary generation
 
-### Important frontend modules
+- [services/executionBridge.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/executionBridge.ts)
+  - deterministic execution routing
+  - backend execution bridging
+  - local statistical execution bridge
+
+- [services/geminiService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/geminiService.ts)
+  - now acts more like a façade than a single giant implementation file
+
+### Major feature surfaces
 
 - [components/Analysis.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Analysis.tsx)
-  - AI Chat UI
-  - source selection and RAG mode
-  - user-facing display of retrieved sources and analytical responses
+  - AI Chat
+  - source selection
+  - RAG / direct context modes
+  - planning assist
+  - suggested exploration questions
+
+- [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
+  - guided workflow execution
+  - saved-run browser
+  - workspace review
+  - result validation
+
+Supporting extracted Autopilot components:
+- [components/AutopilotControlPanel.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/AutopilotControlPanel.tsx)
+- [components/AutopilotRunBrowser.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/AutopilotRunBrowser.tsx)
+- [components/AutopilotWorkflowPanel.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/AutopilotWorkflowPanel.tsx)
+- [components/AutopilotWorkspaceSection.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/AutopilotWorkspaceSection.tsx)
+- [components/AutopilotResultDetail.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/AutopilotResultDetail.tsx)
 
 - [components/Statistics.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Statistics.tsx)
   - structured analysis workbench
-  - endpoint builder
-  - dataset selection
-  - advanced analysis plan preview
-  - deterministic execution handoff
+  - code review flow
+  - execution and result review
 
-- [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
-  - exploratory and confirmed run setup
-  - saved-run browser
-  - execution log/workflow review
-  - result workspace
+Supporting extracted statistics view:
+- [components/StatisticsResultsView.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/StatisticsResultsView.tsx)
 
-- [services/geminiService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/geminiService.ts)
-  - central orchestration layer for AI Chat and several analysis flows
-  - decides whether to use:
-    - LLM explanation path
-    - local deterministic path
-    - FastAPI deterministic path
-  - contains guardrails to prevent fabricated advanced analyses
+### Frontend intelligence model
 
-- [services/fastapiAnalysisService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/fastapiAnalysisService.ts)
-  - typed client for FastAPI analysis endpoints
+The frontend uses a hybrid intelligence model:
 
-- [utils/rag.ts](/Users/mikhailnikonorov/Clinical-trial-insight/utils/rag.ts)
-  - query-aware retrieval over selected documents and tabular chunks
+1. deterministic recommendation and support checks
+2. optional LLM planning assist
+3. deterministic execution validation
+4. structured commentary
 
-- [utils/statisticsEngine.ts](/Users/mikhailnikonorov/Clinical-trial-insight/utils/statisticsEngine.ts)
-  - legacy/local deterministic engine for simpler single-dataset execution
-
-### Frontend request flows
-
-#### AI Chat
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant FE as Analysis.tsx
-    participant ORCH as geminiService.ts
-    participant RAG as rag.ts
-    participant NODE as Node /api/ai or /api/v1 proxy
-    participant PY as FastAPI
-
-    U->>FE: Ask question
-    FE->>ORCH: submit question + selected sources
-    ORCH->>RAG: retrieve relevant chunks (when RAG mode)
-    ORCH->>ORCH: decide execution path
-    alt General explanation / doc answer
-        ORCH->>NODE: /api/ai/generate
-        NODE-->>ORCH: model response
-    else Local deterministic analysis
-        ORCH->>ORCH: execute via statisticsEngine.ts
-    else Advanced deterministic analysis
-        ORCH->>NODE: /api/v1/analysis/*
-        NODE->>PY: proxy request
-        PY-->>NODE: plan / workspace / result
-        NODE-->>ORCH: deterministic response
-    end
-    ORCH-->>FE: formatted response + citations/metrics
-```
-
-#### Statistical Analysis / Autopilot
-
-```mermaid
-sequenceDiagram
-    participant FE as React Workbench
-    participant CLIENT as fastapiAnalysisService.ts
-    participant NODE as Node Proxy
-    participant PY as FastAPI
-
-    FE->>CLIENT: capabilities / plan / build / run
-    CLIENT->>NODE: /api/v1/analysis/*
-    NODE->>PY: proxy request
-    PY-->>NODE: typed response
-    NODE-->>CLIENT: typed response
-    CLIENT-->>FE: plan, workspace preview, metrics, receipt
-```
+That is why the UI can now:
+- recommend files
+- explain missing roles
+- downgrade partial answers
+- still avoid inventing unsupported charts or model results
 
 ## Backend Architecture
 
@@ -238,232 +449,142 @@ Main file:
 - [server/index.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/index.js)
 
 Responsibilities:
-- serve the Vite app in development and the built app in production mode
-- proxy LLM requests through `/api/ai/generate`
-- persist projects via `/api/projects`
-- parse SAS datasets via `/api/ingestion/parse-sas`
+- serve frontend assets
+- proxy AI requests
+- persist projects
+- parse SAS datasets
 - proxy `/api/v1/*` requests to FastAPI
 
 Supporting files:
-- [server/dev.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/dev.js): unified local dev launcher
-- [server/projectStore.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/projectStore.js): local metadata/artifact persistence
-- [server/parse_sas.py](/Users/mikhailnikonorov/Clinical-trial-insight/server/parse_sas.py): server-side SAS parsing helper
+- [server/dev.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/dev.js)
+- [server/projectStore.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/projectStore.js)
+- [server/parse_sas.py](/Users/mikhailnikonorov/Clinical-trial-insight/server/parse_sas.py)
 
 ### 2. FastAPI analysis backend
 
 Main app:
 - [backend/app/main.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/main.py)
 
-API routes:
+Routes:
 - [backend/app/api/routes/health.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/api/routes/health.py)
 - [backend/app/api/routes/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/api/routes/analysis.py)
 
 Core services:
 - [backend/app/services/analysis_service.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/analysis_service.py)
-  - question classification
-  - capability checks
+  - capability classification
   - plan construction
-  - workspace lifecycle
-  - deterministic family dispatch
-  - persistent workspace coordination
+  - orchestration across workspace and runner layers
 
 - [backend/app/services/workspace_builder.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/workspace_builder.py)
   - dataset role inference
-  - row-level subject/event workspace construction
-  - derived endpoint preparation
-  - cohort filtering
-  - multi-domain feature assembly
+  - row-level workspace construction
+  - endpoint derivation
+  - censored time-to-resolution support
+  - multi-source feature assembly
 
 - [backend/app/services/deterministic_runner.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/deterministic_runner.py)
-  - deterministic statistical and ML-family execution
-
-- [backend/app/services/endpoint_templates.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/endpoint_templates.py)
-  - reusable endpoint templates for common question shapes
+  - deterministic analysis families
+  - predictor prioritization
+  - model fallback behavior
+  - result tables and interpretation seeds
 
 - [backend/app/services/workspace_repository.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/workspace_repository.py)
   - file-backed workspace persistence
-  - stores workspace tables and manifests under `.app-data/analysis-workspaces`
 
-Models and contracts:
-- [backend/app/models/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/models/analysis.py)
+- [backend/app/services/endpoint_templates.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/endpoint_templates.py)
+  - reusable endpoint templates for supported question classes
 
-### FastAPI endpoint contract
+## Feature Surface Overview
 
-Current analysis API surface:
-- `POST /api/v1/analysis/capabilities`
-- `POST /api/v1/analysis/plan`
-- `POST /api/v1/analysis/build-workspace`
-- `POST /api/v1/analysis/run`
+### Ingestion & QC
+- file upload
+- QC issues
+- auto-fix suggestions
+- SAS parsing support
 
-This split matters because the app can:
-- first decide whether a question is executable
-- then build a structured analysis plan
-- then build a row-level workspace
-- then execute a deterministic analysis family
+### Mapping Specs
+- source-to-target mapping review
+- mapping suggestion workflow
+- reference mapping support
 
-That is the main safety mechanism that prevents the app from inventing complex outputs from chat summaries alone.
+### ETL Pipeline
+- prepares raw files for downstream analysis
+- standardizes inconsistent datasets
+- improves analysis reliability
 
-### Backend execution schema
+### AI Chat
+- quick question answering
+- question/file support recommendations
+- scoped suggested questions
+- deterministic analysis when supported
 
-```mermaid
-flowchart TD
-    API["FastAPI Route"] --> SERVICE["AnalysisService"]
-    SERVICE --> CLASSIFY["Capability Classification"]
-    SERVICE --> SPEC["AnalysisSpec Builder"]
-    SERVICE --> WS_BUILD["workspace_builder.build_workspace"]
-    WS_BUILD --> ROLE["Role Inference"]
-    WS_BUILD --> FILTER["Cohort Filtering"]
-    WS_BUILD --> DERIVE["Endpoint / Feature Derivation"]
-    WS_BUILD --> FRAME["Subject-level or row-level workspace"]
+### Autopilot
+- guided execution workflow
+- Explore Fast vs Run Confirmed
+- saved run browser
+- result validation and export
 
-    SERVICE --> WS_REPO["workspace_repository.py"]
-    WS_REPO --> CSV["workspace.csv"]
-    WS_REPO --> MANIFEST["manifest.json"]
+### Statistical Analysis
+- explicit workbench
+- analysis code review
+- deterministic execution
+- promotion from Autopilot into editable workbench
 
-    SERVICE --> RUNNER["deterministic_runner.py"]
-    RUNNER --> OUT["Metrics + Tables + Interpretation + Receipt"]
-```
+### Provenance Log
+- auditable record of project actions
 
-### Backend data contracts
+### Bias Audit
+- separate bias/fairness-oriented workflows
 
-The backend uses typed request/response models in [backend/app/models/analysis.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/models/analysis.py):
-- `AnalysisCapabilityRequest` / `AnalysisCapabilityResponse`
-- `AnalysisPlanRequest` / `AnalysisPlanResponse`
-- `WorkspaceBuildRequest` / `WorkspaceBuildResponse`
-- `AnalysisRunRequest` / `AnalysisRunResponse`
-- `AnalysisSpec`
-- `AnalysisExecutionReceipt`
+## Supported Analysis Families
 
-The most important contract is `AnalysisSpec`, because it turns a natural-language question into a deterministic execution request:
-- analysis family
-- endpoint definition
-- treatment variable
-- outcome variable
-- time variable
-- cohort filters
-- interaction terms
-- requested outputs
-
-The `AnalysisExecutionReceipt` is the audit-oriented payload returned with executed analyses. It tells the frontend:
-- which datasets were used
-- which derived columns were created
-- which cohort filters were applied
-- which endpoint/target definition was actually run
-
-## Analysis Execution Model
-
-The app is intentionally hybrid, not purely LLM-driven.
-
-### Path 1: LLM assistance
-
-Used for:
-- general help
-- dataset understanding
-- document Q&A
-- RAG-style retrieval answers
-- methodology explanation
-- user-facing interpretation
-
-### Path 2: local deterministic execution
-
-Used for:
-- some simpler single-dataset analyses
-- lightweight statistical workflows that do not need the row-level FastAPI workspace
-
-### Path 3: FastAPI deterministic execution
-
-Used for:
-- multi-dataset row-level joins
-- advanced endpoint derivations
-- survival workflows
-- multivariable models
-- exploratory ML outputs
-- reusable endpoint templates
-
-### Execution flow for advanced analyses
-
-```mermaid
-flowchart TD
-    Q["User Question"] --> CAP["Capability Check"]
-    CAP --> PLAN["Analysis Plan"]
-    PLAN --> WS["Build Workspace"]
-    WS --> RUN["Run Deterministic Family"]
-    RUN --> RESP["Metrics + Tables + Charts + Narrative"]
-```
-
-### What happens inside workspace building
-
-```mermaid
-flowchart LR
-    DATA["Selected Datasets"] --> ROLE["Infer analysis roles (ADSL / ADAE / ADLB / ADTTE / EX / DS)"]
-    ROLE --> JOIN["Pick required sources for the chosen AnalysisSpec"]
-    JOIN --> FILTER["Apply cohort filters"]
-    FILTER --> DERIVE["Derive endpoint and helper fields"]
-    DERIVE --> MERGE["Merge subject/event/lab/exposure/disposition features"]
-    MERGE --> SAVE["Persist workspace and manifest"]
-```
-
-### Why some answers are very fast
-
-Some advanced answers return quickly because:
-- the question is routed directly to deterministic code
-- the datasets are already small/in-memory
-- the response is generated from computed metrics, not from a long-form LLM completion
-
-Fast does not automatically mean fake. The safer signal is whether the answer explicitly reflects:
-- executed cohort filters
-- the applied treatment grouping
-- the derived endpoint
-- tables/metrics produced by the deterministic engine
-
-## Repository Structure
-
-Top-level structure:
-
-- [App.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/App.tsx): application shell
-- [types.ts](/Users/mikhailnikonorov/Clinical-trial-insight/types.ts): shared app types
-- [components](/Users/mikhailnikonorov/Clinical-trial-insight/components): UI feature surfaces
-- [services](/Users/mikhailnikonorov/Clinical-trial-insight/services): frontend service/orchestration layer
-- [utils](/Users/mikhailnikonorov/Clinical-trial-insight/utils): retrieval, dataset parsing helpers, deterministic client logic
-- [server](/Users/mikhailnikonorov/Clinical-trial-insight/server): Node app server and local persistence layer
-- [backend](/Users/mikhailnikonorov/Clinical-trial-insight/backend): FastAPI analysis backend
-- [backend/tests](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests): Python backend tests and fixtures
-- [docs](/Users/mikhailnikonorov/Clinical-trial-insight/docs): architecture notes, plans, and validation reports
-- [public](/Users/mikhailnikonorov/Clinical-trial-insight/public): static assets
-
-## Supported Analysis Types
-
-The codebase now supports these analysis families through either the local engine or the FastAPI backend:
+The app currently supports, through either the local engine or the FastAPI backend:
 
 - incidence comparison
 - risk difference
 - logistic regression
 - Kaplan-Meier
 - Cox proportional hazards
-- mixed model / repeated-measures style analysis
-- threshold search / early-warning workflow
-- competing risks / cumulative incidence summary
+- mixed model / repeated measures style analysis
+- competing risks summary
+- threshold search
 - feature importance
 - partial dependence
-
-More traditional local analysis support also exists for:
 - t-test
 - chi-square
 - ANOVA
 - linear regression
 - correlation
 
-### Important distinction
+### Important boundary
 
-Not every natural-language question is universally supported just because a family exists.
+A supported family does not mean every natural-language question is fully supported.
 
-Execution depends on:
-- whether the selected datasets expose the required roles
-- whether the needed columns can be inferred or mapped
-- whether the endpoint can be derived from available data
-- whether the requested question matches a supported workflow template
+Execution still depends on:
+- having the right dataset roles
+- having the right columns
+- having a supported endpoint derivation path
+- producing a result that actually matches the user’s question
 
-In other words: the app now supports many real families, but still within a bounded clinical-analytics execution model.
+That is why the system can now return:
+- `matched`
+- `partial exploratory answer`
+- `missing support`
+
+instead of always pretending every analysis was fully answered.
+
+## Repository Structure
+
+- [App.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/App.tsx)
+- [types.ts](/Users/mikhailnikonorov/Clinical-trial-insight/types.ts)
+- [components](/Users/mikhailnikonorov/Clinical-trial-insight/components)
+- [services](/Users/mikhailnikonorov/Clinical-trial-insight/services)
+- [utils](/Users/mikhailnikonorov/Clinical-trial-insight/utils)
+- [server](/Users/mikhailnikonorov/Clinical-trial-insight/server)
+- [backend](/Users/mikhailnikonorov/Clinical-trial-insight/backend)
+- [backend/tests](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests)
+- [docs](/Users/mikhailnikonorov/Clinical-trial-insight/docs)
+- [public](/Users/mikhailnikonorov/Clinical-trial-insight/public)
 
 ## Local Development
 
@@ -473,184 +594,115 @@ In other words: the app now supports many real families, but still within a boun
 - npm 10+
 - Python 3.12+ recommended
 
-### Install JavaScript dependencies
+### Install frontend dependencies
 
 ```bash
 npm install
 ```
 
-### Install Python dependencies
+### Install backend dependencies
 
 ```bash
-python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
+npm run api:setup
 ```
+
+This creates `.venv` and installs Python requirements from [requirements.txt](/Users/mikhailnikonorov/Clinical-trial-insight/requirements.txt).
 
 ### Start the full local stack
 
 ```bash
-npm run api:setup
 npm run dev
 ```
 
-This launches:
-- the Node/Vite application shell on port `3000` by default
-- the FastAPI backend on port `8000`
-
-If `3000` is already in use:
+If port `3000` is already in use:
 
 ```bash
 PORT=3100 npm run dev
 ```
 
-### Run only the FastAPI backend
+### Start only the FastAPI backend
 
 ```bash
 npm run api:dev
 ```
 
-### Run FastAPI with autoreload
+### Start FastAPI with reload
 
 ```bash
 npm run api:watch
 ```
 
-### Build the frontend
+### Build the app
 
 ```bash
 npm run build
 ```
 
-### Run the built app locally
+### Run production mode locally
 
 ```bash
 npm run start
 ```
 
-## Environment Variables
-
-Typical local variables:
-
-```bash
-GEMINI_API_KEY=your_key_here
-PORT=3000
-ECP_ENV=development
-VITE_FASTAPI_BASE_URL=http://localhost:8000/api/v1
-```
-
-Useful optional variables:
-
-- `ECP_FASTAPI_URL`
-  - Node proxy target for the FastAPI backend
-- `ECP_PYTHON_BIN`
-  - override Python binary used for SAS parsing
-
 ## Testing And Validation
 
-### Frontend/unit tests
+### Frontend / TypeScript tests
 
 ```bash
 npm test
 ```
 
-### Python backend tests
+### FastAPI backend tests
 
 ```bash
 npm run api:test
 ```
 
-### Generate backend reference validation report
+### Backend reference validation report
 
 ```bash
 npm run api:benchmark
 ```
 
-Relevant validation assets:
-- [backend/tests/test_reference_validation.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_reference_validation.py)
+Relevant validation modules:
 - [backend/tests/test_analysis_service.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_analysis_service.py)
 - [backend/tests/test_workspace_builder.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_workspace_builder.py)
-- [docs/reference-validation-report.md](/Users/mikhailnikonorov/Clinical-trial-insight/docs/reference-validation-report.md)
+- [backend/tests/test_reference_validation.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/tests/test_reference_validation.py)
+- [services/deterministicAnalysisFormatter.test.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/deterministicAnalysisFormatter.test.ts)
+- [utils/questionSupport.test.ts](/Users/mikhailnikonorov/Clinical-trial-insight/utils/questionSupport.test.ts)
+- [utils/datasetProfile.test.ts](/Users/mikhailnikonorov/Clinical-trial-insight/utils/datasetProfile.test.ts)
 
-## Current Strengths And Limits
+## Architecture Strengths
 
-### Strengths
+- real deterministic backend execution exists for advanced analysis families
+- the app has explicit `capabilities -> plan -> workspace -> run` stages
+- the system no longer has to fabricate advanced outputs from pure chat reasoning
+- partial and failed question matches are now surfaced more honestly
+- execution receipts make advanced analyses auditable
+- AI Chat, Autopilot, Statistical Analysis, and ETL now have clearer distinct roles
+- AI-suggested questions are gated by deterministic support checks before they are shown or run
+- saved Autopilot runs are now browsable and deletable as explicit run groups
 
-- real deterministic backend execution exists for multiple advanced families
-- the app has explicit capability/plan/workspace/run stages for safer execution
-- AI Chat no longer has to fabricate advanced charts when deterministic execution is required
-- project persistence is backend-backed instead of browser-only
-- analysis workspaces are now file-backed and can be reloaded across backend service instances
-- SAS ingestion is supported through a server-side Python path
-- the UI now supports saved-run review in Autopilot and structured workbench analysis in Statistical Analysis
-- deterministic results can include an execution receipt describing cohort, endpoint, variables, and derived fields
+## Current Limits
 
-### Important limits
-
-- question planning still relies heavily on heuristic classification and endpoint templates
-- the frontend has several oversized orchestration files, especially:
+- some large orchestration files still exist, especially:
   - [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
   - [components/Statistics.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Statistics.tsx)
-  - [services/geminiService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/geminiService.ts)
-- workspace persistence is file-backed for local use, but it is not yet a multi-user database-backed repository
-- backend test depth is still lighter than ideal for the number of supported families
-- this is a strong clinical analytics POC, not yet a fully general production-grade clinical platform
-
-## Deployment Model In This Repo
-
-This repository is optimized for:
-- local development
-- local pilot use
-- single-user or small-team prototype workflows
-
-It is not yet a full enterprise deployment package.
-
-### What is already in place
-
-- server-side AI boundary
-- server-side persistence boundary
-- Python backend for clinical/statistical execution
-- report generation
-- provenance-oriented workflow concepts
-
-### What would still be needed for enterprise hardening
-
-- real database-backed metadata storage
-- object storage for artifacts
-- authentication and authorization enforcement
-- async job execution for heavier analyses
-- persistent workspace storage
-- stronger validation and governance workflows
-- CI/CD and production observability
-
-## Recommended Reading Inside The Repo
-
-- [docs/react-fastapi-development-plan.md](/Users/mikhailnikonorov/Clinical-trial-insight/docs/react-fastapi-development-plan.md)
-- [docs/reference-validation-report.md](/Users/mikhailnikonorov/Clinical-trial-insight/docs/reference-validation-report.md)
-- [backend/app/services/analysis_service.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/analysis_service.py)
-- [backend/app/services/workspace_builder.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/workspace_builder.py)
-- [backend/app/services/deterministic_runner.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/deterministic_runner.py)
-- [services/geminiService.ts](/Users/mikhailnikonorov/Clinical-trial-insight/services/geminiService.ts)
-- [components/Statistics.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Statistics.tsx)
-- [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
+- backend test depth is better than before but still lighter than ideal relative to total analysis complexity
+- workspace persistence is file-backed for local use, not a multi-user database architecture
+- chunking is still heavy in the frontend build
+- question planning still uses a mix of heuristics, templates, and LLM assistance rather than a single unified planner
 
 ## Summary
 
-This repo is best understood as a hybrid clinical analytics application:
-- React/TypeScript for user experience
-- Node for app-shell serving, persistence, AI proxying, and local orchestration
-- FastAPI/Python for row-level workspace construction and deterministic clinical/statistical execution
+Evidence CoPilot is best understood as:
 
-That split is the key architectural decision in the current codebase, and it explains how the app can combine:
-- AI chat and retrieval
-- deterministic analysis
-- multi-dataset clinical derivations
-- exportable analytical outputs
+- a clinical analytics workbench
+- with AI planning and explanation on top
+- and deterministic execution underneath
 
-If you are onboarding to the codebase, start with:
-1. [App.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/App.tsx)
-2. [components/Analysis.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Analysis.tsx)
-3. [components/Statistics.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Statistics.tsx)
-4. [components/Autopilot.tsx](/Users/mikhailnikonorov/Clinical-trial-insight/components/Autopilot.tsx)
-5. [server/index.js](/Users/mikhailnikonorov/Clinical-trial-insight/server/index.js)
-6. [backend/app/main.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/main.py)
-7. [backend/app/services/analysis_service.py](/Users/mikhailnikonorov/Clinical-trial-insight/backend/app/services/analysis_service.py)
+That distinction is the key to understanding the codebase:
+
+- `LLM` helps the user think
+- `deterministic code` produces the answer
+- `receipts and validation` decide whether the result is a strong match, a partial exploratory answer, or not good enough yet

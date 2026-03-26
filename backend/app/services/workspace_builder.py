@@ -306,6 +306,23 @@ def _build_ae_workspace(
     if "AE_TIME_TO_RESOLUTION" in workspace.columns:
         workspace["AE_TIME_TO_RESOLUTION"] = pd.to_numeric(workspace["AE_TIME_TO_RESOLUTION"], errors="coerce")
         workspace["AE_RESOLUTION_EVENT"] = pd.to_numeric(workspace["AE_RESOLUTION_EVENT"], errors="coerce").fillna(0).astype(int)
+        resolution_censor_source = pd.Series([float("nan")] * len(workspace), index=workspace.index, dtype="float64")
+        if "EX_LAST_EXPOSURE_DAY" in workspace.columns:
+            resolution_censor_source = pd.to_numeric(workspace["EX_LAST_EXPOSURE_DAY"], errors="coerce")
+        if resolution_censor_source.isna().all() and ae_metadata.get("max_followup_day") is not None:
+            resolution_censor_source = pd.Series(
+                [float(ae_metadata["max_followup_day"])] * len(workspace), index=workspace.index, dtype="float64"
+            )
+        if "AE_FIRST_QUALIFYING_DAY_DETAIL" in workspace.columns:
+            onset_day = pd.to_numeric(workspace["AE_FIRST_QUALIFYING_DAY_DETAIL"], errors="coerce")
+        else:
+            onset_day = pd.to_numeric(workspace.get("AE_FIRST_QUALIFYING_DAY"), errors="coerce")
+        unresolved_mask = workspace["AE_RESOLUTION_EVENT"] == 0
+        if unresolved_mask.any():
+            censor_duration = resolution_censor_source - onset_day
+            censor_duration = pd.to_numeric(censor_duration, errors="coerce")
+            censor_duration = censor_duration.where(censor_duration > 0)
+            workspace.loc[unresolved_mask & workspace["AE_TIME_TO_RESOLUTION"].isna(), "AE_TIME_TO_RESOLUTION"] = censor_duration
         resolution_time_column = "AE_TIME_TO_RESOLUTION"
         resolution_event_column = "AE_RESOLUTION_EVENT"
         derived_columns.extend(["AE_TIME_TO_RESOLUTION", "AE_RESOLUTION_EVENT"])
@@ -320,7 +337,7 @@ def _build_ae_workspace(
         workspace = workspace[workspace["AE_OUTCOME_FLAG"] == 1].copy()
         survival_time_column = resolution_time_column
         survival_event_column = resolution_event_column
-        notes.append("Filtered workspace to subjects with qualifying adverse events for time-to-resolution modeling.")
+        notes.append("Filtered workspace to subjects with qualifying adverse events for time-to-resolution modeling and preserved unresolved qualifying events as censored rows when follow-up timing was available.")
     elif spec and spec.target_definition == "later_treatment_discontinuation":
         if "DS_DISCONTINUATION_FLAG" not in workspace.columns:
             raise ValueError(
@@ -381,7 +398,7 @@ def _build_ae_workspace(
     metadata: dict[str, str | int | list[str] | None] = {
         "subject_id_column": subject_id_col,
         "treatment_column": treatment_col,
-        "outcome_column": "AE_OUTCOME_FLAG",
+        "outcome_column": resolution_event_column if spec and spec.target_definition == "time_to_resolution_grade_2_plus_dae" else "AE_OUTCOME_FLAG",
         "survival_time_column": survival_time_column,
         "survival_event_column": survival_event_column,
         "competing_time_column": competing_time_column,
@@ -686,6 +703,11 @@ def _derive_ae_subject_summary(
         "time_window_days": time_window_days,
         "term_filters": term_filters,
         "max_observed_day": int(frame["__DAY_NUM__"].max()) if day_col is not None and frame["__DAY_NUM__"].notna().any() else None,
+        "max_followup_day": int(frame["__END_DAY_NUM__"].max())
+        if end_day_col is not None and frame["__END_DAY_NUM__"].notna().any()
+        else int(frame["__DAY_NUM__"].max())
+        if day_col is not None and frame["__DAY_NUM__"].notna().any()
+        else None,
     }
     return subject_summary, metadata, notes
 

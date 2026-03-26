@@ -488,7 +488,7 @@ const App: React.FC = () => {
               // Clinical Trial Workflow: Rigid Mapping & Pipelines
               engineeringItems.push(
                   { view: View.MAPPING, icon: Map, label: 'Mapping Specs (SDTM)' },
-                  { view: View.TRANSFORMATION, icon: GitMerge, label: 'ETL Pipeline' }
+                  { view: View.TRANSFORMATION, icon: GitMerge, label: 'ETL Pipeline', helper: 'Prepare and standardize data for analysis' }
               );
           } else {
               // RWE Workflow: Cohort Building & Filtering
@@ -508,9 +508,9 @@ const App: React.FC = () => {
           groups.push({
               title: 'Clinical Intelligence',
               items: [
-                  { view: View.ANALYSIS, icon: MessageSquareText, label: 'AI Insights Chat', helper: 'Help me understand what to do and what happened' },
-                  { view: View.AUTOPILOT, icon: Bot, label: 'AI Autopilot', helper: 'Do work for me' },
-                  { view: View.STATISTICS, icon: BarChart2, label: 'Statistical Analysis', helper: 'Let me control the work' },
+                  { view: View.ANALYSIS, icon: MessageSquareText, label: 'AI Insights Chat', helper: 'Explore what the data can answer next' },
+                  { view: View.AUTOPILOT, icon: Bot, label: 'AI Autopilot', helper: 'Run a guided first-pass workflow' },
+                  { view: View.STATISTICS, icon: BarChart2, label: 'Statistical Analysis', helper: 'Control and review the final analysis' },
                   { view: View.BIAS_AUDIT, icon: Scale, label: 'Bias Audit' },
               ]
           });

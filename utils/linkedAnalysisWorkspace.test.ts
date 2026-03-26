@@ -72,6 +72,62 @@ describe('linkedAnalysisWorkspace', () => {
     ).toBe(true);
   });
 
+  it('avoids near-duplicate mean and max variants of the same signal family', () => {
+    const workspaceFile = makeFile(
+      'workspace_duplicate_signals.csv',
+      [
+        'USUBJID,TRT_ARM,EARLY_RASH__MEAN,EARLY_RASH__MAX,EARLY_PRURITUS__MEAN,EARLY_PRURITUS__MAX',
+        'S1,Arm A,1,2,0,1',
+        'S2,Arm B,0,1,1,2',
+        'S3,Arm A,2,3,0,1',
+        'S4,Arm B,1,1,2,3',
+      ].join('\n')
+    );
+
+    const tasks = buildExploratorySignalTasks(workspaceFile, 6);
+    const var2s = tasks.map((task) => task.var2);
+
+    expect(var2s.filter((value) => value.startsWith('EARLY_RASH')).length).toBeLessThanOrEqual(1);
+    expect(var2s.filter((value) => value.startsWith('EARLY_PRURITUS')).length).toBeLessThanOrEqual(1);
+  });
+
+  it('does not repeat the same arm-style grouping semantics across duplicate columns', () => {
+    const workspaceFile = makeFile(
+      'workspace_duplicate_groups.csv',
+      [
+        'USUBJID,ARM,DM__ARM__MODE,AE__ARM__MODE,EARLY_RASH__MEAN,EARLY_PRURITUS__MEAN',
+        'S1,Arm A,Arm A,Arm A,1,0',
+        'S2,Arm B,Arm B,Arm B,0,1',
+        'S3,Arm A,Arm A,Arm A,2,0',
+        'S4,Arm B,Arm B,Arm B,1,2',
+      ].join('\n')
+    );
+
+    const tasks = buildExploratorySignalTasks(workspaceFile, 6);
+    const armComparisons = tasks.filter((task) =>
+      ['ARM', 'DM__ARM__MODE', 'AE__ARM__MODE'].includes(task.var1)
+    );
+
+    expect(armComparisons.length).toBeLessThanOrEqual(2);
+  });
+
+  it('can include a non-group exploratory association in the pack', () => {
+    const workspaceFile = makeFile(
+      'workspace_numeric_association.csv',
+      [
+        'USUBJID,TRT_ARM,LAB_ALP__MEAN,AE_QUALIFYING_EVENT_COUNT,EX_DOSE__MEAN',
+        'S1,Arm A,10,1,100',
+        'S2,Arm B,15,2,120',
+        'S3,Arm A,20,3,150',
+        'S4,Arm B,25,4,180',
+      ].join('\n')
+    );
+
+    const tasks = buildExploratorySignalTasks(workspaceFile, 6);
+
+    expect(tasks.some((task) => task.testType === StatTestType.CORRELATION)).toBe(true);
+  });
+
   it('adds adjusted p-values to exploratory sessions', () => {
     const baseSession = (id: string, pValue: string): AnalysisSession => ({
       id,

@@ -93,6 +93,109 @@ class AnalysisServicePersistenceTests(unittest.TestCase):
         self.assertGreaterEqual(len(run_response.receipt.source_names), 2)
         self.assertIn("AE_OUTCOME_FLAG", run_response.receipt.derived_columns)
 
+    def test_time_to_resolution_cox_falls_back_to_dense_predictor_subset(self) -> None:
+        adsl_rows = ["USUBJID,TRT01A,AGE,SEX,RACE"]
+        adae_rows = ["USUBJID,AETERM,AETOXGR,AESTDY,AEENDY"]
+        for index in range(1, 13):
+            treatment = "Enhanced DM" if index <= 6 else "SoC DM"
+            if index <= 6:
+                age = str(60 + index)
+                sex = ""
+                race = "ASIAN"
+            else:
+                age = ""
+                sex = "F" if index % 2 == 0 else "M"
+                race = "WHITE" if index % 2 == 0 else "ASIAN"
+            adsl_rows.append(f"{index:02d},{treatment},{age},{sex},{race}")
+            adae_rows.append(f"{index:02d},Rash,{2 if index % 3 else 3},{8 + index},{18 + index}")
+
+        sparse_datasets = [
+            DatasetReference(
+                file_id="adsl_sparse",
+                name="adsl_sparse.csv",
+                role="ADSL",
+                column_names=["USUBJID", "TRT01A", "AGE", "SEX", "RACE"],
+                content="\n".join(adsl_rows),
+            ),
+            DatasetReference(
+                file_id="adae_sparse",
+                name="adae_sparse.csv",
+                role="ADAE",
+                column_names=["USUBJID", "AETERM", "AETOXGR", "AESTDY", "AEENDY"],
+                content="\n".join(adae_rows),
+            ),
+        ]
+
+        service = AnalysisService()
+        response = service.run_analysis(
+            AnalysisRunRequest(
+                question=(
+                    "Among participants who develop Grade >=2 DAEIs, what factors predict time to resolution "
+                    "(faster vs slower recovery), and do these predictors differ by arm?"
+                ),
+                datasets=sparse_datasets,
+            )
+        )
+
+        self.assertTrue(response.executed)
+        self.assertEqual(response.analysis_family, "cox")
+        self.assertTrue(any("Reduced the Cox predictor set" in warning for warning in response.warnings))
+
+    def test_time_to_resolution_receipt_uses_resolution_event_and_keeps_censored_rows(self) -> None:
+        adsl_rows = ["USUBJID,TRT01A,AGE,SEX,RACE"]
+        adae_rows = ["USUBJID,AETERM,AETOXGR,AESTDY,AEENDY"]
+        adex_rows = ["USUBJID,EXSTDY,EXENDY,EXDOSE"]
+        for index in range(1, 13):
+            treatment = "Enhanced DM" if index <= 6 else "SoC DM"
+            adsl_rows.append(f"{index:02d},{treatment},{58 + index},{'F' if index % 2 == 0 else 'M'},{'ASIAN' if index % 3 else 'WHITE'}")
+            ae_end = "" if index in {3, 9} else str(16 + index)
+            adae_rows.append(f"{index:02d},Rash,{2 if index % 4 else 3},{6 + index},{ae_end}")
+            adex_rows.append(f"{index:02d},1,{26 + index},{700 if index <= 6 else 1050}")
+
+        datasets = [
+            DatasetReference(
+                file_id="adsl_resolution",
+                name="adsl_resolution.csv",
+                role="ADSL",
+                column_names=["USUBJID", "TRT01A", "AGE", "SEX", "RACE"],
+                content="\n".join(adsl_rows),
+            ),
+            DatasetReference(
+                file_id="adae_resolution",
+                name="adae_resolution.csv",
+                role="ADAE",
+                column_names=["USUBJID", "AETERM", "AETOXGR", "AESTDY", "AEENDY"],
+                content="\n".join(adae_rows),
+            ),
+            DatasetReference(
+                file_id="adex_resolution",
+                name="adex_resolution.csv",
+                role="ADEX",
+                column_names=["USUBJID", "EXSTDY", "EXENDY", "EXDOSE"],
+                content="\n".join(adex_rows),
+            ),
+        ]
+
+        service = AnalysisService()
+        response = service.run_analysis(
+            AnalysisRunRequest(
+                question=(
+                    "Among participants who develop Grade >=2 DAEIs, what factors predict time to resolution "
+                    "(faster vs slower recovery), and do these predictors differ by arm?"
+                ),
+                datasets=datasets,
+            )
+        )
+
+        self.assertTrue(response.executed)
+        self.assertEqual(response.analysis_family, "cox")
+        self.assertIsNotNone(response.receipt)
+        self.assertEqual(response.receipt.outcome_variable, "AE_RESOLUTION_EVENT")
+        metric_map = {metric.name: metric.value for metric in response.metrics}
+        self.assertEqual(metric_map.get("subjects_used"), 12)
+        self.assertEqual(metric_map.get("non_event_subjects"), 2)
+        self.assertFalse(any("did not include censored subjects" in warning for warning in response.warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -313,6 +313,39 @@ const keywordScore = (header: string) => {
   return score;
 };
 
+const stripAggregateSuffix = (value: string) =>
+  value
+    .replace(/__(MEAN|MAX|MODE|TERMS|PRESENT)$/i, '')
+    .replace(/_MEAN$|_MAX$|_MODE$|_TERMS$|_PRESENT$/i, '');
+
+const semanticStem = (header: string) => {
+  const parts = header.split('__').filter(Boolean);
+  const lastPart = parts[parts.length - 1] || '';
+  const lastIsAggregate = /^(MEAN|MAX|MODE|TERMS|PRESENT)$/i.test(lastPart);
+  if (parts.length >= 3) {
+    const candidate = lastIsAggregate ? parts[parts.length - 2] : parts[parts.length - 1];
+    return sanitizeToken(stripAggregateSuffix(candidate)).toUpperCase();
+  }
+  if (parts.length === 2) {
+    const candidate = lastIsAggregate ? parts[0] : parts[1];
+    return sanitizeToken(stripAggregateSuffix(candidate)).toUpperCase();
+  }
+  return sanitizeToken(stripAggregateSuffix(header)).toUpperCase();
+};
+
+const scoreGroupColumnCandidate = (header: string) => {
+  const upper = header.toUpperCase();
+  let score = keywordScore(header);
+  if (!header.includes('__')) score += 10;
+  if (/ARM|TRT|TREATMENT|GROUP|COHORT/.test(upper)) score += 10;
+  if (/SEX|RACE|ETHNIC|AGEGR|WEIGHT_TIER/.test(upper)) score += 4;
+  if (/__MODE$/.test(upper)) score -= 1;
+  if (/^WORKSPACE_/.test(upper)) score -= 8;
+  if (/^SDTM_/.test(upper)) score -= 3;
+  score -= Math.min(header.length, 80) / 100;
+  return score;
+};
+
 export const buildExploratorySignalTasks = (
   workspaceFile: ClinicalFile,
   maxTasks = 6
@@ -320,18 +353,42 @@ export const buildExploratorySignalTasks = (
   const { headers, rows } = parseCsv(workspaceFile.content);
   if (headers.length === 0 || rows.length === 0) return [];
 
-  const groupColumns = headers.filter((header) => isCandidateGroupColumn(rows, header));
+  const groupedGroupColumns = new Map<string, { header: string; score: number }>();
+  headers
+    .filter((header) => isCandidateGroupColumn(rows, header))
+    .forEach((header) => {
+      const stem = semanticStem(header);
+      const score = scoreGroupColumnCandidate(header);
+      const existing = groupedGroupColumns.get(stem);
+      if (!existing || score > existing.score) {
+        groupedGroupColumns.set(stem, { header, score });
+      }
+    });
+  const groupColumns = Array.from(groupedGroupColumns.values()).map((entry) => entry.header);
   const categoricalOutcomes = headers.filter((header) => isCandidateCategoricalOutcome(rows, header));
   const numericOutcomes = headers.filter((header) => isCandidateNumericOutcome(rows, header));
 
-  const candidates: Array<AutopilotAnalysisTask & { score: number }> = [];
+  const candidates: Array<
+    AutopilotAnalysisTask & {
+      score: number;
+      groupDomain: string;
+      outcomeDomain: string;
+      signalKey: string;
+    }
+  > = [];
   const seen = new Set<string>();
 
-  const pushCandidate = (task: Omit<AutopilotAnalysisTask, 'id'>, score: number) => {
+  const pushCandidate = (
+    task: Omit<AutopilotAnalysisTask, 'id'>,
+    score: number,
+    groupDomain: string,
+    outcomeDomain: string,
+    signalKey: string
+  ) => {
     const key = `${task.testType}|${task.var1}|${task.var2}`;
     if (task.var1 === task.var2 || seen.has(key)) return;
     seen.add(key);
-    candidates.push({ id: crypto.randomUUID(), ...task, score });
+    candidates.push({ id: crypto.randomUUID(), ...task, score, groupDomain, outcomeDomain, signalKey });
   };
 
   groupColumns.forEach((groupColumn) => {
@@ -356,7 +413,10 @@ export const buildExploratorySignalTasks = (
           var2: outcomeColumn,
           rationale: 'Cross-domain exploratory categorical association in linked workspace.',
         },
-        score
+        score,
+        groupDomain,
+        outcomeDomain,
+        `${semanticStem(groupColumn)}|${semanticStem(outcomeColumn)}`
       );
     });
 
@@ -378,15 +438,75 @@ export const buildExploratorySignalTasks = (
           var2: outcomeColumn,
           rationale: 'Cross-domain exploratory numeric signal scan in linked workspace.',
         },
-        score
+        score,
+        groupDomain,
+        outcomeDomain,
+        `${semanticStem(groupColumn)}|${semanticStem(outcomeColumn)}`
       );
     });
   });
 
-  return candidates
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxTasks)
-    .map(({ score, ...task }) => task);
+  const groupedNumericCandidates = numericOutcomes.filter((header) => groupColumns.indexOf(header) === -1);
+  groupedNumericCandidates.forEach((leftColumn) => {
+    const leftDomain = domainFromHeader(leftColumn);
+    groupedNumericCandidates.forEach((rightColumn) => {
+      if (leftColumn === rightColumn) return;
+      const rightDomain = domainFromHeader(rightColumn);
+      if (leftDomain === rightDomain) return;
+
+      const signalKey = [semanticStem(leftColumn), semanticStem(rightColumn)].sort().join('|');
+      const score = keywordScore(leftColumn) + keywordScore(rightColumn) + 5;
+
+      pushCandidate(
+        {
+          label: formatComparisonLabel(leftColumn, rightColumn),
+          question: `Is ${formatDisplayName(rightColumn).toLowerCase()} associated with ${formatDisplayName(leftColumn).toLowerCase()}?`,
+          testType: StatTestType.CORRELATION,
+          var1: leftColumn,
+          var2: rightColumn,
+          rationale: 'Cross-domain exploratory numeric association in linked workspace.',
+        },
+        score,
+        leftDomain,
+        rightDomain,
+        signalKey
+      );
+    });
+  });
+
+  const ranked = candidates.sort((a, b) => b.score - a.score);
+  const selected: typeof ranked = [];
+  const usedSignalKeys = new Set<string>();
+  const usedVar1Stems = new Map<string, number>();
+  const usedVar2Stems = new Set<string>();
+  const usedDomainPairs = new Map<string, number>();
+  const usedTestTypes = new Map<StatTestType, number>();
+
+  for (const candidate of ranked) {
+    if (selected.length >= maxTasks) break;
+    if (usedSignalKeys.has(candidate.signalKey)) continue;
+    const candidateVar1Stem = semanticStem(candidate.var1);
+    const candidateVar2Stem = semanticStem(candidate.var2);
+    if (usedVar2Stems.has(candidateVar2Stem)) continue;
+
+    const domainPairKey = [candidate.groupDomain, candidate.outcomeDomain].sort().join('|');
+    const domainPairCount = usedDomainPairs.get(domainPairKey) || 0;
+    const testTypeCount = usedTestTypes.get(candidate.testType) || 0;
+    const var1Count = usedVar1Stems.get(candidateVar1Stem) || 0;
+
+    if (domainPairCount >= 2 && testTypeCount >= 2) continue;
+    if (candidate.testType === StatTestType.CORRELATION && testTypeCount >= 2) continue;
+    if (var1Count >= 2) continue;
+
+    selected.push(candidate);
+    usedSignalKeys.add(candidate.signalKey);
+    usedVar1Stems.set(candidateVar1Stem, var1Count + 1);
+    usedVar2Stems.add(candidateVar2Stem);
+    usedDomainPairs.set(domainPairKey, domainPairCount + 1);
+    usedTestTypes.set(candidate.testType, testTypeCount + 1);
+  }
+
+  return selected.map(({ score, groupDomain, outcomeDomain, signalKey, ...task }) => task);
 };
 
 export const applyBenjaminiHochbergAdjustments = (

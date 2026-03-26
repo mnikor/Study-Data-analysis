@@ -78,9 +78,9 @@ def run_incidence_analysis(
 
     warnings: list[str] = []
     interpretation = (
-        f"Computed subject-level incidence by treatment within the filtered cohort ({cohort_summary}) from the row-level FastAPI workspace."
+        f"Computed subject-level incidence by treatment within the filtered cohort ({cohort_summary}) from the row-level analysis workspace."
         if cohort_summary
-        else "Computed subject-level incidence by treatment from the row-level FastAPI workspace."
+        else "Computed subject-level incidence by treatment from the row-level analysis workspace."
     )
 
     if grouped.shape[0] == 2:
@@ -130,7 +130,7 @@ def run_incidence_analysis(
         metrics=metrics,
         table=table,
         warnings=warnings,
-        explanation="Deterministic incidence analysis executed on the FastAPI workspace.",
+        explanation="Deterministic incidence analysis executed on the analysis workspace.",
     )
 
 
@@ -258,7 +258,7 @@ def run_logistic_regression(
         metrics=metrics,
         table=table,
         warnings=warnings,
-        explanation="Deterministic logistic regression executed on the FastAPI workspace.",
+        explanation="Deterministic logistic regression executed on the analysis workspace.",
     )
 
 
@@ -293,6 +293,9 @@ def _select_logistic_covariates(
         "line",
         "prior",
     )
+    management_prefixes = ("DS_", "CM_", "MH_", "VS_", "MP_")
+    event_derived_candidates: list[str] = []
+    secondary_candidates: list[str] = []
 
     for column in workspace.columns:
         normalized = _normalize_column_name(column)
@@ -306,6 +309,12 @@ def _select_logistic_covariates(
         if column.startswith("EX_"):
             selected.append(column)
             continue
+        if column.startswith(management_prefixes):
+            selected.append(column)
+            continue
+        if any(token in normalized for token in priority_tokens):
+            selected.append(column)
+            continue
         if column.startswith("AE_") and not any(
             token in column
             for token in (
@@ -316,15 +325,23 @@ def _select_logistic_covariates(
                 "RESOLUTION_EVENT",
             )
         ):
-            selected.append(column)
+            event_derived_candidates.append(column)
             continue
-        if any(token in normalized for token in priority_tokens):
-            selected.append(column)
+        secondary_candidates.append(column)
 
     deduped: list[str] = []
     for column in selected:
         if column not in deduped:
             deduped.append(column)
+    for column in secondary_candidates:
+        if column not in deduped:
+            deduped.append(column)
+    if len(deduped) < 3:
+        for column in event_derived_candidates:
+            if column not in deduped:
+                deduped.append(column)
+            if len(deduped) >= 10:
+                break
     return deduped[:16]
 
 
@@ -342,6 +359,73 @@ def _prepare_predictor_series(series: pd.Series) -> pd.Series | None:
 
 def _normalize_column_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _matches_treatment_predictor(column: str, treatment_col: str) -> bool:
+    normalized_treatment = _normalize_column_name(treatment_col)
+    normalized_column = _normalize_column_name(column)
+    return bool(normalized_treatment and normalized_treatment in normalized_column)
+
+
+def _complete_case_survival_frame(
+    model_frame: pd.DataFrame,
+    predictor_frame: pd.DataFrame,
+    time_col: str,
+    event_col: str,
+) -> pd.DataFrame:
+    combined = pd.concat([model_frame[[time_col, event_col]], predictor_frame], axis=1).dropna()
+    combined[event_col] = combined[event_col].astype(int)
+    combined = combined[(combined[event_col].isin([0, 1])) & (combined[time_col] > 0)]
+    return combined
+
+
+def _select_dense_predictor_subset(
+    predictor_frame: pd.DataFrame,
+    treatment_col: str,
+    min_complete_rows: int = 12,
+    max_predictors: int = 8,
+) -> tuple[list[str], int]:
+    if predictor_frame.empty:
+        return [], 0
+
+    ordered_columns = sorted(
+        predictor_frame.columns,
+        key=lambda column: (
+            0 if _matches_treatment_predictor(column, treatment_col) else 1,
+            -float(predictor_frame[column].notna().mean()),
+            -int(predictor_frame[column].dropna().nunique()),
+            column,
+        ),
+    )
+
+    selected: list[str] = []
+    best_subset: list[str] = []
+    best_rows = 0
+
+    for column in ordered_columns:
+        if len(selected) >= max_predictors:
+            break
+        trial_subset = selected + [column]
+        trial_rows = int(predictor_frame[trial_subset].dropna().shape[0])
+        if trial_rows == 0:
+            continue
+        if not selected or trial_rows >= min_complete_rows:
+            selected = trial_subset
+            best_subset = trial_subset
+            best_rows = trial_rows
+            continue
+        if trial_rows > best_rows:
+            best_subset = trial_subset
+            best_rows = trial_rows
+
+    if not best_subset:
+        for column in ordered_columns:
+            trial_rows = int(predictor_frame[[column]].dropna().shape[0])
+            if trial_rows > best_rows:
+                best_subset = [column]
+                best_rows = trial_rows
+
+    return best_subset, best_rows
 
 
 def _apply_interaction_terms(
@@ -508,7 +592,7 @@ def run_kaplan_meier_analysis(
         executed=True,
         analysis_family=analysis_family,  # type: ignore[arg-type]
         workspace_id=workspace_id,
-        interpretation="Computed Kaplan-Meier group summaries with a log-rank comparison from the FastAPI survival workspace.",
+        interpretation="Computed Kaplan-Meier group summaries with a log-rank comparison.",
         metrics=metrics,
         table=AnalysisTable(
             title="Kaplan-Meier summary by treatment group",
@@ -516,7 +600,7 @@ def run_kaplan_meier_analysis(
             rows=rows,
         ),
         warnings=["Kaplan-Meier output currently returns group summaries rather than a full survival-curve table."],
-        explanation="Deterministic Kaplan-Meier analysis executed on the FastAPI workspace.",
+        explanation="Deterministic Kaplan-Meier analysis executed successfully.",
     )
 
 
@@ -552,11 +636,39 @@ def run_cox_analysis(
         raise ValueError("All candidate Cox predictors were constant or missing after preprocessing.")
 
     predictor_frame = pd.DataFrame(prepared_predictors, index=model_frame.index)
-    combined = pd.concat([model_frame[[time_col, event_col]], predictor_frame], axis=1).dropna()
-    combined[event_col] = combined[event_col].astype(int)
-    combined = combined[(combined[event_col].isin([0, 1])) & (combined[time_col] > 0)]
+    combined = _complete_case_survival_frame(model_frame, predictor_frame, time_col, event_col)
     if combined.empty:
-        raise ValueError("Cox regression has no complete-case rows after applying time/event and predictor requirements.")
+        dense_subset, dense_rows = _select_dense_predictor_subset(predictor_frame, treatment_col)
+        if dense_subset:
+            reduced_predictor_frame = predictor_frame[dense_subset].copy()
+            reduced_combined = _complete_case_survival_frame(model_frame, reduced_predictor_frame, time_col, event_col)
+            if not reduced_combined.empty:
+                dropped_predictors = [column for column in predictor_frame.columns if column not in dense_subset]
+                warnings.append(
+                    "Reduced the Cox predictor set from "
+                    f"{predictor_frame.shape[1]} to {len(dense_subset)} column(s) because the full merged predictor set "
+                    "produced no complete-case rows."
+                )
+                if dropped_predictors:
+                    warnings.append(
+                        "Dropped sparse predictors for the fallback Cox model: "
+                        + ", ".join(dropped_predictors[:6])
+                        + ("..." if len(dropped_predictors) > 6 else "")
+                    )
+                warnings.append(
+                    f"The simplified Cox model retained {int(reduced_combined.shape[0])} analyzable subject row(s) after complete-case filtering."
+                )
+                predictor_frame = reduced_predictor_frame
+                combined = reduced_combined
+            else:
+                raise ValueError(
+                    "Cox regression had no analyzable subject rows after merging time-to-event fields with candidate predictors. "
+                    f"Even a reduced fallback predictor set only retained {dense_rows} complete-case row(s)."
+                )
+        else:
+            raise ValueError(
+                "Cox regression had no analyzable subject rows after merging time-to-event fields with candidate predictors."
+            )
     if combined[event_col].sum() == 0:
         raise ValueError("Cox regression requires at least one observed event in the analysis subset.")
 
@@ -594,12 +706,20 @@ def run_cox_analysis(
             }
         )
 
+    concordance_value: float | str
+    try:
+        concordance_value = round(float(fitter.concordance_index_), 6)
+    except ZeroDivisionError:
+        concordance_value = "not estimable"
+        warnings.append("Concordance index was not estimable for the fitted Cox model because no admissible subject pairs remained.")
+
     metrics = [
         AnalysisMetric(name="analysis_method", value="cox_proportional_hazards"),
         AnalysisMetric(name="subjects_used", value=int(cox_frame.shape[0])),
         AnalysisMetric(name="event_subjects", value=int(cox_frame[event_col].sum())),
+        AnalysisMetric(name="non_event_subjects", value=int(cox_frame.shape[0] - int(cox_frame[event_col].sum()))),
         AnalysisMetric(name="predictor_columns", value=int(len(table_rows))),
-        AnalysisMetric(name="concordance_index", value=round(float(fitter.concordance_index_), 6)),
+        AnalysisMetric(name="concordance_index", value=concordance_value),
     ]
     if subject_id_col:
         metrics.append(AnalysisMetric(name="subject_identifier", value=subject_id_col))
@@ -610,7 +730,30 @@ def run_cox_analysis(
 
     warnings.append("Cox regression currently uses complete-case rows after baseline predictor preprocessing.")
     if spec is None or not spec.covariates:
-        warnings.append("Predictors were auto-selected from treatment, demographic, and baseline lab columns.")
+        warnings.append("Predictors were auto-selected with preference for treatment, baseline clinical, management, exposure, and lab columns.")
+    event_derived_predictors = [
+        column
+        for column in predictor_columns
+        if column.startswith("AE_")
+        and not any(
+            token in column
+            for token in (
+                "OUTCOME_FLAG",
+                "TIME_TO_EVENT",
+                "EVENT_INDICATOR",
+                "TIME_TO_RESOLUTION",
+                "RESOLUTION_EVENT",
+            )
+        )
+    ]
+    if event_derived_predictors:
+        warnings.append(
+            "The fitted Cox model still includes event-derived AE descriptors as exploratory predictors: "
+            + ", ".join(event_derived_predictors[:5])
+            + ("..." if len(event_derived_predictors) > 5 else "")
+        )
+    if int(cox_frame.shape[0] - int(cox_frame[event_col].sum())) == 0:
+        warnings.append("All included subjects experienced the modeled event; the survival model did not include censored subjects.")
     warnings.extend(interaction_warnings)
     warnings.extend(stabilization_warnings)
 
@@ -620,7 +763,7 @@ def run_cox_analysis(
         analysis_family="cox",
         workspace_id=workspace_id,
         interpretation=(
-            "Computed a Cox proportional hazards model from the FastAPI survival workspace."
+            "Computed a Cox proportional hazards model for the requested time-to-event question."
             if metadata.get("target_definition") != "time_to_resolution_grade_2_plus_dae"
             else "Computed a Cox proportional hazards model for time to resolution among subjects with qualifying adverse events."
         ),
@@ -631,7 +774,7 @@ def run_cox_analysis(
             rows=table_rows,
         ),
         warnings=warnings,
-        explanation="Deterministic Cox regression executed on the FastAPI workspace.",
+        explanation="Deterministic Cox regression executed successfully.",
     )
 
 
@@ -740,7 +883,7 @@ def run_mixed_model_analysis(
             "Repeated-measures output currently uses an exchangeable GEE working correlation rather than a full random-effects mixed model.",
             "When multiple repeated parameters exist, verify that the selected endpoint label matches the intended measurement series.",
         ],
-        explanation="Deterministic repeated-measures analysis executed on the FastAPI workspace.",
+        explanation="Deterministic repeated-measures analysis executed on the analysis workspace.",
     )
 
 
@@ -845,7 +988,7 @@ def run_threshold_search_analysis(
             "Threshold search is exploratory and should be validated on a holdout cohort or reference implementation before operational use.",
             "Balanced accuracy ranking does not guarantee clinical utility or causal interpretation.",
         ],
-        explanation="Exploratory threshold-search analysis executed on the FastAPI workspace.",
+        explanation="Exploratory threshold-search analysis executed on the analysis workspace.",
     )
 
 
@@ -915,7 +1058,7 @@ def run_competing_risks_analysis(
             rows=rows,
         ),
         warnings=warnings,
-        explanation="Deterministic competing-risks analysis executed on the FastAPI workspace.",
+        explanation="Deterministic competing-risks analysis executed on the analysis workspace.",
     )
 
 
@@ -971,12 +1114,12 @@ def run_feature_importance_analysis(
         analysis_family="feature_importance",
         workspace_id=workspace_id,
         interpretation=(
-            "Computed exploratory random-forest feature importances for the derived binary endpoint using the row-level FastAPI workspace."
+            "Computed exploratory random-forest feature importances for the derived binary endpoint using the row-level analysis workspace."
         ),
         metrics=metrics,
         table=table,
         warnings=warnings,
-        explanation="Exploratory feature importance executed on the FastAPI workspace.",
+        explanation="Exploratory feature importance executed on the analysis workspace.",
     )
 
 
@@ -1045,12 +1188,12 @@ def run_partial_dependence_analysis(
         analysis_family="partial_dependence",
         workspace_id=workspace_id,
         interpretation=(
-            "Computed exploratory partial dependence summaries for the highest-importance predictors in the FastAPI workspace."
+            "Computed exploratory partial dependence summaries for the highest-importance predictors in the analysis workspace."
         ),
         metrics=metrics,
         table=table,
         warnings=warnings,
-        explanation="Exploratory partial dependence executed on the FastAPI workspace.",
+        explanation="Exploratory partial dependence executed on the analysis workspace.",
     )
 
 

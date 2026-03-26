@@ -334,5 +334,5 @@ export const buildAutopilotAnalysisSuite = (
     });
   }
 
-  return tasks.slice(0, 4);
+  return tasks.slice(0, 6);
 };

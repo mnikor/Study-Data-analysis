@@ -161,8 +161,26 @@ export const Pipeline: React.FC<PipelineProps> = ({ files, mappingSpecs, onAddFi
   return (
     <div className="p-8 h-full flex flex-col bg-slate-50 relative">
       <div className="mb-6">
-        <h2 className="text-2xl font-bold text-slate-800">Transformation Pipeline</h2>
-        <p className="text-slate-500">Orchestrate data flow from Raw to Analysis Ready</p>
+        <h2 className="text-2xl font-bold text-slate-800">ETL Pipeline</h2>
+        <p className="text-slate-500">Prepare and standardize raw datasets so analysis workflows can use them more reliably.</p>
+      </div>
+
+      <div className="mb-6 rounded-2xl border border-emerald-100 bg-emerald-50/70 p-5 text-sm text-slate-700 shadow-sm">
+        <div className="text-xs font-semibold uppercase tracking-wide text-emerald-700">Why use ETL?</div>
+        <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-3">
+          <div className="rounded-xl border border-emerald-100 bg-white/80 px-4 py-3">
+            <div className="font-semibold text-slate-800">Standardize messy raw files</div>
+            <div className="mt-1 text-slate-600">Use ETL when column names, formats, or source structures are inconsistent and need to be mapped into a cleaner clinical shape.</div>
+          </div>
+          <div className="rounded-xl border border-emerald-100 bg-white/80 px-4 py-3">
+            <div className="font-semibold text-slate-800">Improve downstream reliability</div>
+            <div className="mt-1 text-slate-600">A cleaner standardized dataset gives AI Chat, Autopilot, and Statistical Analysis a better chance of choosing the right variables and joins.</div>
+          </div>
+          <div className="rounded-xl border border-emerald-100 bg-white/80 px-4 py-3">
+            <div className="font-semibold text-slate-800">Reuse prepared data</div>
+            <div className="mt-1 text-slate-600">Run ETL once when the raw data is messy, then reuse the standardized output across multiple analyses instead of repeating manual cleanup.</div>
+          </div>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">

@@ -2,9 +2,16 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users, Activity } from 'lucide-react';
 import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, ProvenanceType } from '../types';
 import { generateAnalysis } from '../services/geminiService';
+import {
+  generateQuestionPlanningAssist,
+  generateExplorationQuestionSuggestions,
+  type ExplorationQuestionSuggestion,
+  type QuestionPlanningAssist,
+} from '../services/planningAssistService';
 import { Chart } from './Chart';
 import { buildChatQuickActions, ChatQuickActionIcon } from '../utils/chatQuickActions';
 import { InfoTooltip } from './InfoTooltip';
+import { buildQuestionFileRecommendation, inferDatasetProfile, type AnalysisRole } from '../utils/datasetProfile';
 
 interface AnalysisProps {
   files: ClinicalFile[];
@@ -193,16 +200,64 @@ const formatMessageAsHtml = (content: string): string => {
   return htmlBlocks.join('');
 };
 
+const ROLE_LABELS: Record<AnalysisRole, string> = {
+  ADSL: 'Subject baseline',
+  ADAE: 'Adverse events',
+  ADLB: 'Labs',
+  ADTTE: 'Time to event',
+  ADEX: 'Exposure / dosing',
+  DS: 'Disposition / adherence',
+};
+
+const confidenceBadgeClass = (confidence?: string) =>
+  confidence === 'High'
+    ? 'bg-emerald-50 text-emerald-700'
+    : confidence === 'Medium'
+      ? 'bg-amber-50 text-amber-700'
+      : 'bg-slate-100 text-slate-600';
+
+const supportStatusClass = (status?: 'READY' | 'PARTIAL' | 'MISSING') =>
+  status === 'READY'
+    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+    : status === 'PARTIAL'
+      ? 'border-amber-200 bg-amber-50 text-amber-800'
+      : 'border-red-200 bg-red-50 text-red-800';
+
+const supportCheckClass = (status?: 'MET' | 'PARTIAL' | 'MISSING') =>
+  status === 'MET'
+    ? 'text-emerald-700'
+    : status === 'PARTIAL'
+      ? 'text-amber-700'
+      : 'text-red-700';
+
+const suggestionSupportClass = (status?: 'READY' | 'PARTIAL' | 'MISSING') =>
+  status === 'READY'
+    ? 'bg-emerald-50 text-emerald-700'
+    : status === 'PARTIAL'
+      ? 'bg-amber-50 text-amber-700'
+      : 'bg-red-50 text-red-700';
+
 export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, messages, setMessages }) => {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [mode, setMode] = useState<AnalysisMode>(AnalysisMode.RAG);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
+  const [planningAssist, setPlanningAssist] = useState<QuestionPlanningAssist | null>(null);
+  const [isPlanningAssistLoading, setIsPlanningAssistLoading] = useState(false);
+  const [planningAssistError, setPlanningAssistError] = useState<string | null>(null);
+  const [explorationSuggestions, setExplorationSuggestions] = useState<ExplorationQuestionSuggestion[]>([]);
+  const [isExplorationSuggestionsLoading, setIsExplorationSuggestionsLoading] = useState(false);
+  const [explorationSuggestionsError, setExplorationSuggestionsError] = useState<string | null>(null);
+  const [pendingSuggestedQuestion, setPendingSuggestedQuestion] = useState<ExplorationQuestionSuggestion | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const docs = useMemo(
     () => files.filter(f => f.type === DataType.DOCUMENT || f.type === DataType.RAW || f.type === DataType.STANDARDIZED),
     [files]
+  );
+  const fileProfiles = useMemo(
+    () => new Map(docs.map((doc) => [doc.id, inferDatasetProfile(doc)])),
+    [docs]
   );
 
   const scrollToBottom = () => {
@@ -226,6 +281,45 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     }
     return 'Ask about the selected sources, realistic analyses, joins, safety findings, or what deserves follow-up...';
   }, [selectedContextFiles]);
+  const recommendation = useMemo(
+    () => (input.trim() ? buildQuestionFileRecommendation(input, docs) : null),
+    [input, docs]
+  );
+  const recommendedFileIds = useMemo(() => {
+    const selected = Object.values(recommendation?.selectedByRole || {}).filter(Boolean) as ClinicalFile[];
+    return new Set(selected.map((file) => file.id));
+  }, [recommendation]);
+  const recommendedRoleByFileId = useMemo(() => {
+    const entries = Object.entries(recommendation?.selectedByRole || {}) as Array<[AnalysisRole, ClinicalFile | undefined]>;
+    const mapped = new Map<string, AnalysisRole>();
+    for (const [role, file] of entries) {
+      if (file) mapped.set(file.id, role);
+    }
+    return mapped;
+  }, [recommendation]);
+  const alternativeRoleByFileId = useMemo(() => {
+    const mapped = new Map<string, AnalysisRole>();
+    const entries = Object.entries(recommendation?.alternativesByRole || {}) as Array<[AnalysisRole, ClinicalFile[] | undefined]>;
+    for (const [role, filesForRole] of entries) {
+      for (const file of filesForRole || []) {
+        if (!recommendedRoleByFileId.has(file.id) && !mapped.has(file.id)) {
+          mapped.set(file.id, role);
+        }
+      }
+    }
+    return mapped;
+  }, [recommendation, recommendedRoleByFileId]);
+
+  useEffect(() => {
+    setPlanningAssist(null);
+    setPlanningAssistError(null);
+  }, [input, docs]);
+
+  useEffect(() => {
+    setExplorationSuggestions([]);
+    setExplorationSuggestionsError(null);
+    setPendingSuggestedQuestion(null);
+  }, [selectedFileIds, docs, input]);
 
   useEffect(() => {
     scrollToBottom();
@@ -253,7 +347,94 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     setSelectedFileIds(new Set(docs.filter((doc) => types.includes(doc.type)).map((doc) => doc.id)));
   };
 
-  const handleSend = async (textOverride?: string) => {
+  const applyRecommendedSources = () => {
+    if (!recommendation) return;
+    const preservedDocumentIds = docs
+      .filter((doc) => doc.type === DataType.DOCUMENT && selectedFileIds.has(doc.id))
+      .map((doc) => doc.id);
+    const recommendedIds = Object.values(recommendation.selectedByRole)
+      .filter(Boolean)
+      .map((file) => (file as ClinicalFile).id);
+    setSelectedFileIds(new Set([...preservedDocumentIds, ...recommendedIds]));
+  };
+
+  const handleGeneratePlanningAssist = async () => {
+    if (!input.trim() || docs.length === 0 || isPlanningAssistLoading) return;
+    setIsPlanningAssistLoading(true);
+    setPlanningAssistError(null);
+    try {
+      const assist = await generateQuestionPlanningAssist(input, docs);
+      if (!assist) {
+        setPlanningAssistError('AI planning assist could not produce advice from the current files.');
+        setPlanningAssist(null);
+      } else {
+        setPlanningAssist(assist);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'AI planning assist failed.';
+      setPlanningAssistError(message);
+      setPlanningAssist(null);
+    } finally {
+      setIsPlanningAssistLoading(false);
+    }
+  };
+
+  const handleGenerateExplorationSuggestions = async () => {
+    if (selectedContextFiles.length === 0 || isExplorationSuggestionsLoading) return;
+    setIsExplorationSuggestionsLoading(true);
+    setExplorationSuggestionsError(null);
+    try {
+      const suggestions = await generateExplorationQuestionSuggestions(selectedContextFiles, input);
+      if (!suggestions.length) {
+        setExplorationSuggestions([]);
+        setExplorationSuggestionsError('AI could not propose distinct questions from the current selected sources.');
+      } else {
+        setExplorationSuggestions(suggestions);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'AI question suggestions failed.';
+      setExplorationSuggestions([]);
+      setExplorationSuggestionsError(message);
+    } finally {
+      setIsExplorationSuggestionsLoading(false);
+    }
+  };
+
+  const buildScopedContextForQuestion = (question: string) => {
+    const candidateFiles = docs;
+    const scopedRecommendation = buildQuestionFileRecommendation(question, candidateFiles);
+    const preservedDocuments = docs.filter(
+      (file) => file.type === DataType.DOCUMENT && selectedFileIds.has(file.id)
+    );
+    const recommendedDatasets = Object.values(scopedRecommendation.selectedByRole).filter(Boolean) as ClinicalFile[];
+    const scopedFiles =
+      recommendedDatasets.length > 0
+        ? [...preservedDocuments, ...recommendedDatasets]
+        : (selectedContextFiles.length > 0 ? selectedContextFiles : candidateFiles);
+    const scopedIds = new Set(scopedFiles.map((file) => file.id));
+    return { scopedFiles, scopedIds };
+  };
+
+  const executeSuggestedQuestion = async (question: string) => {
+    const { scopedFiles, scopedIds } = buildScopedContextForQuestion(question);
+    setSelectedFileIds(scopedIds);
+    await handleSend(question, scopedFiles, scopedIds);
+  };
+
+  const handleRunSuggestedQuestion = async (suggestion: ExplorationQuestionSuggestion) => {
+    if (suggestion.supportStatus === 'PARTIAL') {
+      setPendingSuggestedQuestion(suggestion);
+      return;
+    }
+    setPendingSuggestedQuestion(null);
+    await executeSuggestedQuestion(suggestion.question);
+  };
+
+  const handleSend = async (
+    textOverride?: string,
+    contextOverride?: ClinicalFile[],
+    selectedIdsOverride?: Set<string>
+  ) => {
     const textToSend = textOverride || input;
     if (!textToSend.trim() || isLoading) return;
 
@@ -268,7 +449,8 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     setInput('');
     setIsLoading(true);
 
-    const contextFiles = selectedContextFiles;
+    const contextFiles = contextOverride || selectedContextFiles;
+    const provenanceInputs = Array.from(selectedIdsOverride || selectedFileIds);
     
     // Record provenance start
     const provId = crypto.randomUUID();
@@ -278,7 +460,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       userId: 'current_user',
       actionType: ProvenanceType.ANALYSIS,
       details: `Query: ${textToSend.substring(0, 50)}... | Mode: ${mode}`,
-      inputs: Array.from(selectedFileIds)
+      inputs: provenanceInputs
     });
 
     const response = await generateAnalysis(textToSend, contextFiles, mode, messages);
@@ -486,6 +668,288 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
               >
                 Documents Only
               </button>
+              {recommendation && recommendation.requiredRoles.length > 0 && (
+                <button
+                  onClick={applyRecommendedSources}
+                  className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700 hover:bg-medical-100"
+                >
+                  Use Recommended Files
+                </button>
+              )}
+            </div>
+          )}
+          {recommendation && recommendation.requiredRoles.length > 0 && (
+            <div className="mb-3 rounded-xl border border-medical-100 bg-medical-50/60 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-xs font-semibold uppercase tracking-wider text-medical-700">Recommended For This Question</div>
+                <div className="text-[11px] text-medical-600">
+                  {recommendedFileIds.size} file{recommendedFileIds.size === 1 ? '' : 's'} suggested
+                </div>
+              </div>
+              <div className="space-y-1.5 text-xs text-slate-700">
+                <div className={`rounded-lg border px-3 py-2 ${supportStatusClass(recommendation.supportAssessment.status)}`}>
+                  <div className="text-[11px] font-semibold uppercase tracking-wide">
+                    {recommendation.supportAssessment.status === 'READY'
+                      ? 'Likely answerable'
+                      : recommendation.supportAssessment.status === 'PARTIAL'
+                        ? 'Partially supported'
+                        : 'Not enough data yet'}
+                  </div>
+                  <div className="mt-1 text-xs leading-relaxed">{recommendation.supportAssessment.summary}</div>
+                </div>
+                {recommendation.requiredRoles.map((role) => {
+                  const file = recommendation.selectedByRole[role];
+                  const alternatives = recommendation.alternativesByRole[role] || [];
+                  return (
+                    <div key={role} className="leading-relaxed">
+                      <span className="font-semibold text-slate-800">{ROLE_LABELS[role]}:</span>{' '}
+                      {file ? (
+                        <>
+                          <span>{file.name}</span>
+                          {recommendation.confidenceByFileId[file.id] && (
+                            <span className={`ml-1 inline-flex rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${confidenceBadgeClass(recommendation.confidenceByFileId[file.id])}`}>
+                              {recommendation.confidenceByFileId[file.id]} confidence
+                            </span>
+                          )}
+                          {alternatives.length > 1 && (
+                            <span className="text-slate-500"> ({alternatives.length - 1} alternative{alternatives.length - 1 === 1 ? '' : 's'} found)</span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-amber-700">no good match found</span>
+                      )}
+                    </div>
+                  );
+                })}
+                {recommendation.optionalRoles.length > 0 && (
+                  <div className="pt-1 text-[11px] text-slate-500">
+                    Optional if available: {recommendation.optionalRoles.map((role) => ROLE_LABELS[role]).join(', ')}
+                  </div>
+                )}
+                {recommendation.missingRequiredRoles.length > 0 && (
+                  <div className="pt-1 text-[11px] text-amber-700">
+                    Still missing: {recommendation.missingRequiredRoles.map((role) => ROLE_LABELS[role]).join(', ')}
+                  </div>
+                )}
+                <div className="pt-1 text-[11px] text-slate-500">
+                  The app prefers one best file per dataset type and leaves likely duplicates unselected.
+                </div>
+                {recommendation.supportAssessment.checks.length > 0 && (
+                  <div className="pt-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                      Readiness checks
+                    </div>
+                    <div className="space-y-1 text-[11px]">
+                      {recommendation.supportAssessment.checks.map((check, index) => (
+                        <div key={`${check.label}-${index}`} className="leading-relaxed">
+                          <span className={`font-semibold ${supportCheckClass(check.status)}`}>
+                            {check.status === 'MET' ? 'Ready' : check.status === 'PARTIAL' ? 'Partial' : 'Missing'}:
+                          </span>{' '}
+                          <span className="text-slate-700">{check.label}</span>
+                          <div className="text-slate-500">{check.detail}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {input.trim() && docs.length > 0 && (
+            <div className="mb-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wider text-indigo-700">AI Planning Assist</div>
+                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    Uses AI to interpret the question and selected file metadata, then suggests which files and predictor families are most relevant.
+                  </div>
+                </div>
+                <button
+                  onClick={handleGeneratePlanningAssist}
+                  disabled={isPlanningAssistLoading}
+                  className="rounded-full border border-indigo-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isPlanningAssistLoading ? 'Generating…' : 'Generate AI Assist'}
+                </button>
+              </div>
+              {planningAssistError && (
+                <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {planningAssistError}
+                </div>
+              )}
+              {planningAssist && (
+                <div className="space-y-2 text-xs text-slate-700">
+                  <div className="rounded-lg border border-indigo-100 bg-white px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-slate-800">AI read of the question</span>
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                        planningAssist.confidence === 'HIGH'
+                          ? 'bg-emerald-50 text-emerald-700'
+                          : planningAssist.confidence === 'LOW'
+                            ? 'bg-red-50 text-red-700'
+                            : 'bg-amber-50 text-amber-700'
+                      }`}>
+                        {planningAssist.confidence.toLowerCase()} confidence
+                      </span>
+                    </div>
+                    <div className="mt-1 leading-relaxed">{planningAssist.questionIntentSummary}</div>
+                  </div>
+                  {planningAssist.requiredRoles.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Likely required dataset types</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {planningAssist.requiredRoles.map((role) => (
+                          <span key={role} className="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-semibold text-indigo-700">{role}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {planningAssist.predictorFamiliesNeeded.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Predictor families needed</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {planningAssist.predictorFamiliesNeeded.map((family) => (
+                          <span key={family} className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-700">{family}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {planningAssist.recommendedFileNames.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">AI-recommended files</div>
+                      <ul className="mt-1 list-disc space-y-1 pl-4">
+                        {planningAssist.recommendedFileNames.map((name) => (
+                          <li key={name}>{name}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {planningAssist.whyTheseFiles.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Why these files</div>
+                      <ul className="mt-1 list-disc space-y-1 pl-4">
+                        {planningAssist.whyTheseFiles.map((item, index) => (
+                          <li key={`${item}-${index}`}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {planningAssist.keyRisks.length > 0 && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">AI-noted risks</div>
+                      <ul className="mt-1 list-disc space-y-1 pl-4 text-amber-800">
+                        {planningAssist.keyRisks.map((risk, index) => (
+                          <li key={`${risk}-${index}`}>{risk}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {selectedContextFiles.length > 0 && (
+            <div className="mb-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wider text-emerald-700">Explore Questions</div>
+                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    Let AI scan the selected source metadata and propose distinct clinical questions you can run next.
+                  </div>
+                </div>
+                <button
+                  onClick={handleGenerateExplorationSuggestions}
+                  disabled={isExplorationSuggestionsLoading}
+                  className="rounded-full border border-emerald-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isExplorationSuggestionsLoading ? 'Generating…' : 'Suggest Questions'}
+                </button>
+              </div>
+              {explorationSuggestionsError && (
+                <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {explorationSuggestionsError}
+                </div>
+              )}
+              {explorationSuggestions.length > 0 && (
+                <div className="space-y-2">
+                  {explorationSuggestions.map((suggestion, index) => (
+                    <button
+                      key={`${suggestion.question}-${index}`}
+                      onClick={() => handleRunSuggestedQuestion(suggestion)}
+                      disabled={isLoading}
+                      className="w-full rounded-lg border border-emerald-100 bg-white px-3 py-3 text-left hover:border-emerald-200 hover:bg-emerald-50/50 disabled:opacity-60"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="text-sm font-semibold leading-5 text-slate-800">{suggestion.question}</div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${suggestionSupportClass(suggestion.supportStatus)}`}>
+                            {suggestion.supportStatus.toLowerCase()}
+                          </span>
+                          <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                            suggestion.confidence === 'HIGH'
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : suggestion.confidence === 'LOW'
+                                ? 'bg-red-50 text-red-700'
+                                : 'bg-amber-50 text-amber-700'
+                          }`}>
+                            {suggestion.confidence.toLowerCase()}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="mt-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
+                        {suggestion.analysisFamily}
+                      </div>
+                      <div className="mt-1 text-xs leading-relaxed text-slate-600">{suggestion.rationale}</div>
+                      <div className="mt-2 text-[11px] leading-relaxed text-slate-500">
+                        {suggestion.supportSummary}
+                      </div>
+                      {suggestion.recommendedFileNames.length > 0 && (
+                        <div className="mt-2 text-[11px] leading-relaxed text-slate-500">
+                          Using: <span className="font-medium text-slate-700">{suggestion.recommendedFileNames.join(', ')}</span>
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {pendingSuggestedQuestion && (
+                <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-amber-800">
+                    Partial Question Confirmation
+                  </div>
+                  <div className="mt-1 text-sm font-semibold leading-5 text-slate-800">
+                    {pendingSuggestedQuestion.question}
+                  </div>
+                  <div className="mt-2 text-xs leading-relaxed text-slate-700">
+                    This suggested question can run, but the current files only partially support it.
+                    You may still continue for an exploratory answer, or cancel and choose a stronger suggestion.
+                  </div>
+                  <div className="mt-2 text-[11px] leading-relaxed text-slate-600">
+                    {pendingSuggestedQuestion.supportSummary}
+                  </div>
+                  {pendingSuggestedQuestion.recommendedFileNames.length > 0 && (
+                    <div className="mt-2 text-[11px] leading-relaxed text-slate-600">
+                      Using: <span className="font-medium text-slate-700">{pendingSuggestedQuestion.recommendedFileNames.join(', ')}</span>
+                    </div>
+                  )}
+                  <div className="mt-3 flex items-center gap-2">
+                    <button
+                      onClick={() => executeSuggestedQuestion(pendingSuggestedQuestion.question)}
+                      disabled={isLoading}
+                      className="rounded-full bg-amber-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Continue Anyway
+                    </button>
+                    <button
+                      onClick={() => setPendingSuggestedQuestion(null)}
+                      disabled={isLoading}
+                      className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
           {docs.map(doc => (
@@ -504,6 +968,36 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
               <div className="flex-1 overflow-hidden">
                 <div className="text-sm font-medium text-slate-700 truncate">{doc.name}</div>
                 <div className="text-xs text-slate-500">{doc.type} • {doc.size}</div>
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                    {fileProfiles.get(doc.id)?.shortLabel || 'Clinical'}
+                  </span>
+                  {recommendedRoleByFileId.has(doc.id) && (
+                    <span className="rounded-full bg-medical-100 px-2 py-0.5 text-[10px] font-semibold text-medical-700">
+                      Recommended: {ROLE_LABELS[recommendedRoleByFileId.get(doc.id)!]}
+                    </span>
+                  )}
+                  {!recommendedRoleByFileId.has(doc.id) && alternativeRoleByFileId.has(doc.id) && (
+                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                      Alternative: {ROLE_LABELS[alternativeRoleByFileId.get(doc.id)!]}
+                    </span>
+                  )}
+                  {recommendation?.confidenceByFileId[doc.id] && (
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${confidenceBadgeClass(recommendation.confidenceByFileId[doc.id])}`}>
+                      {recommendation.confidenceByFileId[doc.id]} confidence
+                    </span>
+                  )}
+                </div>
+                {recommendedRoleByFileId.has(doc.id) && recommendation?.rationaleByFileId[doc.id] && (
+                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    {recommendation.rationaleByFileId[doc.id]}
+                  </div>
+                )}
+                {!recommendedRoleByFileId.has(doc.id) && recommendation?.whyNotSelectedByFileId[doc.id] && (
+                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    {recommendation.whyNotSelectedByFileId[doc.id]}
+                  </div>
+                )}
               </div>
             </div>
           ))}
@@ -570,13 +1064,13 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                     </div>
                   )}
 
-                  {/* Key Insights - Discovery Mode UI */}
+                  {/* Key Takeaways */}
                   {msg.keyInsights && msg.keyInsights.length > 0 && (
                     <div className="mt-4 bg-indigo-50 border border-indigo-200 rounded-xl overflow-hidden shadow-sm">
                       <div className="bg-indigo-100 px-4 py-2 border-b border-indigo-200 flex items-center">
                         <Sparkles className="w-4 h-4 mr-2 text-indigo-600" />
                         <h4 className="text-sm font-bold text-indigo-800">
-                          Hidden Insights & Discovery
+                          Key Takeaways
                         </h4>
                       </div>
                       <div className="p-4">

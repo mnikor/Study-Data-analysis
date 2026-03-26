@@ -222,6 +222,16 @@ export interface StatAnalysisResult {
     summary: string;
     limitations: string[];
     caution?: string;
+    sections?: {
+      status?: string;
+      directAnswer?: string;
+      population?: string;
+      endpointDefinition?: string;
+      mainFindings?: string;
+      interactionFindings?: string;
+      modelStrength?: string;
+      nextSteps?: string[];
+    };
   };
 }
 
@@ -365,7 +375,7 @@ export interface AnalysisSession extends StatAnalysisResult {
     autopilotMultiplicityMethod?: string | null;
     autopilotReview?: AutopilotReviewBundle | null;
     autopilotExecutionLog?: string[] | null;
-    autopilotQuestionMatchStatus?: 'MATCHED' | 'FAILED' | null;
+    autopilotQuestionMatchStatus?: 'MATCHED' | 'PARTIAL' | 'FAILED' | null;
     autopilotQuestionMatchSummary?: string | null;
     autopilotQuestionMatchDetails?: string[] | null;
   };

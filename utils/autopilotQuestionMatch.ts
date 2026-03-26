@@ -1,4 +1,5 @@
 import { AutopilotDataScope, AutopilotExecutionMode, ResultTable, StatAnalysisResult, StatTestType } from '../types';
+import { normalizeSupportToken, summarizeQuestionSupport } from './questionSupport';
 
 export interface AutopilotQuestionMatchAssessment {
   status: 'MATCHED' | 'FAILED';
@@ -27,6 +28,7 @@ const includesAny = (value: string, patterns: Array<string | RegExp>) =>
   patterns.some((pattern) => (typeof pattern === 'string' ? value.includes(pattern) : pattern.test(value)));
 
 const hasMetric = (text: string, candidates: string[]) => candidates.some((candidate) => text.includes(candidate));
+const normalizeToken = normalizeSupportToken;
 
 const inferLocalFamily = (testType: StatTestType): string => {
   switch (testType) {
@@ -67,6 +69,15 @@ const requiresBackendExecution = (question: string) =>
     /hazard|cox|kaplan|survival/,
   ]);
 
+const mentionsDoseWeight = (question: string) =>
+  includesAny(question, [/\bdose\b/, /\bdosing\b/, /\bweight\b/, /\bkg\b/, /\btier\b/, />=\s*80\s*kg/, /≥\s*80\s*kg/]);
+
+const mentionsMitigation = (question: string) =>
+  includesAny(question, [/\bmitigat/i, /\bdiffer by arm\b/i, /\binteraction\b/i, /\benhanced dm\b/i]);
+
+const mentionsOnsetOrTimeToEvent = (question: string) =>
+  includesAny(question, [/\bearlier onset\b/i, /\bonset\b/i, /\btime to first\b/i, /\btime to event\b/i, /\bsurvival\b/i, /\bhazard\b/i, /\bcox\b/i]);
+
 export const assessAutopilotQuestionMatch = (
   question: string,
   result: StatAnalysisResult,
@@ -96,6 +107,16 @@ export const assessAutopilotQuestionMatch = (
 
   const details: string[] = [];
   const isLinkedSingleQuestion = context.analysisMode === 'SINGLE' && context.analysisScope === 'LINKED_WORKSPACE';
+  const predictorTexts = (result.tableConfig?.rows || [])
+    .map((row) => normalizeToken(String(row.predictor ?? '')))
+    .filter(Boolean);
+  const supportSummary = summarizeQuestionSupport(
+    normalizedQuestion,
+    (result.tableConfig?.rows || []).map((row) => String(row.predictor ?? '')).filter(Boolean)
+  );
+  const hasPredictorMatch = (patterns: RegExp[]) => predictorTexts.some((predictor) => patterns.some((pattern) => pattern.test(predictor)));
+  const subjectsUsed = Number(result.metrics.subjects_used ?? result.metrics.total_subjects);
+  const eventSubjects = Number(result.metrics.event_subjects ?? result.metrics.event_of_interest_subjects);
 
   if (isLinkedSingleQuestion && requiresBackendExecution(normalizedQuestion) && !result.backendExecution) {
     details.push(
@@ -140,6 +161,22 @@ export const assessAutopilotQuestionMatch = (
     !includesAny(actualFamily, ['cox', 'kaplan_meier', 'competing_risks'])
   ) {
     details.push(`The executed analysis family was "${actualFamily}", not a survival or competing-risks workflow.`);
+  }
+
+  if (mentionsDoseWeight(normalizedQuestion) && !hasPredictorMatch([/dose/, /weight/, /80kg/, /tier/, /ge80kg/, /\bex_/])) {
+    details.push('The result does not contain a direct dose- or weight-tier predictor estimate.');
+  }
+
+  if (mentionsMitigation(normalizedQuestion) && !hasPredictorMatch([/^int\b/, /^int__/, /interaction/, /dose.*trt/, /trt.*dose/, /dose.*arm/, /arm.*dose/, /treatment.*dose/])) {
+    details.push('The result does not contain an interpretable treatment-by-dose interaction estimate.');
+  }
+
+  for (const detail of supportSummary.details) {
+    details.push(detail);
+  }
+
+  if (mentionsOnsetOrTimeToEvent(normalizedQuestion) && Number.isFinite(subjectsUsed) && Number.isFinite(eventSubjects) && subjectsUsed > 0 && eventSubjects >= subjectsUsed) {
+    details.push('All included subjects experienced the modeled event, so the run does not look like a clean at-risk onset analysis.');
   }
 
   if (

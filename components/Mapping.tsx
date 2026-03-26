@@ -11,12 +11,15 @@ interface MappingProps {
   onSaveSpec: (spec: MappingSpec) => void;
 }
 
+type MappingRow = { sourceCol: string; targetCol: string; transformation?: string };
+type MappingField = keyof MappingRow;
+
 export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
   const [selectedFileId, setSelectedFileId] = useState<string>('');
   const [selectedReferenceId, setSelectedReferenceId] = useState<string>('');
   const [sourceDomain, setSourceDomain] = useState('RAW_DOMAIN');
   const [targetDomain, setTargetDomain] = useState('DM');
-  const [mappings, setMappings] = useState<{ sourceCol: string; targetCol: string; transformation?: string }[]>([
+  const [mappings, setMappings] = useState<MappingRow[]>([
     { sourceCol: '', targetCol: '', transformation: '' }
   ]);
   const [isSuggesting, setIsSuggesting] = useState(false);
@@ -51,9 +54,8 @@ export const Mapping: React.FC<MappingProps> = ({ files, onSaveSpec }) => {
     setMappings([...mappings, { sourceCol: '', targetCol: '', transformation: '' }]);
   };
 
-  const updateMapping = (index: number, field: string, value: string) => {
+  const updateMapping = (index: number, field: MappingField, value: string) => {
     const newMappings = [...mappings];
-    // @ts-ignore
     newMappings[index][field] = value;
     setMappings(newMappings);
   };

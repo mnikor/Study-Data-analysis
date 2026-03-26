@@ -144,8 +144,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ files, provenance, onNavig
   const workflowCards = [
     {
       title: 'AI Chat',
-      helper: 'Help me understand what to do and what happened',
-      description: 'Use after ingestion when you are unsure which dataset, workflow, or result matters. Best for explanation, comparison, and next-step guidance.',
+      helper: 'Explore what the data can answer next',
+      description: 'Best when you are unsure which files, workflow, or question to use. It helps you explore the data, compare options, and decide the next sensible analysis.',
       cta: 'Open AI Chat',
       view: 'ANALYSIS',
       icon: MessageSquareText,
@@ -154,8 +154,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ files, provenance, onNavig
     },
     {
       title: 'Autopilot',
-      helper: 'Do work for me',
-      description: 'Best for fast first-pass analysis packs, exploratory scans, and linked-workspace signal finding with minimal setup.',
+      helper: 'Run a guided first-pass workflow',
+      description: 'Best when you already have a concrete question or exploration goal and want the app to assemble the workflow, run it, save it, and explain the result.',
       cta: 'Open Autopilot',
       view: 'AUTOPILOT',
       icon: Bot,
@@ -164,8 +164,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ files, provenance, onNavig
     },
     {
       title: 'Statistical Analysis',
-      helper: 'Let me control the work',
-      description: 'Best for controlled reruns, variable selection, code review, and Run Confirmed execution against a reviewed plan.',
+      helper: 'Control and review the final analysis',
+      description: 'Best for controlled reruns, variable selection, endpoint review, and confirmed execution when you need a more reviewable final answer.',
       cta: 'Open Statistics',
       view: 'STATISTICS',
       icon: BarChart2,
@@ -317,12 +317,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ files, provenance, onNavig
             </h3>
             <p className="text-sm text-slate-500 mt-1 max-w-3xl">
               {hasAnalysisReadyData
-                ? 'Begin with Ingestion & QC to confirm usable data, then use AI Chat for orientation, Autopilot for a first-pass analysis pack, and Statistical Analysis for controlled reruns or confirmed execution.'
-                : 'No scientific workflow is meaningful until datasets are uploaded and checked. Start with Ingestion & QC, then move into AI Chat, Autopilot, or Statistical Analysis once data is ready.'}
+                ? 'Begin with Ingestion & QC to confirm usable data, use ETL when raw files need to be standardized, then use AI Chat for orientation, Autopilot for a first pass, and Statistical Analysis for controlled reruns or confirmed execution.'
+                : 'No scientific workflow is meaningful until datasets are uploaded and checked. Start with Ingestion & QC, use ETL when raw files need preparation, then move into AI Chat, Autopilot, or Statistical Analysis once data is ready.'}
             </p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 max-w-lg">
             Recommended order: <span className="font-semibold text-slate-800">Ingestion & QC</span> first,
+            then <span className="font-semibold text-slate-800">ETL</span> when raw files need standardization,
             then <span className="font-semibold text-slate-800">AI Chat</span> to orient,
             then <span className="font-semibold text-slate-800">Autopilot</span> for a first pass,
             then <span className="font-semibold text-slate-800">Statistical Analysis</span> when you need reviewable control.
