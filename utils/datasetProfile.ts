@@ -368,6 +368,13 @@ const QUERY_ROLE_PATTERNS: Array<{
       /\bearlier onset\b/i,
       /\btime to\b/i,
       /\bsurvival\b/i,
+      /\bos\b/i,
+      /\bpfs\b/i,
+      /\befs\b/i,
+      /\bdfs\b/i,
+      /\bdss\b/i,
+      /\boverall survival\b/i,
+      /\bprogression[- ]free\b/i,
       /\bhazard\b/i,
       /\bkaplan\b/i,
       /\bcox\b/i,
@@ -410,8 +417,17 @@ const inferRolesFromQuestion = (question: string): { requiredRoles: AnalysisRole
     /\bdose\b|\bdosing\b|\bexposure\b|\bweight\b|\bkg\b|\btier\b|\bamivantamab\b|\badherence\b|\bcompliance\b|\bdiscontinu|\binterruption\b|\breduction\b|\bpersist/.test(normalizedQuestion);
   const asksForSubjectLevelAssociation =
     /\bcorrelate\b|\bcorrelation\b|\bassociate\b|\bassociation\b|\brelationship\b|\bcompare\b|\bimpact\b|\beffect\b/.test(normalizedQuestion);
+  const asksAboutSurvival =
+    /\bos\b|\bpfs\b|\befs\b|\bdfs\b|\bdss\b|\bsurvival\b|\boverall survival\b|\bprogression[- ]free\b|\btime[- ]to[- ]event\b|\btime to event\b|\bhazard\b|\bkaplan\b|\bcox\b/.test(
+      normalizedQuestion
+    );
 
   if ((asksAboutAeOutcomes && asksAboutExposureOrAdherence) || (asksAboutAeOutcomes && asksForSubjectLevelAssociation)) {
+    requiredRoles.push('ADSL');
+  }
+
+  if (asksAboutSurvival) {
+    requiredRoles.push('ADTTE');
     requiredRoles.push('ADSL');
   }
 
@@ -682,12 +698,13 @@ const describeAlternativeReason = (
 
 export const buildQuestionFileRecommendation = (
   question: string,
-  files: ClinicalFile[]
+  files: ClinicalFile[],
+  profilesByFileId?: Map<string, DatasetProfile>
 ): FileRoleRecommendation => {
   const tabularFiles = files.filter((file) => file.type === DataType.RAW || file.type === DataType.STANDARDIZED);
   const profiles = new Map<string, DatasetProfile>();
   for (const file of tabularFiles) {
-    profiles.set(file.id, inferDatasetProfile(file));
+    profiles.set(file.id, profilesByFileId?.get(file.id) || inferDatasetProfile(file));
   }
 
   const { requiredRoles, optionalRoles } = inferRolesFromQuestion(question);

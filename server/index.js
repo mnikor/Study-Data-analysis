@@ -309,8 +309,17 @@ const handleProjects = async (req, res) => {
   sendJson(res, 405, { error: 'Method not allowed' });
 };
 
+const decodePathname = (pathname) => {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+};
+
 const serveStaticAsset = async (pathname, res) => {
-  const normalizedPath = pathname === '/' ? '/index.html' : pathname;
+  const decodedPath = decodePathname(pathname);
+  const normalizedPath = decodedPath === '/' ? '/index.html' : decodedPath;
   const requestedPath = path.join(distDir, normalizedPath.replace(/^\/+/, ''));
   const safePath = requestedPath.startsWith(distDir) ? requestedPath : distDir;
 
@@ -331,7 +340,7 @@ const serveStaticAsset = async (pathname, res) => {
     res.end(file);
     return true;
   } catch {
-    if (pathname === '/' || !path.extname(pathname)) {
+    if (decodedPath === '/' || !path.extname(decodedPath)) {
       const indexFile = await fs.readFile(path.join(distDir, 'index.html'));
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(indexFile);

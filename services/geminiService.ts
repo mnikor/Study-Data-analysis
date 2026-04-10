@@ -19,6 +19,7 @@ import { executeLocalStatisticalAnalysis } from "../utils/statisticsEngine";
 import { formatComparisonLabel, formatDisplayName } from "../utils/displayNames";
 import { planAnalysisFromQuestion } from "../utils/queryPlanner";
 import { retrieveRelevantContext } from "../utils/rag";
+import { resolveChatAnalysisContext } from "../utils/chatAnalysisResolver";
 import {
   findHeaderByAlias as matchHeaderByAlias,
   inferDatasetProfileFromHeaders,
@@ -77,6 +78,16 @@ const requiresAdvancedAnalysisGuard = (query: string, contextFiles: ClinicalFile
   const tabularFiles = contextFiles.filter(
     (file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)
   );
+
+  if (tabularFiles.length === 0) {
+    return false;
+  }
+
+  // Quantitative questions over multiple tabular files should prefer deterministic
+  // backend routing over the looser RAG + model-generated chart path.
+  if (CHAT_EXECUTION_INTENT.test(query) && tabularFiles.length > 1) {
+    return true;
+  }
 
   if (ADVANCED_ANALYSIS_GUARD_INTENT.test(query)) {
     return tabularFiles.length >= 1;
@@ -139,13 +150,16 @@ const describeFamily = (family: string) => {
 
 const runAdvancedAnalysisGuard = async (
   query: string,
-  contextFiles: ClinicalFile[]
+  contextFiles: ClinicalFile[],
+  allFiles: ClinicalFile[] = contextFiles
 ): Promise<AnalysisResponse | null> => {
   if (!requiresAdvancedAnalysisGuard(query, contextFiles)) {
     return null;
   }
 
-  const datasetRefs = contextFiles
+  const resolution = resolveChatAnalysisContext(query, contextFiles, allFiles);
+  const resolvedContextFiles = resolution.resolvedFiles;
+  const datasetRefs = resolvedContextFiles
     .filter((file) => file.type === DataType.RAW || file.type === DataType.STANDARDIZED)
     .map(buildDatasetReference);
 
@@ -834,7 +848,8 @@ export const generateAnalysis = async (
   query: string,
   contextFiles: ClinicalFile[],
   mode: 'RAG' | 'STUFFING',
-  history: ChatMessage[]
+  history: ChatMessage[],
+  allFiles: ClinicalFile[] = contextFiles
 ): Promise<AnalysisResponse> => {
   const exploratoryFile = canRunExploratoryChatAnalysis(query, contextFiles);
   if (exploratoryFile) {
@@ -884,7 +899,7 @@ export const generateAnalysis = async (
     }
   }
 
-  const guardedAdvancedResponse = await runAdvancedAnalysisGuard(query, contextFiles);
+  const guardedAdvancedResponse = await runAdvancedAnalysisGuard(query, contextFiles, allFiles);
   if (guardedAdvancedResponse) {
     return guardedAdvancedResponse;
   }

@@ -12,6 +12,7 @@ import { Chart } from './Chart';
 import { buildChatQuickActions, ChatQuickActionIcon } from '../utils/chatQuickActions';
 import { InfoTooltip } from './InfoTooltip';
 import { buildQuestionFileRecommendation, inferDatasetProfile, type AnalysisRole } from '../utils/datasetProfile';
+import { resolveChatAnalysisContext } from '../utils/chatAnalysisResolver';
 
 interface AnalysisProps {
   files: ClinicalFile[];
@@ -282,8 +283,8 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     return 'Ask about the selected sources, realistic analyses, joins, safety findings, or what deserves follow-up...';
   }, [selectedContextFiles]);
   const recommendation = useMemo(
-    () => (input.trim() ? buildQuestionFileRecommendation(input, docs) : null),
-    [input, docs]
+    () => (input.trim() ? buildQuestionFileRecommendation(input, docs, fileProfiles) : null),
+    [input, docs, fileProfiles]
   );
   const recommendedFileIds = useMemo(() => {
     const selected = Object.values(recommendation?.selectedByRole || {}).filter(Boolean) as ClinicalFile[];
@@ -401,18 +402,15 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   };
 
   const buildScopedContextForQuestion = (question: string) => {
-    const candidateFiles = docs;
-    const scopedRecommendation = buildQuestionFileRecommendation(question, candidateFiles);
-    const preservedDocuments = docs.filter(
-      (file) => file.type === DataType.DOCUMENT && selectedFileIds.has(file.id)
-    );
-    const recommendedDatasets = Object.values(scopedRecommendation.selectedByRole).filter(Boolean) as ClinicalFile[];
-    const scopedFiles =
-      recommendedDatasets.length > 0
-        ? [...preservedDocuments, ...recommendedDatasets]
-        : (selectedContextFiles.length > 0 ? selectedContextFiles : candidateFiles);
+    const resolution = resolveChatAnalysisContext(question, selectedContextFiles, docs, fileProfiles);
+    const scopedFiles = resolution.resolvedFiles;
     const scopedIds = new Set(scopedFiles.map((file) => file.id));
-    return { scopedFiles, scopedIds };
+    return {
+      scopedFiles,
+      scopedIds,
+      note: resolution.note,
+      shouldUpdateSelection: resolution.autoSelected,
+    };
   };
 
   const executeSuggestedQuestion = async (question: string) => {
@@ -449,8 +447,21 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     setInput('');
     setIsLoading(true);
 
-    const contextFiles = contextOverride || selectedContextFiles;
-    const provenanceInputs = Array.from(selectedIdsOverride || selectedFileIds);
+    let contextFiles = contextOverride || selectedContextFiles;
+    let provenanceIds = new Set(selectedIdsOverride || selectedFileIds);
+    let resolutionNote = '';
+
+    if (!contextOverride && !selectedIdsOverride) {
+      const scoped = buildScopedContextForQuestion(textToSend);
+      contextFiles = scoped.scopedFiles;
+      provenanceIds = scoped.scopedIds;
+      resolutionNote = scoped.note;
+      if (scoped.shouldUpdateSelection) {
+        setSelectedFileIds(new Set(scoped.scopedIds));
+      }
+    }
+
+    const provenanceInputs = Array.from(provenanceIds);
     
     // Record provenance start
     const provId = crypto.randomUUID();
@@ -463,7 +474,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       inputs: provenanceInputs
     });
 
-    const response = await generateAnalysis(textToSend, contextFiles, mode, messages);
+    const response = await generateAnalysis(textToSend, contextFiles, mode, messages, docs);
 
     const aiMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -475,6 +486,10 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       tableConfig: response.tableConfig,
       keyInsights: response.keyInsights
     };
+
+    if (resolutionNote) {
+      aiMsg.content = `${resolutionNote}\n\n${aiMsg.content}`;
+    }
 
     setMessages(prev => [...prev, aiMsg]);
     setIsLoading(false);

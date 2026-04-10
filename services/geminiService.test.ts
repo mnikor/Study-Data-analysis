@@ -585,6 +585,63 @@ describe('generateAnalysis', () => {
     expect(response.tableConfig).toBeUndefined();
   });
 
+  it('routes plain multi-file quantitative comparison requests to the backend guard instead of generating a retrieval chart', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        status: 'not_executable',
+        analysis_family: 'risk_difference',
+        executable: false,
+        requires_row_level_data: true,
+        missing_roles: [],
+        warnings: [],
+        explanation: 'The selected files look structurally suitable for incidence analysis, but the app has not produced a validated result yet.',
+      }),
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const response = await generateAnalysis(
+      'Compare rash incidence by treatment arm.',
+      [
+        {
+          id: 'adsl_compare_chat',
+          name: 'adsl.csv',
+          type: DataType.STANDARDIZED,
+          uploadDate: new Date().toISOString(),
+          size: '1 KB',
+          content: [
+            'USUBJID,TRT01A,AGE,SEX',
+            '01,DrugA,68,F',
+            '02,DrugA,71,M',
+            '03,DrugB,66,F',
+            '04,DrugB,70,M',
+          ].join('\n'),
+        },
+        {
+          id: 'adae_compare_chat',
+          name: 'adae.csv',
+          type: DataType.STANDARDIZED,
+          uploadDate: new Date().toISOString(),
+          size: '1 KB',
+          content: [
+            'USUBJID,AETERM,AETOXGR,AESTDY',
+            '01,Rash,2,15',
+            '02,Nausea,1,20',
+            '03,Rash,3,12',
+          ].join('\n'),
+        },
+      ],
+      'RAG',
+      []
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(response.answer).toMatch(/full analysis run/i);
+    expect(response.answer).toMatch(/not inventing a chart/i);
+    expect(response.chartConfig).toBeUndefined();
+  });
+
   it('blocks advanced multi-dataset chat requests instead of generating illustrative charts', async () => {
     const response = await generateAnalysis(
       'Which baseline variables are the strongest predictors of Grade 2+ adverse events by Week 12? Provide feature importance and partial dependence summaries.',

@@ -19,6 +19,14 @@ export interface QuestionPlanningAssist {
   notes: string[];
 }
 
+export interface PlanningReadinessContext {
+  status: 'idle' | 'loading' | 'ready' | 'missing_data' | 'unsupported' | 'error';
+  summary: string;
+  explanation?: string;
+  missingRoles?: string[];
+  sourceNames?: string[];
+}
+
 export interface ExplorationQuestionSuggestion {
   question: string;
   rationale: string;
@@ -93,7 +101,8 @@ const selectRepresentativePlanningFiles = (files: ClinicalFile[], limit = 18): C
 
 export const generateQuestionPlanningAssist = async (
   question: string,
-  files: ClinicalFile[]
+  files: ClinicalFile[],
+  readinessContext?: PlanningReadinessContext | null
 ): Promise<QuestionPlanningAssist | null> => {
   const trimmedQuestion = question.trim();
   if (!trimmedQuestion || files.length === 0) return null;
@@ -128,6 +137,24 @@ ${JSON.stringify({
   support_summary: deterministicRecommendation.supportAssessment.summary,
 }, null, 2)}
 
+Execution readiness check:
+${JSON.stringify(
+  readinessContext
+    ? {
+        status: readinessContext.status,
+        summary: readinessContext.summary,
+        explanation: readinessContext.explanation || '',
+        missing_roles: readinessContext.missingRoles || [],
+        checked_files: readinessContext.sourceNames || [],
+      }
+    : {
+        status: 'not_run',
+        summary: 'No deterministic execution-readiness result was provided.',
+      },
+  null,
+  2
+)}
+
 Return a concise JSON object that:
 - restates the question intent in plain language
 - identifies required and optional dataset roles
@@ -136,6 +163,9 @@ Return a concise JSON object that:
 - explains why those files are a good fit
 - highlights key risks or missing pieces
 - gives an overall confidence level
+
+If the execution readiness check says data is missing or unsupported, align your advice with it.
+Do not contradict the execution readiness result.
 
 Do not invent files that are not in the list.
 Keep the answer practical for an end user, not technical.

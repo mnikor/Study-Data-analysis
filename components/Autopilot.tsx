@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
   Download,
@@ -62,7 +62,9 @@ import { assessAutopilotQuestionMatch } from '../utils/autopilotQuestionMatch';
 import { buildQuestionFileRecommendation, inferDatasetProfile, mapProfileKindToAnalysisRole } from '../utils/datasetProfile';
 import { Chart } from './Chart';
 import { AutopilotControlPanel } from './AutopilotControlPanel';
+import { AutopilotPlanningHero } from './AutopilotPlanningHero';
 import { AutopilotRunBrowser } from './AutopilotRunBrowser';
+import { UiErrorBoundary } from './UiErrorBoundary';
 import { AutopilotWorkspaceSection } from './AutopilotWorkspaceSection';
 import { AutopilotWorkflowPanel } from './AutopilotWorkflowPanel';
 
@@ -107,6 +109,15 @@ interface PlannedAutopilotTask extends AutopilotAnalysisTask {
   backendSpec?: FastApiAnalysisSpec | null;
   backendPlannedFamily?: BackendAnalysisFamily | null;
   backendPlanExplanation?: string;
+}
+
+interface BackendPlanningPreflightState {
+  status: 'idle' | 'loading' | 'ready' | 'missing_data' | 'unsupported' | 'error';
+  summary: string;
+  explanation: string;
+  missingRoles: string[];
+  sourceNames: string[];
+  basis: 'current' | 'recommended' | null;
 }
 
 interface AutopilotProps {
@@ -440,11 +451,8 @@ const buildAutopilotPlanError = (
   return explanation || `Autopilot could not build a valid analysis plan for: ${question}`;
 };
 
-const buildBackendPlannedTask = async (
-  question: string,
-  sourceFiles: ClinicalFile[]
-): Promise<PlannedAutopilotTask> => {
-  const datasetRefs: FastApiDatasetReference[] = sourceFiles
+const buildBackendPlanningDatasetRefs = (sourceFiles: ClinicalFile[]): FastApiDatasetReference[] =>
+  sourceFiles
     .filter((file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content))
     .map((file) => {
       const reference = buildDatasetReference(file);
@@ -455,6 +463,12 @@ const buildBackendPlannedTask = async (
         role: mapProfileKindToAnalysisRole(profile.kind),
       };
     });
+
+const buildBackendPlannedTask = async (
+  question: string,
+  sourceFiles: ClinicalFile[]
+): Promise<PlannedAutopilotTask> => {
+  const datasetRefs = buildBackendPlanningDatasetRefs(sourceFiles);
 
   const plan = await requestAnalysisPlan(question, datasetRefs);
   if (plan.status !== 'executable' || !plan.spec) {
@@ -875,8 +889,8 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const [selectedProtocolId, setSelectedProtocolId] = useState('');
   const [targetDomain, setTargetDomain] = useState('DM');
   const [experienceMode, setExperienceMode] = useState<ExperienceMode>('EXPLORE_FAST');
-  const [analysisMode, setAnalysisMode] = useState<AutopilotExecutionMode>('PACK');
-  const [analysisScope, setAnalysisScope] = useState<AutopilotDataScope>('SINGLE_DATASET');
+  const [analysisMode, setAnalysisMode] = useState<AutopilotExecutionMode>('SINGLE');
+  const [analysisScope, setAnalysisScope] = useState<AutopilotDataScope>('LINKED_WORKSPACE');
   const [analysisQuestion, setAnalysisQuestion] = useState('');
   const [packFocusQuestion, setPackFocusQuestion] = useState('');
   const [customSynonyms, setCustomSynonyms] = useState('');
@@ -901,6 +915,14 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   const [planningAssist, setPlanningAssist] = useState<QuestionPlanningAssist | null>(null);
   const [isPlanningAssistLoading, setIsPlanningAssistLoading] = useState(false);
   const [planningAssistError, setPlanningAssistError] = useState<string | null>(null);
+  const [backendPlanningPreflight, setBackendPlanningPreflight] = useState<BackendPlanningPreflightState>({
+    status: 'idle',
+    summary: '',
+    explanation: '',
+    missingRoles: [],
+    sourceNames: [],
+    basis: null,
+  });
 
   const sourceFiles = useMemo(
     () => files.filter((f) => f.type === DataType.RAW || f.type === DataType.STANDARDIZED || f.type === DataType.COHORT_DEF),
@@ -916,15 +938,26 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     () => sourceFiles.filter((file) => file.id !== selectedSourceId),
     [sourceFiles, selectedSourceId]
   );
-  const selectedSupportingFiles = supportingSourceFiles.filter((file) => selectedSupportingIds.includes(file.id));
+  const selectedSupportingFiles = useMemo(
+    () => supportingSourceFiles.filter((file) => selectedSupportingIds.includes(file.id)),
+    [supportingSourceFiles, selectedSupportingIds]
+  );
   const selectedTargetDomainOption = TARGET_DOMAIN_OPTIONS.some((option) => option.value === targetDomain)
     ? targetDomain
     : CUSTOM_TARGET_DOMAIN_VALUE;
   const suggestedTargetDomain = useMemo(() => inferPrimaryClinicalDomain(selectedSource), [selectedSource]);
   const activeAutopilotPrompt = analysisMode === 'SINGLE' ? analysisQuestion.trim() : packFocusQuestion.trim();
+  const deferredAutopilotPrompt = useDeferredValue(activeAutopilotPrompt);
+  const sourceFileProfiles = useMemo(
+    () => new Map(sourceFiles.map((file) => [file.id, inferDatasetProfile(file)])),
+    [sourceFiles]
+  );
   const autopilotRecommendation = useMemo(
-    () => (activeAutopilotPrompt ? buildQuestionFileRecommendation(activeAutopilotPrompt, sourceFiles) : null),
-    [activeAutopilotPrompt, sourceFiles]
+    () =>
+      deferredAutopilotPrompt
+        ? buildQuestionFileRecommendation(deferredAutopilotPrompt, sourceFiles, sourceFileProfiles)
+        : null,
+    [deferredAutopilotPrompt, sourceFiles, sourceFileProfiles]
   );
   const recommendedSourceFile = useMemo(() => {
     if (!autopilotRecommendation) return null;
@@ -948,6 +981,38 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     if (!autopilotRecommendation || !recommendedSourceFile) return [];
     return [recommendedSourceFile, ...recommendedSupportingFiles];
   }, [autopilotRecommendation, recommendedSourceFile, recommendedSupportingFiles]);
+  const preflightExecutionFiles = useMemo(() => {
+    if (
+      analysisMode !== 'SINGLE' ||
+      !deferredAutopilotPrompt ||
+      !shouldPreferBackendPlanning(deferredAutopilotPrompt, analysisScope)
+    ) {
+      return { files: [] as ClinicalFile[], basis: null as BackendPlanningPreflightState['basis'] };
+    }
+
+    if (selectedSource) {
+      return {
+        files: analysisScope === 'LINKED_WORKSPACE' ? [selectedSource, ...selectedSupportingFiles] : [selectedSource],
+        basis: 'current' as const,
+      };
+    }
+
+    if (recommendedExecutionFiles.length > 0) {
+      return {
+        files: recommendedExecutionFiles,
+        basis: 'recommended' as const,
+      };
+    }
+
+    return { files: [] as ClinicalFile[], basis: null as BackendPlanningPreflightState['basis'] };
+  }, [
+    deferredAutopilotPrompt,
+    analysisMode,
+    analysisScope,
+    recommendedExecutionFiles,
+    selectedSource,
+    selectedSupportingFiles,
+  ]);
   const applyRecommendedAutopilotFiles = () => {
     if (!recommendedSourceFile) return;
     setSelectedSourceId(recommendedSourceFile.id);
@@ -958,7 +1023,19 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     setIsPlanningAssistLoading(true);
     setPlanningAssistError(null);
     try {
-      const assist = await generateQuestionPlanningAssist(activeAutopilotPrompt, sourceFiles);
+      const assist = await generateQuestionPlanningAssist(
+        activeAutopilotPrompt,
+        sourceFiles,
+        backendPlanningPreflight.status !== 'idle'
+          ? {
+              status: backendPlanningPreflight.status,
+              summary: backendPlanningPreflight.summary,
+              explanation: backendPlanningPreflight.explanation,
+              missingRoles: backendPlanningPreflight.missingRoles,
+              sourceNames: backendPlanningPreflight.sourceNames,
+            }
+          : null
+      );
       if (!assist) {
         setPlanningAssistError('AI planning assist could not propose advice from the current files.');
         setPlanningAssist(null);
@@ -982,6 +1059,96 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     setPlanningAssist(null);
     setPlanningAssistError(null);
   }, [activeAutopilotPrompt, sourceFiles]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resetPreflight = () => {
+      if (cancelled) return;
+      setBackendPlanningPreflight({
+        status: 'idle',
+        summary: '',
+        explanation: '',
+        missingRoles: [],
+        sourceNames: [],
+        basis: null,
+      });
+    };
+
+    if (
+      analysisMode !== 'SINGLE' ||
+      !deferredAutopilotPrompt ||
+      !shouldPreferBackendPlanning(deferredAutopilotPrompt, analysisScope) ||
+      preflightExecutionFiles.files.length === 0
+    ) {
+      resetPreflight();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const sourceNames = preflightExecutionFiles.files.map((file) => file.name);
+    const datasetRefs = buildBackendPlanningDatasetRefs(preflightExecutionFiles.files);
+
+    if (datasetRefs.length === 0) {
+      setBackendPlanningPreflight({
+        status: 'error',
+        summary: 'Backend preflight could not inspect the selected files.',
+        explanation: 'The selected files do not expose tabular content that can be sent to the deterministic planner.',
+        missingRoles: [],
+        sourceNames,
+        basis: preflightExecutionFiles.basis,
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setBackendPlanningPreflight({
+      status: 'loading',
+      summary: 'Checking deterministic readiness against the backend planner.',
+      explanation: '',
+      missingRoles: [],
+      sourceNames,
+      basis: preflightExecutionFiles.basis,
+    });
+
+    const runPreflight = async () => {
+      try {
+        const plan = await requestAnalysisPlan(deferredAutopilotPrompt, datasetRefs);
+        if (cancelled) return;
+
+        setBackendPlanningPreflight({
+          status: plan.status === 'executable' ? 'ready' : plan.status,
+          summary:
+            plan.status === 'executable'
+              ? 'The backend planner says this question is executable with the selected datasets.'
+              : buildAutopilotPlanError(deferredAutopilotPrompt, plan.status, plan.explanation, plan.missing_roles),
+          explanation: plan.explanation,
+          missingRoles: plan.missing_roles,
+          sourceNames,
+          basis: preflightExecutionFiles.basis,
+        });
+      } catch (error) {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : 'Backend planning preflight failed.';
+        setBackendPlanningPreflight({
+          status: 'error',
+          summary: 'Backend planning preflight failed.',
+          explanation: message,
+          missingRoles: [],
+          sourceNames,
+          basis: preflightExecutionFiles.basis,
+        });
+      }
+    };
+
+    runPreflight();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [deferredAutopilotPrompt, analysisMode, analysisScope, preflightExecutionFiles]);
 
   useEffect(() => {
     if (!selectedSource) {
@@ -1026,6 +1193,29 @@ export const Autopilot: React.FC<AutopilotProps> = ({
     }
     return null;
   }, [analysisMode, analysisScope, selectedSource, selectedSupportingFiles.length]);
+
+  const backendPlanningBlockingReason = useMemo(() => {
+    if (
+      analysisMode !== 'SINGLE' ||
+      !deferredAutopilotPrompt ||
+      !shouldPreferBackendPlanning(deferredAutopilotPrompt, analysisScope) ||
+      preflightExecutionFiles.basis !== 'current'
+    ) {
+      return null;
+    }
+
+    if (backendPlanningPreflight.status === 'missing_data' || backendPlanningPreflight.status === 'unsupported') {
+      return backendPlanningPreflight.summary;
+    }
+
+    return null;
+  }, [
+    deferredAutopilotPrompt,
+    analysisMode,
+    analysisScope,
+    backendPlanningPreflight,
+    preflightExecutionFiles.basis,
+  ]);
 
   const runMode = useMemo(() => {
     if (experienceMode === 'RUN_CONFIRMED') {
@@ -2406,6 +2596,9 @@ export const Autopilot: React.FC<AutopilotProps> = ({
           : analysisScope === 'LINKED_WORKSPACE'
             ? [transformedFile, ...selectedSupportingFiles]
             : [analysisFile];
+      const createdSessions: AnalysisSession[] = [];
+      const rejectedAnalyses: string[] = [];
+      const contextDocs = selectedProtocol ? [selectedProtocol] : [];
       let tasks: PlannedAutopilotTask[] = [];
       if (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED') {
         for (const hypothesis of enabledHypotheses) {
@@ -2462,10 +2655,6 @@ export const Autopilot: React.FC<AutopilotProps> = ({
         analysisScope,
         analysisScope === 'LINKED_WORKSPACE' ? linkedWorkspaceInfo?.sourceNames.length || 1 : 1
       );
-      const createdSessions: AnalysisSession[] = [];
-      const rejectedAnalyses: string[] = [];
-      const contextDocs = selectedProtocol ? [selectedProtocol] : [];
-
       for (let index = 0; index < tasks.length; index += 1) {
         const task = tasks[index];
         appendLog(`Running analysis ${index + 1}/${tasks.length}: ${task.question}`);
@@ -2818,91 +3007,105 @@ export const Autopilot: React.FC<AutopilotProps> = ({
   );
 
   const controlPanels = (
-    <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)] gap-6 items-start">
-      <AutopilotControlPanel
-        experienceMode={experienceMode}
-        analysisScope={analysisScope}
-        analysisMode={analysisMode}
-        runMode={runMode}
-        selectedProtocol={selectedProtocol}
-        confirmedBlockingReason={confirmedBlockingReason}
-        analysisQuestion={analysisQuestion}
-        defaultQuestion={buildDefaultQuestion()}
-        packFocusQuestion={packFocusQuestion}
-        proposedHypotheses={proposedHypotheses}
-        enabledHypothesesCount={enabledHypotheses.length}
-        hypothesisGenerationBlockingReason={hypothesisGenerationBlockingReason}
-        hypothesisGenerationError={hypothesisGenerationError}
-        autopilotRecommendation={autopilotRecommendation}
-        activeAutopilotPrompt={activeAutopilotPrompt}
-        recommendedSupportingFiles={recommendedSupportingFiles}
-        planningAssist={planningAssist}
-        planningAssistError={planningAssistError}
-        isPlanningAssistLoading={isPlanningAssistLoading}
-        sourceFiles={sourceFiles}
-        selectedSourceId={selectedSourceId}
-        recommendedSourceFile={recommendedSourceFile}
-        supportingSourceFiles={supportingSourceFiles}
-        selectedSupportingIds={selectedSupportingIds}
-        referenceFiles={referenceFiles}
-        selectedReferenceId={selectedReferenceId}
-        protocolFiles={protocolFiles}
-        selectedProtocolId={selectedProtocolId}
-        selectedTargetDomainOption={selectedTargetDomainOption}
-        targetDomain={targetDomain}
-        suggestedTargetDomain={suggestedTargetDomain}
-        customSynonyms={customSynonyms}
-        generateSasDraft={generateSasDraft}
-        isRunning={isRunning}
-        runDisabled={
-          isRunning ||
-          !selectedSource ||
-          (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
-          (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED' && enabledHypotheses.length === 0) ||
-          Boolean(confirmedBlockingReason)
-        }
-        targetDomainOptions={TARGET_DOMAIN_OPTIONS}
-        customTargetDomainValue={CUSTOM_TARGET_DOMAIN_VALUE}
-        roleLabels={AUTOPILOT_ROLE_LABELS}
-        recommendationConfidenceClass={recommendationConfidenceClass}
-        recommendationSupportStatusClass={recommendationSupportStatusClass}
-        recommendationSupportCheckClass={recommendationSupportCheckClass}
-        formatVariablesForDisplay={formatVariablesForDisplay}
-        onSetExperienceMode={setExperienceMode}
-        onSetAnalysisScope={setAnalysisScope}
-        onSetAnalysisMode={setAnalysisMode}
-        onSetAnalysisQuestion={setAnalysisQuestion}
-        onSetPackFocusQuestion={setPackFocusQuestion}
-        onGeneratePackHypotheses={generatePackHypotheses}
-        onToggleHypothesisEnabled={toggleHypothesisEnabled}
-        onUpdateHypothesisQuestion={updateHypothesisQuestion}
-        onApplyRecommendedAutopilotFiles={applyRecommendedAutopilotFiles}
-        onGeneratePlanningAssist={handleGeneratePlanningAssist}
-        onSetSelectedSourceId={setSelectedSourceId}
-        onSelectAllSupportingFiles={selectAllSupportingFiles}
-        onClearSupportingFiles={clearSupportingFiles}
-        onToggleSupportingFile={toggleSupportingFile}
-        onSetSelectedReferenceId={setSelectedReferenceId}
-        onSetSelectedProtocolId={setSelectedProtocolId}
-        onSetTargetDomain={setTargetDomain}
-        onSetCustomSynonyms={setCustomSynonyms}
-        onSetGenerateSasDraft={setGenerateSasDraft}
-        onRunAutopilot={runAutopilot}
-      />
+    <div className="space-y-6">
+      <UiErrorBoundary title="Planning Panel Error">
+        <AutopilotPlanningHero
+          analysisMode={analysisMode}
+          analysisQuestion={analysisQuestion}
+          defaultQuestion={buildDefaultQuestion()}
+          packFocusQuestion={packFocusQuestion}
+          activeAutopilotPrompt={activeAutopilotPrompt}
+          sourceFilesCount={sourceFiles.length}
+          autopilotRecommendation={autopilotRecommendation}
+          recommendedSupportingFiles={recommendedSupportingFiles}
+          planningAssist={planningAssist}
+          planningAssistError={planningAssistError}
+          isPlanningAssistLoading={isPlanningAssistLoading}
+          backendPlanningPreflight={backendPlanningPreflight}
+          roleLabels={AUTOPILOT_ROLE_LABELS}
+          recommendationConfidenceClass={recommendationConfidenceClass}
+          recommendationSupportStatusClass={recommendationSupportStatusClass}
+          recommendationSupportCheckClass={recommendationSupportCheckClass}
+          onSetAnalysisQuestion={setAnalysisQuestion}
+          onSetPackFocusQuestion={setPackFocusQuestion}
+          onApplyRecommendedAutopilotFiles={applyRecommendedAutopilotFiles}
+          onGeneratePlanningAssist={handleGeneratePlanningAssist}
+        />
+      </UiErrorBoundary>
 
-      <AutopilotWorkflowPanel
-        steps={STEP_ORDER.map((step) => ({
-          key: step.key,
-          label: step.label,
-          status: displayedStepState[step.key].status,
-          detail: displayedStepState[step.key].detail,
-        }))}
-        reviewMode={reviewMode}
-        runError={runError}
-        failureLogPreview={failureLogPreview}
-        displayedRunLog={displayedRunLog}
-        logHeightClass={logHeightClass}
-      />
+      <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)] gap-6 items-start">
+        <AutopilotControlPanel
+          experienceMode={experienceMode}
+          analysisScope={analysisScope}
+          analysisMode={analysisMode}
+          runMode={runMode}
+          selectedProtocol={selectedProtocol}
+          confirmedBlockingReason={confirmedBlockingReason}
+          proposedHypotheses={proposedHypotheses}
+          enabledHypothesesCount={enabledHypotheses.length}
+          hypothesisGenerationBlockingReason={hypothesisGenerationBlockingReason}
+          hypothesisGenerationError={hypothesisGenerationError}
+          backendPlanningBlockingReason={backendPlanningBlockingReason}
+          sourceFiles={sourceFiles}
+          selectedSourceId={selectedSourceId}
+          recommendedSourceFile={recommendedSourceFile}
+          supportingSourceFiles={supportingSourceFiles}
+          selectedSupportingIds={selectedSupportingIds}
+          referenceFiles={referenceFiles}
+          selectedReferenceId={selectedReferenceId}
+          protocolFiles={protocolFiles}
+          selectedProtocolId={selectedProtocolId}
+          selectedTargetDomainOption={selectedTargetDomainOption}
+          targetDomain={targetDomain}
+          suggestedTargetDomain={suggestedTargetDomain}
+          customSynonyms={customSynonyms}
+          generateSasDraft={generateSasDraft}
+          isRunning={isRunning}
+          runDisabled={
+            isRunning ||
+            !selectedSource ||
+            (analysisScope === 'LINKED_WORKSPACE' && selectedSupportingFiles.length === 0) ||
+            (analysisMode === 'PACK' && experienceMode !== 'RUN_CONFIRMED' && enabledHypotheses.length === 0) ||
+            Boolean(confirmedBlockingReason) ||
+            Boolean(backendPlanningBlockingReason)
+          }
+          targetDomainOptions={TARGET_DOMAIN_OPTIONS}
+          customTargetDomainValue={CUSTOM_TARGET_DOMAIN_VALUE}
+          formatVariablesForDisplay={formatVariablesForDisplay}
+          onSetExperienceMode={setExperienceMode}
+          onSetAnalysisScope={setAnalysisScope}
+          onSetAnalysisMode={setAnalysisMode}
+          onGeneratePackHypotheses={generatePackHypotheses}
+          onToggleHypothesisEnabled={toggleHypothesisEnabled}
+          onUpdateHypothesisQuestion={updateHypothesisQuestion}
+          onSetSelectedSourceId={setSelectedSourceId}
+          onSelectAllSupportingFiles={selectAllSupportingFiles}
+          onClearSupportingFiles={clearSupportingFiles}
+          onToggleSupportingFile={toggleSupportingFile}
+          onSetSelectedReferenceId={setSelectedReferenceId}
+          onSetSelectedProtocolId={setSelectedProtocolId}
+          onSetTargetDomain={setTargetDomain}
+          onSetCustomSynonyms={setCustomSynonyms}
+          onSetGenerateSasDraft={setGenerateSasDraft}
+          onRunAutopilot={runAutopilot}
+        />
+
+        <UiErrorBoundary title="Workflow Panel Error">
+          <AutopilotWorkflowPanel
+            steps={STEP_ORDER.map((step) => ({
+              key: step.key,
+              label: step.label,
+              status: displayedStepState[step.key].status,
+              detail: displayedStepState[step.key].detail,
+            }))}
+            reviewMode={reviewMode}
+            runError={runError}
+            failureLogPreview={failureLogPreview}
+            displayedRunLog={displayedRunLog}
+            logHeightClass={logHeightClass}
+          />
+        </UiErrorBoundary>
+      </div>
     </div>
   );
 
