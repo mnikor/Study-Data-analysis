@@ -987,10 +987,7 @@ class AnalysisAgentService:
             follow_up.append("Run an adjusted follow-up model that tests whether the observed signal persists after accounting for key baseline imbalances.")
 
         if supplemental_steps:
-            follow_up.append(f"Inspect the supporting output from {supplemental_steps[0].title.lower()} to refine the next model or subgroup review.")
-
-        if executed.warnings:
-            follow_up.extend([warning for warning in executed.warnings[:2] if str(warning).strip()])
+            follow_up.append(f"Inspect the supporting output from {supplemental_steps[0].title.lower()} and use it to refine the next model or subgroup review.")
 
         return follow_up
 

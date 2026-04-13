@@ -973,6 +973,22 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     await handleSend(question, scopedFiles, scopedIds);
   };
 
+  const buildFollowUpQuestion = (sourceQuestion: string, recommendation: string) => {
+    const cleanedRecommendation = recommendation.replace(/\s+/g, ' ').trim();
+    return `Follow up on the previous analysis question "${sourceQuestion}". Run this additional analysis: ${cleanedRecommendation}`;
+  };
+
+  const editFollowUpRecommendation = (sourceQuestion: string, recommendation: string) => {
+    setMode(AnalysisMode.AGENT);
+    setInput(buildFollowUpQuestion(sourceQuestion, recommendation));
+  };
+
+  const runFollowUpRecommendation = async (sourceQuestion: string, recommendation: string) => {
+    const followUpQuestion = buildFollowUpQuestion(sourceQuestion, recommendation);
+    setMode(AnalysisMode.AGENT);
+    await handleSend(followUpQuestion, undefined, undefined, AnalysisMode.AGENT);
+  };
+
   const handleRunSuggestedQuestion = async (suggestion: ExplorationQuestionSuggestion) => {
     if (suggestion.supportStatus === 'PARTIAL') {
       setPendingSuggestedQuestion(suggestion);
@@ -2550,9 +2566,29 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                             </div>
                             <ul className="space-y-3">
                               {insightSections.recommendedFollowUp.map((item, idx) => (
-                                <li key={`follow-up-${idx}`} className="flex items-start">
-                                  <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
-                                  <span className="text-sm text-indigo-900 leading-relaxed">{item}</span>
+                                <li key={`follow-up-${idx}`} className="rounded-lg border border-indigo-100 bg-white/70 px-3 py-3">
+                                  <div className="flex items-start">
+                                    <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
+                                    <span className="text-sm text-indigo-900 leading-relaxed">{item}</span>
+                                  </div>
+                                  {agentRun?.question && (
+                                    <div className="mt-3 flex flex-wrap gap-2 pl-6">
+                                      <button
+                                        onClick={() => void runFollowUpRecommendation(agentRun.question, item)}
+                                        disabled={isLoading}
+                                        className="rounded-full bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Run now
+                                      </button>
+                                      <button
+                                        onClick={() => editFollowUpRecommendation(agentRun.question, item)}
+                                        disabled={isLoading}
+                                        className="rounded-full border border-indigo-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Edit first
+                                      </button>
+                                    </div>
+                                  )}
                                 </li>
                               ))}
                             </ul>
