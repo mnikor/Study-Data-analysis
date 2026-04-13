@@ -448,6 +448,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   const [selectedAgentStepId, setSelectedAgentStepId] = useState<string | null>(null);
   const [isAgentDetailLoading, setIsAgentDetailLoading] = useState(false);
   const [agentDetailError, setAgentDetailError] = useState<string | null>(null);
+  const [activeExportRunId, setActiveExportRunId] = useState<string | null>(null);
   const [agentPlanBrief, setAgentPlanBrief] = useState<AnalysisAgentPlanBrief | null>(null);
   const [agentPlanStatus, setAgentPlanStatus] = useState<FastApiAgentPlanResponse['status'] | null>(null);
   const [agentPlanExplanation, setAgentPlanExplanation] = useState<string | null>(null);
@@ -1210,16 +1211,30 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   };
 
   const exportAgentRun = async (runId: string, format: 'ipynb' | 'html') => {
-    const exported = await exportAnalysisAgentRun(runId, format);
-    const blob = new Blob([exported.content], { type: exported.mime_type });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = exported.filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
+    setAgentDetailError(null);
+    setActiveExportRunId(`${runId}:${format}`);
+    try {
+      const exported = await exportAnalysisAgentRun(runId, format);
+      const mimeType = format === 'ipynb' ? 'application/json;charset=utf-8' : exported.mime_type;
+      const blob = new Blob([exported.content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = exported.filename;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setAgentDetailError(
+        error instanceof Error
+          ? error.message
+          : `Could not export the ${format === 'ipynb' ? 'notebook' : 'HTML report'}.`
+      );
+    } finally {
+      setActiveExportRunId(null);
+    }
   };
 
   return (
@@ -1690,16 +1705,18 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                       {activeAgentRunId === selectedAgentRunDetail.runId ? 'Opening…' : 'Open In Chat'}
                     </button>
                     <button
-                      onClick={() => exportAgentRun(selectedAgentRunDetail.runId, 'ipynb')}
-                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                      onClick={() => void exportAgentRun(selectedAgentRunDetail.runId, 'ipynb')}
+                      disabled={activeExportRunId === `${selectedAgentRunDetail.runId}:ipynb`}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      Notebook
+                      {activeExportRunId === `${selectedAgentRunDetail.runId}:ipynb` ? 'Preparing…' : 'Notebook'}
                     </button>
                     <button
-                      onClick={() => exportAgentRun(selectedAgentRunDetail.runId, 'html')}
-                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                      onClick={() => void exportAgentRun(selectedAgentRunDetail.runId, 'html')}
+                      disabled={activeExportRunId === `${selectedAgentRunDetail.runId}:html`}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      HTML
+                      {activeExportRunId === `${selectedAgentRunDetail.runId}:html` ? 'Preparing…' : 'HTML'}
                     </button>
                   </div>
                 </div>
@@ -2296,16 +2313,18 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                         </div>
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => exportAgentRun(agentRun.runId, 'ipynb')}
-                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                            onClick={() => void exportAgentRun(agentRun.runId, 'ipynb')}
+                            disabled={activeExportRunId === `${agentRun.runId}:ipynb`}
+                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            Notebook
+                            {activeExportRunId === `${agentRun.runId}:ipynb` ? 'Preparing…' : 'Notebook'}
                           </button>
                           <button
-                            onClick={() => exportAgentRun(agentRun.runId, 'html')}
-                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                            onClick={() => void exportAgentRun(agentRun.runId, 'html')}
+                            disabled={activeExportRunId === `${agentRun.runId}:html`}
+                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            HTML
+                            {activeExportRunId === `${agentRun.runId}:html` ? 'Preparing…' : 'HTML'}
                           </button>
                           <div className={`text-[11px] font-semibold uppercase tracking-wide ${
                             agentRun.executed ? 'text-slate-500' : 'text-amber-700'
