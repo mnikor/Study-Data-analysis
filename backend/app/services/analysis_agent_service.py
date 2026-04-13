@@ -1227,6 +1227,9 @@ class AnalysisAgentService:
 
     def _endpoint_reference(self, executed: AnalysisRunResponse, question: str | None = None) -> str:
         receipt = executed.receipt
+        extracted = self._extract_endpoint_from_question(question or "")
+        if extracted:
+            return extracted
         if receipt:
             endpoint_label = str(receipt.endpoint_label or "").strip()
             if endpoint_label and not self._is_generic_endpoint_label(endpoint_label):
@@ -1235,11 +1238,8 @@ class AnalysisAgentService:
             if target_definition:
                 return self._humanize_target_definition(target_definition)
             outcome_variable = str(receipt.outcome_variable or "").strip()
-            if outcome_variable and outcome_variable.upper() not in {"ENDPOINT", "DERIVED_ENDPOINT", "OUTCOME"}:
+            if outcome_variable and not self._is_generic_outcome_variable(outcome_variable):
                 return self._format_predictor_name(outcome_variable)
-        extracted = self._extract_endpoint_from_question(question or "")
-        if extracted:
-            return extracted
         return "the endpoint"
 
     def _extract_endpoint_from_question(self, question: str) -> str | None:
@@ -1249,6 +1249,8 @@ class AnalysisAgentService:
         patterns = [
             r"predictors? of (.+)",
             r"predictors? for (.+)",
+            r"identify patients at highest risk of (.+)",
+            r"highest risk of (.+)",
             r"risk factors? for (.+)",
             r"associated with (.+)",
             r"relate to (.+)",
@@ -1273,6 +1275,22 @@ class AnalysisAgentService:
             "exploratory predictors of derived adverse event endpoint",
         }
         return lowered in generic_labels or lowered.endswith(" adverse-event endpoint") or lowered.endswith(" adverse event endpoint")
+
+    def _is_generic_outcome_variable(self, value: str) -> bool:
+        normalized = value.strip().upper()
+        generic_values = {
+            "ENDPOINT",
+            "DERIVED_ENDPOINT",
+            "OUTCOME",
+            "AE_OUTCOME_FLAG",
+            "OUTCOME_FLAG",
+            "EVENT_FLAG",
+        }
+        return (
+            normalized in generic_values
+            or normalized.endswith("_FLAG")
+            or normalized.endswith("FLAG")
+        )
 
     def _humanize_target_definition(self, target_definition: str) -> str:
         normalized = target_definition.strip().lower()
