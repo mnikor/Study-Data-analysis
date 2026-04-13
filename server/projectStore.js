@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const DEFAULT_BACKEND = process.env.PROJECT_STORE_BACKEND || 'local-disk';
 
@@ -21,7 +22,8 @@ const readJsonFile = async (filePath, fallback = null) => {
 };
 
 const writeJsonAtomic = async (filePath, payload) => {
-  const tempFile = `${filePath}.tmp`;
+  await ensureDir(path.dirname(filePath));
+  const tempFile = `${filePath}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), 'utf8');
   await fs.rename(tempFile, filePath);
 };

@@ -85,4 +85,18 @@ describe('projectStore', () => {
       .catch(() => false);
     expect(legacyExists).toBe(false);
   });
+
+  it('handles overlapping writes without colliding on temp files', async () => {
+    const root = await makeTempRoot();
+    const store = createProjectStore(root);
+
+    await Promise.all([
+      store.writeProjects(sampleProjects),
+      store.writeProjects(sampleProjects),
+      store.writeProjects(sampleProjects),
+    ]);
+
+    const projects = await store.readProjects();
+    expect(projects[0].files[0].content).toBe('USUBJID,AGE\n01,65');
+  });
 });
