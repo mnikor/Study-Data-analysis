@@ -1201,30 +1201,57 @@ class AnalysisAgentService:
 
     def _build_notebook_payload(self, run: AnalysisAgentRunResponse) -> dict:
         cells: list[dict] = [
-            {
-                "cell_type": "markdown",
-                "metadata": {},
-                "source": [
+            self._markdown_notebook_cell(
+                [
                     "# AI Analysis Agent Run\n",
                     f"- Run ID: `{run.run_id}`\n",
                     f"- Analysis family: `{run.analysis_family}`\n",
                     f"- Executed: `{run.executed}`\n",
                     f"- Sources: {', '.join(run.selected_sources) or 'none'}\n",
-                ],
-            },
-            {
-                "cell_type": "markdown",
-                "metadata": {},
-                "source": ["## Final Answer\n", run.answer],
-            },
+                ]
+            ),
+            self._code_notebook_cell(
+                self._lines(
+                    "import json",
+                    "import pandas as pd",
+                    "from IPython.display import display, Markdown",
+                    "",
+                    "try:",
+                    "    import plotly.graph_objects as go",
+                    "except ImportError:",
+                    "    go = None",
+                    "",
+                    "def show_step_table(title, columns, rows):",
+                    "    df = pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)",
+                    "    display(Markdown(f\"### {title}\"))",
+                    "    display(df)",
+                    "    return df",
+                    "",
+                    "def show_chart_from_spec(spec):",
+                    "    if go is None:",
+                    "        print(\"Plotly is not installed in this notebook environment. Chart spec is still available as a Python dict.\")",
+                    "        return spec",
+                    "    fig = go.Figure()",
+                    "    for trace in spec.get('data', []):",
+                    "        fig.add_trace(go.Figure(data=[trace]).data[0])",
+                    "    fig.update_layout(**spec.get('layout', {}))",
+                    "    fig.show()",
+                    "    return fig",
+                )
+            ),
+            self._code_notebook_cell(
+                self._lines(
+                    f"run_metadata = {json.dumps({'run_id': run.run_id, 'question': run.question, 'analysis_family': run.analysis_family, 'executed': run.executed, 'selected_sources': run.selected_sources, 'warnings': run.warnings}, indent=2)}",
+                    "run_metadata",
+                )
+            ),
+            self._markdown_notebook_cell(["## Final Answer\n", run.answer]),
         ]
 
         for step in run.steps:
             cells.append(
-                {
-                    "cell_type": "markdown",
-                    "metadata": {},
-                    "source": [
+                self._markdown_notebook_cell(
+                    [
                         f"## {step.title}\n",
                         f"- Status: `{step.status}`\n",
                         f"{step.summary}\n",
@@ -1241,50 +1268,22 @@ class AnalysisAgentService:
                             if step.provenance
                             else []
                         ),
-                    ],
-                }
+                    ]
+                )
             )
             if step.code:
-                cells.append(
-                    {
-                        "cell_type": "code",
-                        "execution_count": None,
-                        "metadata": {},
-                        "outputs": [],
-                        "source": [step.code],
-                    }
-                )
+                cells.append(self._code_notebook_cell(step.code))
             if step.table:
-                header = "| " + " | ".join(step.table.columns) + " |\n"
-                separator = "|" + "|".join([" --- " for _ in step.table.columns]) + "|\n"
-                body = [
-                    "| " + " | ".join(str(row.get(column, "")) for column in step.table.columns) + " |\n"
-                    for row in step.table.rows
-                ]
                 cells.append(
-                    {
-                        "cell_type": "markdown",
-                        "metadata": {},
-                        "source": [
-                            f"### {step.table.title or 'Table'}\n",
-                            header,
-                            separator,
-                            *body,
-                        ],
-                    }
+                    self._code_notebook_cell(
+                        self._build_notebook_table_code(step.id, step.table.title or "Table", step.table.columns, step.table.rows)
+                    )
                 )
             if step.chart:
                 cells.append(
-                    {
-                        "cell_type": "markdown",
-                        "metadata": {},
-                        "source": [
-                            "### Chart Spec\n",
-                            "```json\n",
-                            json.dumps({"data": step.chart.data, "layout": step.chart.layout}, indent=2),
-                            "\n```\n",
-                        ],
-                    }
+                    self._code_notebook_cell(
+                        self._build_notebook_chart_code(step.id, {"data": step.chart.data, "layout": step.chart.layout})
+                    )
                 )
 
         return {
@@ -1303,6 +1302,60 @@ class AnalysisAgentService:
             "nbformat": 4,
             "nbformat_minor": 5,
         }
+
+    def _markdown_notebook_cell(self, source: list[str] | str) -> dict:
+        return {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": source if isinstance(source, list) else [source],
+        }
+
+    def _code_notebook_cell(self, source: list[str] | str) -> dict:
+        return {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": source if isinstance(source, list) else [source],
+        }
+
+    def _lines(self, *lines: str) -> list[str]:
+        return [f"{line}\n" for line in lines]
+
+    def _build_notebook_table_code(
+        self,
+        step_id: str,
+        title: str,
+        columns: list[str],
+        rows: list[dict[str, str | float | int]],
+    ) -> list[str]:
+        variable_prefix = self._sanitize_notebook_identifier(step_id)
+        return self._lines(
+            f"{variable_prefix}_table_columns = {json.dumps(columns)}",
+            f"{variable_prefix}_table_rows = {json.dumps(rows, indent=2)}",
+            f"{variable_prefix}_table_df = show_step_table({json.dumps(title)}, {variable_prefix}_table_columns, {variable_prefix}_table_rows)",
+            f"{variable_prefix}_table_df.head()",
+        )
+
+    def _build_notebook_chart_code(
+        self,
+        step_id: str,
+        chart_spec: dict[str, object],
+    ) -> list[str]:
+        variable_prefix = self._sanitize_notebook_identifier(step_id)
+        return self._lines(
+            f"{variable_prefix}_chart_spec = {json.dumps(chart_spec, indent=2)}",
+            f"{variable_prefix}_figure = show_chart_from_spec({variable_prefix}_chart_spec)",
+            f"{variable_prefix}_chart_spec",
+        )
+
+    def _sanitize_notebook_identifier(self, value: str) -> str:
+        sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", value).strip("_")
+        if not sanitized:
+            return "step"
+        if sanitized[0].isdigit():
+            return f"step_{sanitized}"
+        return sanitized
 
     def _build_html_report(self, run: AnalysisAgentRunResponse) -> str:
         sections = []
