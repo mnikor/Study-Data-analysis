@@ -229,7 +229,7 @@ class AnalysisAgentService:
         supplemental_steps = self._build_supplemental_steps(resolved, workspace.workspace_id)
         steps.extend(supplemental_steps)
 
-        user_summary = self._build_executed_user_summary(executed, supplemental_steps)
+        user_summary = self._build_executed_user_summary(question, executed, supplemental_steps)
         answer = self._build_final_answer(question, resolved, executed, supplemental_steps, user_summary)
         response = AnalysisAgentRunResponse(
             run_id=run_id,
@@ -855,28 +855,27 @@ class AnalysisAgentService:
 
     def _build_executed_user_summary(
         self,
+        question: str,
         executed: AnalysisRunResponse,
         supplemental_steps: list[AnalysisAgentStep],
     ) -> AnalysisAgentUserSummary:
         metrics = {metric.name: metric.value for metric in executed.metrics}
         bottom_line = (executed.interpretation or executed.explanation or "The deterministic analysis completed.").strip()
-        evidence_points = self._build_user_evidence_points(executed, metrics)
-        family_summary = self._build_family_bottom_line(executed, metrics)
+        evidence_points = self._build_user_evidence_points(question, executed, metrics)
+        family_summary = self._build_family_bottom_line(question, executed, metrics)
         if family_summary:
             bottom_line = family_summary
 
-        next_step = None
-        if executed.warnings:
-            next_step = executed.warnings[0]
-        elif supplemental_steps:
-            next_step = f"Review the supporting step: {supplemental_steps[0].title.lower()}."
+        follow_up = self._build_recommended_follow_up(executed, metrics, supplemental_steps)
+        limitations = self._build_limitations(executed, metrics)
+        next_step = follow_up[0] if follow_up else None
 
         return AnalysisAgentUserSummary(
             bottom_line=bottom_line,
             evidence_points=[point for point in evidence_points if str(point).strip()],
             potential_hypotheses=self._build_potential_hypotheses(executed, metrics),
-            recommended_follow_up=self._build_recommended_follow_up(executed, metrics, supplemental_steps),
-            limitations=self._build_limitations(executed, metrics),
+            recommended_follow_up=follow_up,
+            limitations=limitations,
             next_step=next_step,
         )
 
@@ -1003,17 +1002,23 @@ class AnalysisAgentService:
         metrics: dict[str, object],
     ) -> list[str]:
         limitations: list[str] = []
-
-        if executed.warnings:
-            limitations.extend([warning for warning in executed.warnings if str(warning).strip()])
+        warnings_text = "\n".join(str(warning) for warning in executed.warnings if str(warning).strip()).lower()
 
         if executed.analysis_family in {"incidence", "risk_difference"}:
             limitations.append("This comparison is descriptive unless covariate adjustment and sensitivity analyses confirm that the group difference is robust.")
         elif executed.analysis_family == "logistic_regression":
             pseudo_r2 = self._to_float(metrics.get("pseudo_r_squared"))
+            if "complete-case" in warnings_text:
+                limitations.append("The model only used patients with complete baseline data, so missing data may have reduced precision and may have shifted the apparent pattern.")
+            if "auto-selected" in warnings_text:
+                limitations.append("The predictor set was chosen automatically from available baseline variables, so clinically important factors may still be missing while some included variables may be less relevant.")
+            if any(token in warnings_text for token in ["collinear", "proxy", "reduced encoded predictor matrix"]):
+                limitations.append("Several overlapping baseline variables had to be simplified or removed because they carried similar information, so individual variable rankings should not be over-interpreted.")
+            if any(token in warnings_text for token in ["did not converge", "penalized fallback", "singular matrix"]):
+                limitations.append("The initial model was unstable and required a more conservative fallback fit, so the coefficient-level findings should be treated as directional rather than definitive.")
             if pseudo_r2 is not None and pseudo_r2 < 0.1:
-                limitations.append("Model fit appears modest, so the identified predictors may explain only a limited share of outcome variability.")
-            limitations.append("Predictor effects should not be interpreted as causal without additional adjustment, interaction testing, and external clinical review.")
+                limitations.append("The model explained only a limited share of the endpoint pattern, so this result is better suited for orientation than for making subgroup decisions.")
+            limitations.append("This analysis can highlight candidate risk markers, but it does not establish cause and effect.")
         elif executed.analysis_family in {"kaplan_meier", "cox"}:
             limitations.append("Time-to-event findings remain sensitive to censoring assumptions, event-definition rules, and baseline prognostic balance.")
         elif executed.analysis_family == "mixed_model":
@@ -1031,14 +1036,15 @@ class AnalysisAgentService:
             cleaned = str(item).strip()
             if cleaned and cleaned not in deduped:
                 deduped.append(cleaned)
-        return deduped
+        return deduped[:4]
 
     def _build_family_bottom_line(
         self,
+        question: str,
         executed: AnalysisRunResponse,
         metrics: dict[str, object],
     ) -> str | None:
-        endpoint_phrase = self._endpoint_reference(executed)
+        endpoint_phrase = self._endpoint_reference(executed, question)
         if executed.analysis_family in {"incidence", "risk_difference"} and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
             rows = executed.table.rows
@@ -1076,9 +1082,15 @@ class AnalysisAgentService:
                 predictor = self._format_predictor_name(top.get("predictor", "A predictor"))
                 odds_ratio = self._to_float(top.get("odds_ratio"))
                 if odds_ratio is not None:
-                    direction = "higher" if odds_ratio > 1 else "lower"
-                    return f"{predictor} was the clearest signal in this model and was associated with a {direction} likelihood of {endpoint_phrase}."
-            return f"No single baseline factor stood out as a strong independent driver of {endpoint_phrase} in this model."
+                    return (
+                        f"For the question of which baseline factors relate to {endpoint_phrase}, "
+                        f"{predictor} was the clearest signal in this model, but it still needs confirmation before it should influence decisions."
+                    )
+            return (
+                f"For the question of which baseline factors relate to {endpoint_phrase}, "
+                f"this analysis did not identify a clear, decision-ready baseline driver. "
+                f"In practical terms, the currently tested baseline variables do not yet support a reliable way to separate higher-risk from lower-risk patients."
+            )
 
         if executed.analysis_family == "cox" and executed.table and executed.table.rows:
             significant = [
@@ -1090,9 +1102,11 @@ class AnalysisAgentService:
                 predictor = self._format_predictor_name(top.get("predictor", "A predictor"))
                 hazard_ratio = self._to_float(top.get("hazard_ratio"))
                 if hazard_ratio is not None:
-                    direction = "higher" if hazard_ratio > 1 else "lower"
-                    return f"{predictor} was the clearest time-to-event signal and was associated with a {direction} event rate over follow-up for {endpoint_phrase}."
-            return f"No single baseline factor stood out as a strong independent time-to-event driver for {endpoint_phrase} in this model."
+                    return (
+                        f"For time to {endpoint_phrase}, {predictor} was the clearest baseline signal, "
+                        f"but it should still be treated as exploratory rather than practice-changing."
+                    )
+            return f"This time-to-event model did not identify a clear baseline driver for {endpoint_phrase} that would currently justify subgroup targeting or risk stratification."
 
         if executed.analysis_family == "kaplan_meier" and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
@@ -1111,10 +1125,11 @@ class AnalysisAgentService:
 
     def _build_user_evidence_points(
         self,
+        question: str,
         executed: AnalysisRunResponse,
         metrics: dict[str, object],
     ) -> list[str]:
-        endpoint_phrase = self._endpoint_reference(executed)
+        endpoint_phrase = self._endpoint_reference(executed, question)
         if executed.analysis_family in {"incidence", "risk_difference"} and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
             rows = sorted(
@@ -1140,7 +1155,9 @@ class AnalysisAgentService:
                 executed.table.rows,
                 key=lambda row: self._to_float(row.get("p_value")) or 1,
             )
-            bullets = []
+            bullets = [
+                f"Practical takeaway: none of the tested baseline variables provided a strong enough signal to serve as a dependable predictor of {endpoint_phrase} on their own."
+            ]
             for row in rows[:3]:
                 predictor = self._format_predictor_name(row.get("predictor", "predictor"))
                 odds_ratio = self._to_float(row.get("odds_ratio"))
@@ -1148,14 +1165,14 @@ class AnalysisAgentService:
                 if odds_ratio is not None and p_value is not None:
                     direction = "higher" if odds_ratio > 1 else "lower"
                     bullets.append(
-                        f"{predictor} pointed toward a {direction} likelihood of {endpoint_phrase}, but {self._describe_signal_strength(p_value)} (odds ratio {odds_ratio:.2f})."
+                        f"{predictor} showed only a weak directional trend toward {direction} risk for {endpoint_phrase}, and the current data do not support treating it as a stable independent predictor ({self._describe_signal_strength(p_value)}; odds ratio {odds_ratio:.2f})."
                     )
             pseudo_r2 = self._to_float(metrics.get("pseudo_r_squared"))
             if pseudo_r2 is not None:
                 if pseudo_r2 < 0.1:
-                    bullets.append(f"Overall model fit was modest (pseudo R-squared {pseudo_r2:.3f}), so this model explains only a limited share of the {endpoint_phrase} pattern.")
+                    bullets.append(f"The overall model explained only a limited share of the observed {endpoint_phrase} pattern (pseudo R-squared {pseudo_r2:.3f}), which is another reason to avoid over-interpreting individual predictors.")
                 else:
-                    bullets.append(f"Overall model fit was moderate (pseudo R-squared {pseudo_r2:.3f}).")
+                    bullets.append(f"The overall model fit was moderate (pseudo R-squared {pseudo_r2:.3f}).")
             return bullets
 
         if executed.analysis_family == "cox" and executed.table and executed.table.rows:
@@ -1208,7 +1225,7 @@ class AnalysisAgentService:
         label = str(value or "predictor").replace("_", " ").strip()
         return " ".join(part for part in label.split())
 
-    def _endpoint_reference(self, executed: AnalysisRunResponse) -> str:
+    def _endpoint_reference(self, executed: AnalysisRunResponse, question: str | None = None) -> str:
         receipt = executed.receipt
         if receipt:
             endpoint_label = str(receipt.endpoint_label or "").strip()
@@ -1217,7 +1234,30 @@ class AnalysisAgentService:
             target_definition = str(receipt.target_definition or "").strip()
             if target_definition:
                 return " ".join(target_definition.replace("_", " ").split())
+        extracted = self._extract_endpoint_from_question(question or "")
+        if extracted:
+            return extracted
         return "the endpoint"
+
+    def _extract_endpoint_from_question(self, question: str) -> str | None:
+        cleaned_question = question.strip().rstrip("?. ")
+        if not cleaned_question:
+            return None
+        patterns = [
+            r"predictors? of (.+)",
+            r"risk factors? for (.+)",
+            r"associated with (.+)",
+            r"drivers? of (.+)",
+            r"incidence of (.+)",
+            r"time to (.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, cleaned_question, re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip(" .")
+                if candidate:
+                    return candidate
+        return None
 
     def _describe_signal_strength(self, p_value: float) -> str:
         if p_value < 0.05:
