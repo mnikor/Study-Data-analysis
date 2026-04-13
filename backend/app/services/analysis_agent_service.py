@@ -1229,11 +1229,14 @@ class AnalysisAgentService:
         receipt = executed.receipt
         if receipt:
             endpoint_label = str(receipt.endpoint_label or "").strip()
-            if endpoint_label:
+            if endpoint_label and not self._is_generic_endpoint_label(endpoint_label):
                 return endpoint_label
             target_definition = str(receipt.target_definition or "").strip()
             if target_definition:
-                return " ".join(target_definition.replace("_", " ").split())
+                return self._humanize_target_definition(target_definition)
+            outcome_variable = str(receipt.outcome_variable or "").strip()
+            if outcome_variable and outcome_variable.upper() not in {"ENDPOINT", "DERIVED_ENDPOINT", "OUTCOME"}:
+                return self._format_predictor_name(outcome_variable)
         extracted = self._extract_endpoint_from_question(question or "")
         if extracted:
             return extracted
@@ -1245,8 +1248,10 @@ class AnalysisAgentService:
             return None
         patterns = [
             r"predictors? of (.+)",
+            r"predictors? for (.+)",
             r"risk factors? for (.+)",
             r"associated with (.+)",
+            r"relate to (.+)",
             r"drivers? of (.+)",
             r"incidence of (.+)",
             r"time to (.+)",
@@ -1258,6 +1263,30 @@ class AnalysisAgentService:
                 if candidate:
                     return candidate
         return None
+
+    def _is_generic_endpoint_label(self, label: str) -> bool:
+        lowered = label.strip().lower()
+        generic_labels = {
+            "endpoint",
+            "derived endpoint",
+            "exploratory predictors of derived adverse-event endpoint",
+            "exploratory predictors of derived adverse event endpoint",
+        }
+        return lowered in generic_labels or lowered.endswith(" adverse-event endpoint") or lowered.endswith(" adverse event endpoint")
+
+    def _humanize_target_definition(self, target_definition: str) -> str:
+        normalized = target_definition.strip().lower()
+        known = {
+            "grade_2_plus_dae_by_week_12": "Grade >=2 dermatologic adverse event by Week 12",
+            "time_to_resolution_grade_2_plus_dae": "time to resolution of Grade >=2 dermatologic adverse events",
+            "time_to_first_grade_2_plus_dae": "time to first Grade >=2 dermatologic adverse event",
+            "cumulative_incidence_of_discontinuation": "cumulative incidence of discontinuation",
+            "later_treatment_discontinuation": "later treatment discontinuation",
+            "repeated_measure_change": "change in the repeated-measure endpoint",
+        }
+        if normalized in known:
+            return known[normalized]
+        return " ".join(target_definition.replace("_", " ").split())
 
     def _describe_signal_strength(self, p_value: float) -> str:
         if p_value < 0.05:
