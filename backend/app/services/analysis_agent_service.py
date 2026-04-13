@@ -1038,6 +1038,7 @@ class AnalysisAgentService:
         executed: AnalysisRunResponse,
         metrics: dict[str, object],
     ) -> str | None:
+        endpoint_phrase = self._endpoint_reference(executed)
         if executed.analysis_family in {"incidence", "risk_difference"} and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
             rows = executed.table.rows
@@ -1058,12 +1059,12 @@ class AnalysisAgentService:
                     comparison_group = str(metrics["comparison_group"])
                     reference_group = str(metrics["reference_group"])
                     return (
-                        f"Events were more frequent in {top_group} than {bottom_group} "
+                        f"{endpoint_phrase.capitalize()} was more frequent in {top_group} than {bottom_group} "
                         f"({top_rate:.1f}% vs {bottom_rate:.1f}%). "
                         f"The estimated risk difference was {risk_difference_pp:+.1f} percentage points "
                         f"for {comparison_group} minus {reference_group}."
                     )
-                return f"Events were more frequent in {top_group} than {bottom_group} ({top_rate:.1f}% vs {bottom_rate:.1f}%)."
+                return f"{endpoint_phrase.capitalize()} was more frequent in {top_group} than {bottom_group} ({top_rate:.1f}% vs {bottom_rate:.1f}%)."
 
         if executed.analysis_family == "logistic_regression" and executed.table and executed.table.rows:
             significant = [
@@ -1076,8 +1077,8 @@ class AnalysisAgentService:
                 odds_ratio = self._to_float(top.get("odds_ratio"))
                 if odds_ratio is not None:
                     direction = "higher" if odds_ratio > 1 else "lower"
-                    return f"{predictor} was the clearest signal in this model and was associated with a {direction} likelihood of the endpoint."
-            return "No single baseline factor stood out as a strong independent driver of the endpoint in this model."
+                    return f"{predictor} was the clearest signal in this model and was associated with a {direction} likelihood of {endpoint_phrase}."
+            return f"No single baseline factor stood out as a strong independent driver of {endpoint_phrase} in this model."
 
         if executed.analysis_family == "cox" and executed.table and executed.table.rows:
             significant = [
@@ -1090,8 +1091,8 @@ class AnalysisAgentService:
                 hazard_ratio = self._to_float(top.get("hazard_ratio"))
                 if hazard_ratio is not None:
                     direction = "higher" if hazard_ratio > 1 else "lower"
-                    return f"{predictor} was the clearest time-to-event signal and was associated with a {direction} event rate over follow-up."
-            return "No single baseline factor stood out as a strong independent time-to-event driver in this model."
+                    return f"{predictor} was the clearest time-to-event signal and was associated with a {direction} event rate over follow-up for {endpoint_phrase}."
+            return f"No single baseline factor stood out as a strong independent time-to-event driver for {endpoint_phrase} in this model."
 
         if executed.analysis_family == "kaplan_meier" and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
@@ -1113,6 +1114,7 @@ class AnalysisAgentService:
         executed: AnalysisRunResponse,
         metrics: dict[str, object],
     ) -> list[str]:
+        endpoint_phrase = self._endpoint_reference(executed)
         if executed.analysis_family in {"incidence", "risk_difference"} and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
             rows = sorted(
@@ -1146,12 +1148,12 @@ class AnalysisAgentService:
                 if odds_ratio is not None and p_value is not None:
                     direction = "higher" if odds_ratio > 1 else "lower"
                     bullets.append(
-                        f"{predictor} pointed toward a {direction} likelihood of the endpoint, but {self._describe_signal_strength(p_value)} (odds ratio {odds_ratio:.2f})."
+                        f"{predictor} pointed toward a {direction} likelihood of {endpoint_phrase}, but {self._describe_signal_strength(p_value)} (odds ratio {odds_ratio:.2f})."
                     )
             pseudo_r2 = self._to_float(metrics.get("pseudo_r_squared"))
             if pseudo_r2 is not None:
                 if pseudo_r2 < 0.1:
-                    bullets.append(f"Overall model fit was modest (pseudo R-squared {pseudo_r2:.3f}), so this model explains only a limited share of the outcome pattern.")
+                    bullets.append(f"Overall model fit was modest (pseudo R-squared {pseudo_r2:.3f}), so this model explains only a limited share of the {endpoint_phrase} pattern.")
                 else:
                     bullets.append(f"Overall model fit was moderate (pseudo R-squared {pseudo_r2:.3f}).")
             return bullets
@@ -1169,7 +1171,7 @@ class AnalysisAgentService:
                 if hazard_ratio is not None and p_value is not None:
                     direction = "faster" if hazard_ratio > 1 else "slower"
                     bullets.append(
-                        f"{predictor} pointed toward a {direction} time to event, but {self._describe_signal_strength(p_value)} (hazard ratio {hazard_ratio:.2f})."
+                        f"{predictor} pointed toward a {direction} time to {endpoint_phrase}, but {self._describe_signal_strength(p_value)} (hazard ratio {hazard_ratio:.2f})."
                     )
             concordance = self._to_float(metrics.get("concordance_index"))
             if concordance is not None:
@@ -1205,6 +1207,17 @@ class AnalysisAgentService:
     def _format_predictor_name(self, value: object) -> str:
         label = str(value or "predictor").replace("_", " ").strip()
         return " ".join(part for part in label.split())
+
+    def _endpoint_reference(self, executed: AnalysisRunResponse) -> str:
+        receipt = executed.receipt
+        if receipt:
+            endpoint_label = str(receipt.endpoint_label or "").strip()
+            if endpoint_label:
+                return endpoint_label
+            target_definition = str(receipt.target_definition or "").strip()
+            if target_definition:
+                return " ".join(target_definition.replace("_", " ").split())
+        return "the endpoint"
 
     def _describe_signal_strength(self, p_value: float) -> str:
         if p_value < 0.05:
