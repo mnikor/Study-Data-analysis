@@ -392,8 +392,65 @@ export interface FastApiAgentExportResponse {
   content: string;
 }
 
-export const exportAnalysisAgentRun = async (
+const buildContentDispositionFilename = (headerValue: string | null): string | null => {
+  if (!headerValue) {
+    return null;
+  }
+
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1]);
+  }
+
+  const quotedMatch = headerValue.match(/filename="([^"]+)"/i);
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1];
+  }
+
+  const plainMatch = headerValue.match(/filename=([^;]+)/i);
+  return plainMatch?.[1]?.trim() ?? null;
+};
+
+export interface FastApiAgentDownloadResponse {
+  blob: Blob;
+  filename: string;
+  mimeType: string;
+}
+
+export const downloadAnalysisAgentRun = async (
   runId: string,
   format: 'ipynb' | 'html'
-): Promise<FastApiAgentExportResponse> =>
-  getJson<FastApiAgentExportResponse>(`/analysis/agent/run/${runId}/export/${format}`);
+): Promise<FastApiAgentDownloadResponse> => {
+  const baseUrls = getCandidateBaseUrls();
+  const errors: string[] = [];
+
+  for (const baseUrl of baseUrls) {
+    try {
+      const response = await fetch(`${baseUrl}/analysis/agent/run/${runId}/download/${format}`);
+
+      if (response.ok) {
+        const blob = await response.blob();
+        const filename =
+          buildContentDispositionFilename(response.headers.get('content-disposition')) ||
+          `${runId}.${format}`;
+        return {
+          blob,
+          filename,
+          mimeType: response.headers.get('content-type') || blob.type || 'application/octet-stream',
+        };
+      }
+
+      const message = await buildErrorMessage(response, baseUrl);
+      errors.push(message);
+
+      if (![404, 502, 503].includes(response.status)) {
+        throw new Error(message);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${baseUrl}: ${message}`);
+    }
+  }
+
+  throw new Error(errors[errors.length - 1] || 'FastAPI download failed.');
+};

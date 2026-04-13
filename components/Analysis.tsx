@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users, Activity, Cpu, ChevronDown, ChevronRight } from 'lucide-react';
 import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, ProvenanceType, AnalysisAgentRunSummary, AnalysisAgentRun, AnalysisAgentPlanBrief } from '../types';
 import { generateAnalysis } from '../services/geminiService';
-import { exportAnalysisAgentRun, getAnalysisAgentRun, listAnalysisAgentRuns, planAnalysisAgent, type FastApiAgentPlanResponse, type FastApiAgentRunResponse } from '../services/fastapiAnalysisService';
+import { downloadAnalysisAgentRun, getAnalysisAgentRun, listAnalysisAgentRuns, planAnalysisAgent, type FastApiAgentPlanResponse, type FastApiAgentRunResponse } from '../services/fastapiAnalysisService';
 import { buildDatasetReference } from '../services/executionBridge';
 import {
   generateQuestionPlanningAssist,
@@ -1214,9 +1214,10 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     setAgentDetailError(null);
     setActiveExportRunId(`${runId}:${format}`);
     try {
-      const exported = await exportAnalysisAgentRun(runId, format);
-      const mimeType = format === 'ipynb' ? 'application/json;charset=utf-8' : exported.mime_type;
-      const blob = new Blob([exported.content], { type: mimeType });
+      const exported = await downloadAnalysisAgentRun(runId, format);
+      const blob = exported.blob.type
+        ? exported.blob
+        : new Blob([exported.blob], { type: exported.mimeType });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;

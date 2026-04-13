@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 from ...models.analysis import (
     AnalysisAgentPlanRequest,
@@ -75,3 +76,21 @@ def export_analysis_agent_run(run_id: str, export_format: str) -> AnalysisAgentE
     except ValueError as error:
         status_code = 404 if "not found" in str(error).lower() else 400
         raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+
+@router.get("/agent/run/{run_id}/download/{export_format}")
+def download_analysis_agent_run(run_id: str, export_format: str) -> Response:
+    try:
+        exported = agent_service.export_run(run_id, export_format)
+    except ValueError as error:
+        status_code = 404 if "not found" in str(error).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+    return Response(
+        content=exported.content,
+        media_type=exported.mime_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{exported.filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
