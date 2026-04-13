@@ -900,9 +900,9 @@ class AnalysisAgentService:
 
         if executed.analysis_family == "logistic_regression":
             hypotheses.extend([
-                "The strongest predictors may be markers of higher-risk patients, not direct causes of the outcome.",
-                "Some predictor effects may reflect differences in treatment assignment, exposure time, or other factors the model did not fully capture.",
-                "Several baseline variables may describe the same underlying clinical pattern, so one top predictor should not be treated as the single explanation.",
+                "The variables near the top may simply identify patients who were already at higher baseline risk, rather than directly causing the outcome.",
+                "Part of the pattern may reflect treatment allocation, exposure duration, or other clinical differences that were not fully captured in this model.",
+                "Some predictors likely describe the same underlying patient profile, so no single variable should be treated as the whole explanation on its own.",
             ])
             return hypotheses
 
@@ -955,9 +955,9 @@ class AnalysisAgentService:
             ])
         elif executed.analysis_family == "logistic_regression":
             follow_up.extend([
-                "Test treatment-covariate interaction terms to distinguish general risk factors from subgroup-specific treatment effects.",
-                "Check calibration, discrimination, and stability across alternative covariate sets or sensitivity models.",
-                "Review whether the top predictors remain consistent after removing correlated or proxy variables.",
+                "Run a treatment-by-predictor interaction analysis. This would show whether the signal is broadly consistent across patients or concentrated in a treatment-defined subgroup.",
+                "Run a sensitivity version of the model with a different covariate set. This would test whether the main finding stays directionally similar when the model is specified differently.",
+                "Re-fit the model after removing overlapping or proxy variables. This would clarify whether the same predictors still stand out once competing baseline signals are simplified.",
             ])
         elif executed.analysis_family in {"kaplan_meier", "cox"}:
             follow_up.extend([
@@ -987,7 +987,13 @@ class AnalysisAgentService:
             follow_up.append("Run an adjusted follow-up model that tests whether the observed signal persists after accounting for key baseline imbalances.")
 
         if supplemental_steps:
-            follow_up.append(f"Inspect the supporting output from {supplemental_steps[0].title.lower()} and use it to refine the next model or subgroup review.")
+            title = supplemental_steps[0].title.lower()
+            if executed.analysis_family == "logistic_regression":
+                follow_up.append(
+                    f"Review the supporting output from {title}. This complements the initial model by checking whether the apparent predictor signal could instead reflect treatment-group imbalance or cohort differences."
+                )
+            else:
+                follow_up.append(f"Review the supporting output from {title}. This complements the initial result by checking the data pattern from a second angle before narrowing the next analysis.")
 
         return follow_up
 
@@ -1066,12 +1072,12 @@ class AnalysisAgentService:
             ]
             if significant:
                 top = min(significant, key=lambda row: self._to_float(row.get("p_value")) or 1)
-                predictor = str(top.get("predictor", "A predictor")).replace("_", " ")
+                predictor = self._format_predictor_name(top.get("predictor", "A predictor"))
                 odds_ratio = self._to_float(top.get("odds_ratio"))
                 if odds_ratio is not None:
                     direction = "higher" if odds_ratio > 1 else "lower"
-                    return f"{predictor} was associated with a {direction} odds of the endpoint (odds ratio {odds_ratio:.2f})."
-            return "The model estimated subject-level odds of the endpoint from treatment and baseline predictors."
+                    return f"{predictor} was the clearest signal in this model and was associated with a {direction} likelihood of the endpoint."
+            return "No single baseline factor stood out as a strong independent driver of the endpoint in this model."
 
         if executed.analysis_family == "cox" and executed.table and executed.table.rows:
             significant = [
@@ -1080,12 +1086,12 @@ class AnalysisAgentService:
             ]
             if significant:
                 top = min(significant, key=lambda row: self._to_float(row.get("p_value")) or 1)
-                predictor = str(top.get("predictor", "A predictor")).replace("_", " ")
+                predictor = self._format_predictor_name(top.get("predictor", "A predictor"))
                 hazard_ratio = self._to_float(top.get("hazard_ratio"))
                 if hazard_ratio is not None:
                     direction = "higher" if hazard_ratio > 1 else "lower"
-                    return f"{predictor} was associated with a {direction} hazard of the event (hazard ratio {hazard_ratio:.2f})."
-            return "The Cox model estimated time-to-event differences across treatment and baseline predictors."
+                    return f"{predictor} was the clearest time-to-event signal and was associated with a {direction} event rate over follow-up."
+            return "No single baseline factor stood out as a strong independent time-to-event driver in this model."
 
         if executed.analysis_family == "kaplan_meier" and executed.table and executed.table.rows:
             group_col = executed.table.columns[0] if executed.table.columns else "group"
@@ -1120,7 +1126,7 @@ class AnalysisAgentService:
             ]
             p_value = self._to_float(metrics.get("p_value"))
             if p_value is not None:
-                bullets.append(f"Chi-square p-value: {p_value:.4f}")
+                bullets.append(self._describe_p_value(p_value, "The between-group separation"))
             ci_lower = self._to_float(metrics.get("ci_lower_95"))
             ci_upper = self._to_float(metrics.get("ci_upper_95"))
             if ci_lower is not None and ci_upper is not None:
@@ -1134,14 +1140,20 @@ class AnalysisAgentService:
             )
             bullets = []
             for row in rows[:3]:
-                predictor = str(row.get("predictor", "predictor")).replace("_", " ")
+                predictor = self._format_predictor_name(row.get("predictor", "predictor"))
                 odds_ratio = self._to_float(row.get("odds_ratio"))
                 p_value = self._to_float(row.get("p_value"))
                 if odds_ratio is not None and p_value is not None:
-                    bullets.append(f"{predictor}: odds ratio {odds_ratio:.2f}, p={p_value:.4f}")
+                    direction = "higher" if odds_ratio > 1 else "lower"
+                    bullets.append(
+                        f"{predictor} pointed toward a {direction} likelihood of the endpoint, but {self._describe_signal_strength(p_value)} (odds ratio {odds_ratio:.2f})."
+                    )
             pseudo_r2 = self._to_float(metrics.get("pseudo_r_squared"))
             if pseudo_r2 is not None:
-                bullets.append(f"Pseudo R-squared: {pseudo_r2:.3f}")
+                if pseudo_r2 < 0.1:
+                    bullets.append(f"Overall model fit was modest (pseudo R-squared {pseudo_r2:.3f}), so this model explains only a limited share of the outcome pattern.")
+                else:
+                    bullets.append(f"Overall model fit was moderate (pseudo R-squared {pseudo_r2:.3f}).")
             return bullets
 
         if executed.analysis_family == "cox" and executed.table and executed.table.rows:
@@ -1151,14 +1163,17 @@ class AnalysisAgentService:
             )
             bullets = []
             for row in rows[:3]:
-                predictor = str(row.get("predictor", "predictor")).replace("_", " ")
+                predictor = self._format_predictor_name(row.get("predictor", "predictor"))
                 hazard_ratio = self._to_float(row.get("hazard_ratio"))
                 p_value = self._to_float(row.get("p_value"))
                 if hazard_ratio is not None and p_value is not None:
-                    bullets.append(f"{predictor}: hazard ratio {hazard_ratio:.2f}, p={p_value:.4f}")
+                    direction = "faster" if hazard_ratio > 1 else "slower"
+                    bullets.append(
+                        f"{predictor} pointed toward a {direction} time to event, but {self._describe_signal_strength(p_value)} (hazard ratio {hazard_ratio:.2f})."
+                    )
             concordance = self._to_float(metrics.get("concordance_index"))
             if concordance is not None:
-                bullets.append(f"Concordance index: {concordance:.3f}")
+                bullets.append(f"Model discrimination was {concordance:.3f} by concordance index.")
             return bullets
 
         if executed.analysis_family == "kaplan_meier" and executed.table and executed.table.rows:
@@ -1186,6 +1201,24 @@ class AnalysisAgentService:
                 if column in first_row
             ]
         return fallback
+
+    def _format_predictor_name(self, value: object) -> str:
+        label = str(value or "predictor").replace("_", " ").strip()
+        return " ".join(part for part in label.split())
+
+    def _describe_signal_strength(self, p_value: float) -> str:
+        if p_value < 0.05:
+            return f"the signal was reasonably strong statistically (p={p_value:.4f})"
+        if p_value < 0.1:
+            return f"the signal was only borderline statistically (p={p_value:.4f})"
+        return f"the signal was not statistically strong (p={p_value:.4f})"
+
+    def _describe_p_value(self, p_value: float, prefix: str) -> str:
+        if p_value < 0.05:
+            return f"{prefix} was reasonably strong statistically (p={p_value:.4f})."
+        if p_value < 0.1:
+            return f"{prefix} was only borderline statistically (p={p_value:.4f})."
+        return f"{prefix} was not statistically strong (p={p_value:.4f})."
 
     def _to_float(self, value: object) -> float | None:
         if isinstance(value, (int, float)):
