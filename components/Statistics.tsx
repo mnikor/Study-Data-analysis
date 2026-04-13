@@ -2344,6 +2344,16 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                    </span>
                                  </div>
                                  <p className="mt-3 text-sm text-slate-700">{backendPreview.plan?.explanation || backendPreview.capability.explanation}</p>
+                                 {backendPreview.capability.assessment?.blocker_reason && (
+                                   <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700">
+                                     <span className="font-semibold text-slate-800">Why:</span> {backendPreview.capability.assessment.blocker_reason}
+                                   </div>
+                                 )}
+                                 {backendPreview.capability.assessment?.recommended_next_step && (
+                                   <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                                     <span className="font-semibold">What to do next:</span> {backendPreview.capability.assessment.recommended_next_step}
+                                   </div>
+                                 )}
                                  {backendPreview.workspace?.workspace_id && (
                                    <div className="mt-3 text-xs text-slate-600 space-y-1">
                                      <div>Workspace: <span className="font-semibold text-slate-800">{backendPreview.workspace.workspace_id}</span></div>
@@ -2378,6 +2388,14 @@ export const Statistics: React.FC<StatisticsProps> = ({ files, onRecordProvenanc
                                      ))}
                                    </div>
                                  )}
+                                 {backendPreview.capability.assessment?.method_constraints?.length ? (
+                                   <div className="mt-3 text-xs text-slate-600 space-y-1">
+                                     <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Method Constraints</div>
+                                     {backendPreview.capability.assessment.method_constraints.map((constraint, index) => (
+                                       <div key={`${constraint}-${index}`}>- {constraint}</div>
+                                     ))}
+                                   </div>
+                                 ) : null}
                                </div>
 
                                {backendPreview.plan?.spec && (

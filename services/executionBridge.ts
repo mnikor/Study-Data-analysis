@@ -26,12 +26,13 @@ export interface StatisticalExecutionOptions {
   backendSpec?: FastApiAnalysisSpec | null;
 }
 
-export const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReference => {
+export const buildDatasetReference = (file: ClinicalFile, preferred = false): FastApiDatasetReference => {
   if (!file.content) {
     return {
       file_id: file.id,
       name: file.name,
       role: file.metadata?.datasetRole as string | undefined,
+      preferred,
       column_names: [],
     };
   }
@@ -45,6 +46,7 @@ export const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReferen
       file_id: file.id,
       name: file.name,
       role,
+      preferred,
       row_count: rows.length,
       column_names: headers,
       content: file.content,
@@ -54,6 +56,7 @@ export const buildDatasetReference = (file: ClinicalFile): FastApiDatasetReferen
       file_id: file.id,
       name: file.name,
       role: file.metadata?.datasetRole as string | undefined,
+      preferred,
       column_names: [],
     };
   }

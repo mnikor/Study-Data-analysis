@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         default=str(Path(__file__).resolve().parents[2] / ".app-data" / "analysis-workspaces"),
         alias="ECP_WORKSPACE_STORE_DIR",
     )
+    analysis_agent_store_dir: str = Field(
+        default=str(Path(__file__).resolve().parents[2] / ".app-data" / "analysis-agent-runs"),
+        alias="ECP_ANALYSIS_AGENT_STORE_DIR",
+    )
 
 
 @lru_cache

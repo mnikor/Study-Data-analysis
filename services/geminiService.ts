@@ -4,6 +4,7 @@ import {
   DataType,
   MappingSpec,
   AnalysisResponse,
+  ResponseModeBadge,
   StatAnalysisResult,
   StatTestType,
   QCStatus,
@@ -27,6 +28,7 @@ import {
 import {
   buildAnalysisWorkspace,
   classifyAnalysisCapabilities,
+  runAnalysisAgent as runFastApiAnalysisAgent,
   requestAnalysisPlan,
   runBackendAnalysis,
   type FastApiDatasetReference,
@@ -51,12 +53,26 @@ export {
   type QuestionPlanningAssist,
 } from "./planningAssistService";
 
+type SummaryContextMode = 'RAG' | 'STUFFING';
+
 const CHAT_EXECUTION_INTENT = /compare|difference|association|correlat|regress|incidence|rate|frequency|distribution|trend|outlier|analy[sz]e|analysis|run|test|chart|kaplan|survival|hazard|cox|anova|chi[- ]?square|t[- ]?test/i;
 const CHAT_GUIDANCE_INTENT = /what can i do|which workflow|how should i|what does this dataset|review the selected|explain the dataset|what files|how to start/i;
 const ADVANCED_ANALYSIS_GUARD_INTENT =
   /feature importance|partial dependence|predictor|predictors|week\s*\d+|risk difference|95%\s*ci|confidence interval|time to resolution|adherence|compliance|interrupt|reduction|discontinuation|dose|mitigat|key drivers|model outputs/i;
 const SURVIVAL_BACKEND_GUARD_INTENT =
   /kaplan|survival|hazard ratio|cox|time[- ]to[- ]event|time to event|overall survival|progression[- ]free|\bpfs\b|\bos\b/i;
+
+const buildResponseModeBadge = (
+  label: string,
+  tone: ResponseModeBadge['tone'],
+  detail?: string,
+  autoRouted = false
+): ResponseModeBadge => ({
+  label,
+  tone,
+  detail,
+  autoRouted,
+});
 
 const canRunExploratoryChatAnalysis = (query: string, contextFiles: ClinicalFile[]): ClinicalFile | null => {
   if (!CHAT_EXECUTION_INTENT.test(query) || CHAT_GUIDANCE_INTENT.test(query)) {
@@ -196,12 +212,22 @@ const runAdvancedAnalysisGuard = async (
           '',
           'For this question, a good starting set is usually one subject-level demographics file, one adverse-events file, and one exposure or dosing file.',
         ].join('\n'),
+        responseModeBadge: buildResponseModeBadge(
+          'Deterministic analysis blocked',
+          'blocked',
+          'Duplicate singleton dataset roles must be resolved before execution.'
+        ),
       };
     }
 
     if (feasibilityQuestion) {
       const missingDescriptions = capability.missing_roles.map(describeRole);
       const familyDescription = describeFamily(capability.analysis_family);
+      const recommendedNextStep = capability.assessment?.recommended_next_step || (
+        capability.status === 'executable'
+          ? 'If you want, ask the app to run the analysis rather than just assess feasibility.'
+          : 'Select the missing domains or clean the role mapping, then ask the app to run the analysis.'
+      );
       const baseAnswer =
         capability.status === 'executable'
           ? [
@@ -224,11 +250,17 @@ const runAdvancedAnalysisGuard = async (
           ...(capability.warnings.length > 0
             ? ['', '### Things to check', ...capability.warnings.map((warning) => `- ${warning}`)]
             : []),
+          ...(capability.assessment?.method_constraints?.length
+            ? ['', '### Method constraints', ...capability.assessment.method_constraints.map((constraint) => `- ${constraint}`)]
+            : []),
           '',
-          capability.status === 'executable'
-            ? 'If you want, ask the app to run the analysis rather than just assess feasibility.'
-            : 'Select the missing domains or clean the role mapping, then ask the app to run the analysis.',
+          recommendedNextStep,
         ].join('\n'),
+        responseModeBadge: buildResponseModeBadge(
+          capability.status === 'executable' ? 'Summary guidance' : 'Summary with data gap',
+          capability.status === 'executable' ? 'summary' : 'blocked',
+          'This answer assessed feasibility rather than executing a model.'
+        ),
       };
     }
 
@@ -252,7 +284,14 @@ const runAdvancedAnalysisGuard = async (
       const executed = await runBackendAnalysis(query, datasetRefs, plan.spec || undefined, workspace.workspace_id);
 
       if (executed.executed) {
-        return formatDeterministicChatResponse(executed, query);
+        return {
+          ...formatDeterministicChatResponse(executed, query),
+          responseModeBadge: buildResponseModeBadge(
+            'Deterministic backend result',
+            'deterministic',
+            'Executed directly from the summary workflow without full agent step history.'
+          ),
+        };
       }
     }
 
@@ -263,15 +302,24 @@ const runAdvancedAnalysisGuard = async (
           ? `The selected files look structurally suitable for ${describeFamily(capability.analysis_family)}, but the app has not produced a validated result yet.`
           : capability.explanation,
         '',
+        ...(capability.assessment?.blocker_reason ? [`**Why it stopped:** ${capability.assessment.blocker_reason}`, ''] : []),
         capability.missing_roles.length > 0
           ? `**Still needed:** ${capability.missing_roles.map(describeRole).join(', ')}.`
           : '**Selected data:** enough to recognize the needed analysis workflow.',
         ...(capability.warnings.length > 0 ? ['', '### Things to check', ...capability.warnings.map((warning) => `- ${warning}`)] : []),
+        ...(capability.assessment?.data_requirements?.length ? ['', '### Data requirements', ...capability.assessment.data_requirements.map((item) => `- ${item}`)] : []),
+        ...(capability.assessment?.method_constraints?.length ? ['', '### Method constraints', ...capability.assessment.method_constraints.map((item) => `- ${item}`)] : []),
         '',
-        '**What to do next:** clean up the selected files if needed, then ask the app to run the analysis again.',
+        `**What to do next:** ${capability.assessment?.recommended_next_step || 'clean up the selected files if needed, then ask the app to run the analysis again.'}`,
+        ...(capability.assessment?.fallback_option ? ['', `**Fallback:** ${capability.assessment.fallback_option}`] : []),
         '',
         'The app is intentionally not inventing a chart or result table here.',
       ].join('\n'),
+      responseModeBadge: buildResponseModeBadge(
+        'Deterministic analysis blocked',
+        capability.status === 'executable' ? 'fallback' : 'blocked',
+        'The backend recognized the workflow but did not produce a validated executed result.'
+      ),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown FastAPI execution error';
@@ -287,6 +335,11 @@ const runAdvancedAnalysisGuard = async (
         '- the analysis service is not running or crashed during startup',
         '- the browser could not reach the local analysis endpoint through the app server proxy',
       ].join('\n'),
+      responseModeBadge: buildResponseModeBadge(
+        'Backend execution error',
+        'fallback',
+        'The summary workflow could not reach the deterministic backend.'
+      ),
     };
   }
 };
@@ -424,7 +477,7 @@ export const buildTabularChatContext = (file: ClinicalFile): string => {
   }
 };
 
-export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' | 'STUFFING', query = ''): string => {
+export const buildChatContextText = (contextFiles: ClinicalFile[], mode: SummaryContextMode, query = ''): string => {
   if (contextFiles.length === 0) return 'No context files selected.';
 
   if (mode === 'RAG') {
@@ -445,6 +498,30 @@ export const buildChatContextText = (contextFiles: ClinicalFile[], mode: 'RAG' |
   });
 
   return sections.join('\n\n');
+};
+
+const chooseSummaryContextMode = (query: string, contextFiles: ClinicalFile[]): SummaryContextMode => {
+  if (contextFiles.length <= 1) {
+    return 'STUFFING';
+  }
+
+  const totalContentLength = contextFiles.reduce(
+    (sum, file) => sum + (file.content?.length || 0),
+    0
+  );
+  const hasLongDocument = contextFiles.some(
+    (file) => file.type === DataType.DOCUMENT && (file.content?.length || 0) > 4000
+  );
+  const hasManySources = contextFiles.length > 3;
+  const broadQuestion =
+    query.trim().length > 140 ||
+    /\ball selected\b|\ball sources\b|\bacross\b|\boverall\b|\bsummarize\b|\breview\b|\bwhat can\b/i.test(query);
+
+  if (hasManySources || hasLongDocument || totalContentLength > 12000 || broadQuestion) {
+    return 'RAG';
+  }
+
+  return 'STUFFING';
 };
 
 const buildExploratoryChatInsights = (
@@ -847,10 +924,59 @@ const applyMappingTransformation = (
 export const generateAnalysis = async (
   query: string,
   contextFiles: ClinicalFile[],
-  mode: 'RAG' | 'STUFFING',
+  mode: 'RAG' | 'STUFFING' | 'AGENT',
   history: ChatMessage[],
   allFiles: ClinicalFile[] = contextFiles
 ): Promise<AnalysisResponse> => {
+  const effectiveAgentMode = mode === 'AGENT' || shouldAutoRouteToAgent(query, contextFiles, allFiles);
+
+  if (effectiveAgentMode) {
+    const allDatasetFiles = allFiles.filter(
+      (file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)
+    );
+    const preferredIds = new Set(contextFiles.map((file) => file.id));
+    const datasetRefs = allDatasetFiles.map((file) => buildDatasetReference(file, preferredIds.has(file.id)));
+
+    if (datasetRefs.length === 0) {
+      return {
+        answer: [
+          '### AI Analysis Agent needs tabular data',
+          'This mode runs executable row-level analysis steps. Select one or more datasets before asking the agent to work.',
+          '',
+          'Use the regular chat modes if you only want document-based explanation.',
+        ].join('\n'),
+        responseModeBadge: buildResponseModeBadge(
+          'Deterministic analysis blocked',
+          'blocked',
+          'No tabular datasets were available for agent execution.',
+          mode !== 'AGENT'
+        ),
+      };
+    }
+
+    try {
+      const agentRun = await runFastApiAnalysisAgent(query, datasetRefs);
+      return mapAgentRunToAnalysisResponse(agentRun, mode !== 'AGENT');
+    } catch (error) {
+      return {
+        answer: [
+          '### AI Analysis Agent failed to start',
+          error instanceof Error ? error.message : String(error),
+          '',
+          'The agent mode depends on the FastAPI analysis backend and deterministic workspace builder.',
+        ].join('\n'),
+        responseModeBadge: buildResponseModeBadge(
+          'Deterministic analysis error',
+          'fallback',
+          mode !== 'AGENT'
+            ? 'The question was auto-routed to the agent, but the backend could not start the run.'
+            : 'The backend could not start the agent run.',
+          mode !== 'AGENT'
+        ),
+      };
+    }
+  }
+
   const exploratoryFile = canRunExploratoryChatAnalysis(query, contextFiles);
   if (exploratoryFile) {
     try {
@@ -886,6 +1012,11 @@ export const generateAnalysis = async (
           plan.var2,
           result.metrics
         ),
+        responseModeBadge: buildResponseModeBadge(
+          'Exploratory analysis',
+          'deterministic',
+          'Executed from a single selected dataset without full agent step history.'
+        ),
       };
     } catch (error) {
       return {
@@ -895,6 +1026,11 @@ export const generateAnalysis = async (
           '',
           'Use **Statistical Analysis** if you need to inspect variables manually or prepare the dataset before rerunning the analysis.',
         ].join('\n'),
+        responseModeBadge: buildResponseModeBadge(
+          'Exploratory analysis blocked',
+          'blocked',
+          'Single-dataset deterministic execution could not be completed.'
+        ),
       };
     }
   }
@@ -904,13 +1040,20 @@ export const generateAnalysis = async (
     return guardedAdvancedResponse;
   }
 
-  const retrieval = mode === 'RAG' ? retrieveRelevantContext(query, contextFiles) : null;
-  const contextText = retrieval?.contextText ?? buildChatContextText(contextFiles, mode, query);
+  const summaryMode: SummaryContextMode =
+    mode === 'AGENT'
+      ? 'RAG'
+      : mode === 'STUFFING'
+        ? 'STUFFING'
+        : chooseSummaryContextMode(query, contextFiles);
+  const retrieval = summaryMode === 'RAG' ? retrieveRelevantContext(query, contextFiles) : null;
+  const contextText = retrieval?.contextText ?? buildChatContextText(contextFiles, summaryMode, query);
 
   const systemInstruction = `You are an expert Clinical Data Scientist and Medical Monitor. 
   Your goal is to assist with clinical study analysis, signal detection, and root cause analysis.
   
-  CURRENT MODE: ${mode}
+  CURRENT MODE: AI_CHAT
+  CONTEXT STRATEGY: ${summaryMode}
   
   OBJECTIVES:
   1. DATA MINING & DISCOVERY: Actively look for non-obvious patterns, such as outliers in vital signs, unexpected correlations between Age/Sex and Adverse Events, or site-specific anomalies.
@@ -984,17 +1127,45 @@ export const generateAnalysis = async (
                 chartConfig: chartConfig,
                 keyInsights: parsed.keyInsights,
                 citations: retrieval?.citations,
+                responseModeBadge: buildResponseModeBadge(
+                  'AI Chat',
+                  'summary',
+                  summaryMode === 'RAG'
+                    ? 'Searched the selected sources and answered from the most relevant snippets.'
+                    : 'Answered directly from the selected sources without a retrieval step.'
+                ),
             };
         } catch (e) {
             console.error("Failed to parse JSON response", e);
-            return { answer: response.text || "Error parsing analysis.", citations: retrieval?.citations };
+            return {
+              answer: response.text || "Error parsing analysis.",
+              citations: retrieval?.citations,
+              responseModeBadge: buildResponseModeBadge(
+                'AI Chat',
+                'summary'
+              ),
+            };
         }
     }
-    return { answer: "No response generated.", citations: retrieval?.citations };
+    return {
+      answer: "No response generated.",
+      citations: retrieval?.citations,
+      responseModeBadge: buildResponseModeBadge(
+        'AI Chat',
+        'summary'
+      ),
+    };
 
   } catch (error) {
     console.error("Gemini API Error", error);
-    return { answer: formatAiServiceError(error), citations: retrieval?.citations };
+    return {
+      answer: formatAiServiceError(error),
+      citations: retrieval?.citations,
+      responseModeBadge: buildResponseModeBadge(
+        'AI Chat error',
+        'fallback'
+      ),
+    };
   }
 };
 
@@ -1682,8 +1853,78 @@ const inferNumericColumns = (headers: string[], rows: Record<string, string>[]):
     const sample = rows.slice(0, 300);
     const numericCount = sample.filter((row) => toNumber(row[h]) != null).length;
     return numericCount >= Math.max(3, Math.floor(sample.length * 0.6));
-  });
+    });
 };
+
+const shouldAutoRouteToAgent = (
+  query: string,
+  contextFiles: ClinicalFile[],
+  allFiles: ClinicalFile[]
+) => {
+  const availableTabular = allFiles.filter(
+    (file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)
+  );
+  return availableTabular.length > 0 && requiresAdvancedAnalysisGuard(query, contextFiles);
+};
+
+const mapAgentRunToAnalysisResponse = (
+  agentRun: Awaited<ReturnType<typeof runFastApiAnalysisAgent>>,
+  autoRouted = false
+): AnalysisResponse => ({
+  answer: agentRun.answer,
+  chartConfig: agentRun.chart || undefined,
+  tableConfig: agentRun.table || undefined,
+  agentRun: {
+    runId: agentRun.run_id,
+    question: agentRun.question,
+    createdAt: agentRun.created_at || null,
+    status: agentRun.status,
+    missingRoles: agentRun.missing_roles,
+    executed: agentRun.executed,
+    analysisFamily: agentRun.analysis_family,
+    selectedSources: agentRun.selected_sources,
+    selectedRoles: agentRun.selected_roles,
+    workspaceId: agentRun.workspace_id || null,
+    userSummary: agentRun.user_summary
+      ? {
+          bottomLine: agentRun.user_summary.bottom_line,
+          evidencePoints: agentRun.user_summary.evidence_points || [],
+          potentialHypotheses: agentRun.user_summary.potential_hypotheses || [],
+          recommendedFollowUp: agentRun.user_summary.recommended_follow_up || [],
+          limitations: agentRun.user_summary.limitations || [],
+          nextStep: agentRun.user_summary.next_step || null,
+          contextNote: agentRun.user_summary.context_note || null,
+        }
+      : null,
+    steps: agentRun.steps.map((step) => ({
+      id: step.id,
+      title: step.title,
+      status: step.status,
+      summary: step.summary,
+      details: step.details,
+      code: step.code || null,
+      chart: step.chart || undefined,
+      table: step.table || undefined,
+      provenance: step.provenance
+        ? {
+            sourceNames: step.provenance.source_names || [],
+            columnsUsed: step.provenance.columns_used || [],
+            derivedColumns: step.provenance.derived_columns || [],
+            cohortFiltersApplied: step.provenance.cohort_filters_applied || [],
+            joinKeys: step.provenance.join_keys || [],
+            note: step.provenance.note || null,
+          }
+        : null,
+    })),
+    warnings: agentRun.warnings,
+  },
+  responseModeBadge: buildResponseModeBadge(
+    agentRun.executed ? 'Deterministic analysis' : 'Deterministic analysis blocked',
+    agentRun.executed ? 'deterministic' : 'blocked',
+    autoRouted ? 'Auto-routed from AI Chat because the question requires executed analysis.' : undefined,
+    autoRouted
+  ),
+});
 
 const inferTimeToEventColumn = (headers: string[], rows: Record<string, string>[]): string | null => {
   const numericColumns = headers.filter((header) => {

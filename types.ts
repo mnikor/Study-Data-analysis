@@ -14,7 +14,8 @@ export enum StudyType {
 
 export enum AnalysisMode {
   RAG = 'RAG',
-  STUFFING = 'STUFFING'
+  STUFFING = 'STUFFING',
+  AGENT = 'AGENT'
 }
 
 export enum UsageMode {
@@ -171,12 +172,138 @@ export interface ResultTable {
   rows: Array<Record<string, string | number>>;
 }
 
+export interface ResponseModeBadge {
+  label: string;
+  tone: 'summary' | 'deterministic' | 'blocked' | 'fallback';
+  detail?: string;
+  autoRouted?: boolean;
+}
+
 export interface AnalysisResponse {
   answer: string;
   chartConfig?: ChartConfiguration;
   tableConfig?: ResultTable;
   keyInsights?: string[];
   citations?: { sourceId: string; snippet: string }[];
+  agentRun?: AnalysisAgentRun;
+  responseModeBadge?: ResponseModeBadge;
+}
+
+export interface AnalysisAgentStep {
+  id: string;
+  title: string;
+  status: 'completed' | 'failed' | 'skipped';
+  summary: string;
+  details: string[];
+  code?: string | null;
+  chart?: ChartConfiguration;
+  table?: ResultTable | null;
+  provenance?: {
+    sourceNames: string[];
+    columnsUsed: string[];
+    derivedColumns: string[];
+    cohortFiltersApplied: string[];
+    joinKeys: string[];
+    note?: string | null;
+  } | null;
+}
+
+export interface AnalysisAgentUserSummary {
+  bottomLine: string;
+  evidencePoints: string[];
+  potentialHypotheses: string[];
+  recommendedFollowUp: string[];
+  limitations: string[];
+  nextStep?: string | null;
+  contextNote?: string | null;
+}
+
+export interface AnalysisAgentPlanBrief {
+  analysisFamily:
+    | 'incidence'
+    | 'risk_difference'
+    | 'logistic_regression'
+    | 'kaplan_meier'
+    | 'cox'
+    | 'mixed_model'
+    | 'threshold_search'
+    | 'competing_risks'
+    | 'feature_importance'
+    | 'partial_dependence'
+    | 'unknown';
+  targetDefinition?: string | null;
+  endpointLabel?: string | null;
+  treatmentVariable?: string | null;
+  subgroupFactors: string[];
+  requiredRoles: string[];
+  missingRoles: string[];
+  selectedSources: string[];
+  selectedRoles: Record<string, string>;
+  timeWindowDays?: number | null;
+  gradeThreshold?: number | null;
+  termFilters: string[];
+  cohortFilters: string[];
+  interactionTerms: string[];
+  requestedOutputs: string[];
+  notes: string[];
+  assessment?: {
+    supportLevel: 'supported' | 'partial' | 'unsupported';
+    blockerStage: 'none' | 'selection' | 'planner' | 'data' | 'method';
+    blockerReason?: string | null;
+    recommendedNextStep?: string | null;
+    fallbackOption?: string | null;
+    dataRequirements: string[];
+    methodConstraints: string[];
+  } | null;
+}
+
+export interface AnalysisAgentRun {
+  runId: string;
+  question: string;
+  createdAt?: string | null;
+  status: 'executable' | 'missing_data' | 'unsupported';
+  missingRoles: string[];
+  executed: boolean;
+  analysisFamily:
+    | 'incidence'
+    | 'risk_difference'
+    | 'logistic_regression'
+    | 'kaplan_meier'
+    | 'cox'
+    | 'mixed_model'
+    | 'threshold_search'
+    | 'competing_risks'
+    | 'feature_importance'
+    | 'partial_dependence'
+    | 'unknown';
+  selectedSources: string[];
+  selectedRoles: Record<string, string>;
+  workspaceId?: string | null;
+  steps: AnalysisAgentStep[];
+  userSummary?: AnalysisAgentUserSummary | null;
+  warnings: string[];
+}
+
+export interface AnalysisAgentRunSummary {
+  runId: string;
+  question: string;
+  createdAt?: string | null;
+  status: 'executable' | 'missing_data' | 'unsupported';
+  missingRoles: string[];
+  executed: boolean;
+  analysisFamily:
+    | 'incidence'
+    | 'risk_difference'
+    | 'logistic_regression'
+    | 'kaplan_meier'
+    | 'cox'
+    | 'mixed_model'
+    | 'threshold_search'
+    | 'competing_risks'
+    | 'feature_importance'
+    | 'partial_dependence'
+    | 'unknown';
+  selectedSources: string[];
 }
 
 export interface StatAnalysisResult {
@@ -395,6 +522,8 @@ export interface ChatMessage {
   chartConfig?: ChartConfiguration;
   tableConfig?: ResultTable;
   keyInsights?: string[];
+  agentRun?: AnalysisAgentRun;
+  responseModeBadge?: ResponseModeBadge;
 }
 
 export interface StatSuggestion {

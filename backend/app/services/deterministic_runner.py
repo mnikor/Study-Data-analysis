@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import exp, sqrt
+from math import exp, isfinite, sqrt
 import re
 
 import pandas as pd
@@ -185,6 +185,7 @@ def run_logistic_regression(
     design = pd.get_dummies(combined[predictor_columns], drop_first=True, dtype=float)
     design, interaction_warnings = _apply_interaction_terms(design, spec, metadata)
     design = design.loc[:, design.nunique(dropna=False) > 1]
+    design, collinearity_warnings = _drop_high_correlation_columns(design, treatment_col)
     design, stabilization_warnings = _stabilize_design_matrix(
         design,
         sample_size=int(combined.shape[0]),
@@ -196,37 +197,40 @@ def run_logistic_regression(
 
     design = sm.add_constant(design, has_constant="add")
 
+    fitting_warnings: list[str] = []
     try:
         fitted = sm.Logit(outcome, design).fit(disp=False, maxiter=100)
+        conf_int = fitted.conf_int()
+        p_values = fitted.pvalues
+        pseudo_r_squared: str | float = _safe_numeric_output(fitted.prsquared)
+        model_method = "logistic_regression"
     except Exception as error:  # pragma: no cover - statsmodels failure paths vary by data shape
-        raise ValueError(f"Logistic regression failed to converge on the current workspace: {error}") from error
-
-    conf_int = fitted.conf_int()
-    coefficient_rows: list[dict[str, str | float | int]] = []
-    for parameter in fitted.params.index:
-        if parameter == "const":
-            continue
-        coefficient = float(fitted.params[parameter])
-        ci_lower = float(conf_int.loc[parameter, 0])
-        ci_upper = float(conf_int.loc[parameter, 1])
-        coefficient_rows.append(
-            {
-                "predictor": parameter,
-                "coefficient": round(coefficient, 6),
-                "odds_ratio": round(float(exp(coefficient)), 6),
-                "ci_lower_95": round(float(exp(ci_lower)), 6),
-                "ci_upper_95": round(float(exp(ci_upper)), 6),
-                "p_value": round(float(fitted.pvalues[parameter]), 6),
-            }
+        fitting_warnings.append(
+            f"Standard logistic regression did not converge cleanly ({error}); used a penalized fallback to reduce instability."
         )
+        try:
+            fitted = sm.Logit(outcome, design).fit_regularized(alpha=0.5, disp=False, maxiter=200)
+            try:
+                conf_int = fitted.conf_int()
+            except Exception:
+                conf_int = None
+            p_values = getattr(fitted, "pvalues", None)
+            pseudo_r_squared = "not available"
+            model_method = "logistic_regression_regularized"
+        except Exception as fallback_error:  # pragma: no cover - statsmodels failure paths vary by data shape
+            raise ValueError(
+                f"Logistic regression failed to converge on the current workspace: {error}. Penalized fallback also failed: {fallback_error}"
+            ) from fallback_error
+
+    coefficient_rows = _build_logistic_table_rows(fitted.params, conf_int, p_values)
 
     metrics = [
-        AnalysisMetric(name="analysis_method", value="logistic_regression"),
+        AnalysisMetric(name="analysis_method", value=model_method),
         AnalysisMetric(name="subjects_used", value=int(combined.shape[0])),
         AnalysisMetric(name="event_subjects", value=int(outcome.sum())),
         AnalysisMetric(name="non_event_subjects", value=int((1 - outcome).sum())),
         AnalysisMetric(name="predictor_columns", value=int(len(coefficient_rows))),
-        AnalysisMetric(name="pseudo_r_squared", value=round(float(fitted.prsquared), 6)),
+        AnalysisMetric(name="pseudo_r_squared", value=pseudo_r_squared),
     ]
     if subject_id_col:
         metrics.append(AnalysisMetric(name="subject_identifier", value=subject_id_col))
@@ -239,7 +243,9 @@ def run_logistic_regression(
     if spec is None or not spec.covariates:
         warnings.append("Predictors were auto-selected from treatment, demographic, and baseline lab columns.")
     warnings.extend(interaction_warnings)
+    warnings.extend(collinearity_warnings)
     warnings.extend(stabilization_warnings)
+    warnings.extend(fitting_warnings)
 
     table = AnalysisTable(
         title="Logistic regression coefficients",
@@ -268,7 +274,29 @@ def _select_logistic_covariates(
     spec: AnalysisSpec | None,
 ) -> list[str]:
     if spec and spec.covariates:
-        return [column for column in spec.covariates if column in workspace.columns]
+        matched: list[str] = []
+        normalized_columns = {_normalize_column_name(column): column for column in workspace.columns}
+        for requested in spec.covariates:
+            requested_normalized = _normalize_column_name(requested)
+            if not requested_normalized:
+                continue
+            direct = normalized_columns.get(requested_normalized)
+            if direct and direct not in matched:
+                matched.append(direct)
+                continue
+
+            fuzzy_matches = [
+                column
+                for column in workspace.columns
+                if requested_normalized in _normalize_column_name(column)
+                or _normalize_column_name(column) in requested_normalized
+            ]
+            for column in fuzzy_matches:
+                if column not in matched:
+                    matched.append(column)
+
+        if matched:
+            return matched[:16]
 
     treatment_col = str(metadata.get("treatment_column") or "")
     subject_id_col = str(metadata.get("subject_id_column") or "")
@@ -426,6 +454,104 @@ def _select_dense_predictor_subset(
                 best_rows = trial_rows
 
     return best_subset, best_rows
+
+
+def _drop_high_correlation_columns(
+    design: pd.DataFrame,
+    treatment_col: str,
+    threshold: float = 0.995,
+) -> tuple[pd.DataFrame, list[str]]:
+    numeric_design = design.select_dtypes(include=["number", "bool"]).astype(float)
+    if numeric_design.shape[1] < 2:
+        return design, []
+
+    corr = numeric_design.corr().abs()
+    kept_columns: list[str] = []
+    dropped_columns: list[str] = []
+    normalized_treatment = _normalize_column_name(treatment_col)
+
+    ordered_columns = sorted(
+        numeric_design.columns,
+        key=lambda column: (
+            0 if normalized_treatment and normalized_treatment in _normalize_column_name(column) else 1,
+            0 if not column.startswith("INT__") else 1,
+            column,
+        ),
+    )
+
+    for column in ordered_columns:
+        is_redundant = any(corr.loc[column, kept] >= threshold for kept in kept_columns if kept in corr.columns)
+        if is_redundant:
+            dropped_columns.append(column)
+        else:
+            kept_columns.append(column)
+
+    if not dropped_columns:
+        return design, []
+
+    reduced = design[kept_columns].copy()
+    return reduced, [
+        "Dropped highly collinear encoded predictors before model fitting: "
+        + ", ".join(dropped_columns[:8])
+        + ("..." if len(dropped_columns) > 8 else "")
+    ]
+
+
+def _build_logistic_table_rows(
+    params: pd.Series,
+    conf_int: pd.DataFrame | None,
+    p_values: pd.Series | None,
+) -> list[dict[str, str | float | int]]:
+    coefficient_rows: list[dict[str, str | float | int]] = []
+    for parameter in params.index:
+        if parameter == "const":
+            continue
+        coefficient = params[parameter]
+        lower_value: str | float | int = "not available"
+        upper_value: str | float | int = "not available"
+        if conf_int is not None and parameter in conf_int.index:
+            lower_value = _safe_exp_output(conf_int.loc[parameter, 0])
+            upper_value = _safe_exp_output(conf_int.loc[parameter, 1])
+        p_value: str | float | int = "not available"
+        if p_values is not None and parameter in p_values.index:
+            p_value = _safe_numeric_output(p_values[parameter])
+        coefficient_rows.append(
+            {
+                "predictor": parameter,
+                "coefficient": _safe_numeric_output(coefficient),
+                "odds_ratio": _safe_exp_output(coefficient),
+                "ci_lower_95": lower_value,
+                "ci_upper_95": upper_value,
+                "p_value": p_value,
+            }
+        )
+    return coefficient_rows
+
+
+def _safe_numeric_output(value: object, digits: int = 6) -> str | float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "not available"
+    if not isfinite(numeric):
+        return "not estimable"
+    return round(numeric, digits)
+
+
+def _safe_exp_output(value: object, digits: int = 6) -> str | float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "not available"
+    if not isfinite(numeric):
+        return "not estimable"
+    try:
+        exp_value = exp(numeric)
+    except OverflowError:
+        return "not estimable"
+    if not isfinite(exp_value):
+        return "not estimable"
+    return round(float(exp_value), digits)
 
 
 def _apply_interaction_terms(

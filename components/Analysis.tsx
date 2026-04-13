@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users, Activity } from 'lucide-react';
-import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, ProvenanceType } from '../types';
+import { Send, Bot, User, FileText, CheckSquare, Search, BookOpen, Lightbulb, TrendingUp, AlertTriangle, Sparkles, Download, GitMerge, Users, Activity, Cpu, ChevronDown, ChevronRight } from 'lucide-react';
+import { ClinicalFile, DataType, ChatMessage, AnalysisMode, ProvenanceRecord, ProvenanceType, AnalysisAgentRunSummary, AnalysisAgentRun, AnalysisAgentPlanBrief } from '../types';
 import { generateAnalysis } from '../services/geminiService';
+import { exportAnalysisAgentRun, getAnalysisAgentRun, listAnalysisAgentRuns, planAnalysisAgent, type FastApiAgentPlanResponse, type FastApiAgentRunResponse } from '../services/fastapiAnalysisService';
+import { buildDatasetReference } from '../services/executionBridge';
 import {
   generateQuestionPlanningAssist,
   generateExplorationQuestionSuggestions,
@@ -238,10 +240,197 @@ const suggestionSupportClass = (status?: 'READY' | 'PARTIAL' | 'MISSING') =>
       ? 'bg-amber-50 text-amber-700'
       : 'bg-red-50 text-red-700';
 
+const formatAgentRunTimestamp = (value?: string | null) => {
+  if (!value) return 'Saved run';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return 'Saved run';
+  return parsed.toLocaleString();
+};
+
+interface InsightSections {
+  directAnswer: string;
+  supportingPoints: string[];
+  potentialHypotheses: string[];
+  recommendedFollowUp: string[];
+  limitations: string[];
+  contextNotes: string[];
+  nextSteps: string[];
+}
+
+const splitInsightSections = (insights?: string[]) => {
+  if (!insights || insights.length === 0) {
+    return null;
+  }
+
+  const contextNotes = insights.filter((insight) => /^Applied cohort filters:/i.test(insight));
+  const nextSteps = insights.filter((insight) => /^What to do next:/i.test(insight));
+  const analyticPoints = insights.filter(
+    (insight) => !/^Applied cohort filters:/i.test(insight) && !/^What to do next:/i.test(insight)
+  );
+
+  const directAnswer = analyticPoints[0] || insights[0];
+  const supportingPoints = analyticPoints.slice(1);
+
+  return {
+    directAnswer,
+    supportingPoints,
+    potentialHypotheses: [],
+    recommendedFollowUp: [],
+    limitations: [],
+    contextNotes,
+    nextSteps,
+  };
+};
+
+const normalizeAgentRun = (run?: Partial<AnalysisAgentRun> | null): AnalysisAgentRun | null => {
+  if (!run || !run.runId) return null;
+  return {
+    runId: run.runId,
+    question: run.question || '',
+    createdAt: run.createdAt || null,
+    status: run.status || 'unsupported',
+    missingRoles: Array.isArray(run.missingRoles) ? run.missingRoles : [],
+    executed: Boolean(run.executed),
+    analysisFamily: run.analysisFamily || 'unknown',
+    selectedSources: Array.isArray(run.selectedSources) ? run.selectedSources : [],
+    selectedRoles: run.selectedRoles || {},
+    workspaceId: run.workspaceId || null,
+    userSummary: run.userSummary
+      ? {
+          bottomLine: run.userSummary.bottomLine || '',
+          evidencePoints: Array.isArray(run.userSummary.evidencePoints) ? run.userSummary.evidencePoints : [],
+          potentialHypotheses: Array.isArray(run.userSummary.potentialHypotheses) ? run.userSummary.potentialHypotheses : [],
+          recommendedFollowUp: Array.isArray(run.userSummary.recommendedFollowUp) ? run.userSummary.recommendedFollowUp : [],
+          limitations: Array.isArray(run.userSummary.limitations) ? run.userSummary.limitations : [],
+          nextStep: run.userSummary.nextStep || null,
+          contextNote: run.userSummary.contextNote || null,
+        }
+      : null,
+    steps: Array.isArray(run.steps)
+      ? run.steps.map((step) => ({
+          id: step?.id || crypto.randomUUID(),
+          title: step?.title || 'Agent step',
+          status: step?.status || 'skipped',
+          summary: step?.summary || '',
+          details: Array.isArray(step?.details) ? step.details : [],
+          code: step?.code || null,
+          chart: step?.chart || undefined,
+          table: step?.table
+            ? {
+                title: step.table.title || '',
+                columns: Array.isArray(step.table.columns) ? step.table.columns : [],
+                rows: Array.isArray(step.table.rows) ? step.table.rows : [],
+              }
+            : null,
+          provenance: step?.provenance
+            ? {
+                sourceNames: Array.isArray(step.provenance.sourceNames) ? step.provenance.sourceNames : [],
+                columnsUsed: Array.isArray(step.provenance.columnsUsed) ? step.provenance.columnsUsed : [],
+                derivedColumns: Array.isArray(step.provenance.derivedColumns) ? step.provenance.derivedColumns : [],
+                cohortFiltersApplied: Array.isArray(step.provenance.cohortFiltersApplied) ? step.provenance.cohortFiltersApplied : [],
+                joinKeys: Array.isArray(step.provenance.joinKeys) ? step.provenance.joinKeys : [],
+                note: step.provenance.note || null,
+              }
+            : null,
+        }))
+      : [],
+    warnings: Array.isArray(run.warnings) ? run.warnings : [],
+  };
+};
+
+const renderAgentStepProvenance = (
+  provenance?: AnalysisAgentRun['steps'][number]['provenance'],
+  variant: 'default' | 'compact' = 'default'
+) => {
+  if (!provenance) return null;
+
+  const items: Array<{ label: string; value: string | null }> = [
+    { label: 'Sources', value: provenance.sourceNames.length > 0 ? provenance.sourceNames.join(', ') : null },
+    { label: 'Variables', value: provenance.columnsUsed.length > 0 ? provenance.columnsUsed.join(', ') : null },
+    { label: 'Derived', value: provenance.derivedColumns.length > 0 ? provenance.derivedColumns.join(', ') : null },
+    { label: 'Filters', value: provenance.cohortFiltersApplied.length > 0 ? provenance.cohortFiltersApplied.join(', ') : null },
+    { label: 'Join logic', value: provenance.joinKeys.length > 0 ? provenance.joinKeys.join(', ') : null },
+    { label: 'Note', value: provenance.note || null },
+  ].filter((item) => item.value);
+
+  if (items.length === 0) return null;
+
+  return (
+    <div className={`mt-3 rounded-lg border border-slate-200 ${variant === 'compact' ? 'bg-slate-50 px-3 py-2' : 'bg-white px-3 py-3'}`}>
+      <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Step Provenance</div>
+      <div className="space-y-2">
+        {items.map((item) => (
+          <div key={`${item.label}-${item.value}`} className={`${variant === 'compact' ? 'text-[11px]' : 'text-xs'} leading-relaxed text-slate-600`}>
+            <span className="font-semibold text-slate-700">{item.label}:</span> {item.value}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const responseBadgeClass = (tone?: 'summary' | 'deterministic' | 'blocked' | 'fallback') => {
+  switch (tone) {
+    case 'deterministic':
+      return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+    case 'blocked':
+      return 'border-amber-200 bg-amber-50 text-amber-800';
+    case 'fallback':
+      return 'border-rose-200 bg-rose-50 text-rose-700';
+    case 'summary':
+    default:
+      return 'border-slate-200 bg-slate-50 text-slate-700';
+  }
+};
+
+const formatAnalysisFamilyLabel = (family?: AnalysisAgentPlanBrief['analysisFamily']) => {
+  switch (family) {
+    case 'risk_difference':
+      return 'Risk difference';
+    case 'logistic_regression':
+      return 'Logistic regression';
+    case 'kaplan_meier':
+      return 'Kaplan-Meier';
+    case 'mixed_model':
+      return 'Mixed model';
+    case 'threshold_search':
+      return 'Threshold search';
+    case 'competing_risks':
+      return 'Competing risks';
+    case 'feature_importance':
+      return 'Feature importance';
+    case 'partial_dependence':
+      return 'Partial dependence';
+    case 'cox':
+      return 'Cox model';
+    case 'incidence':
+      return 'Incidence';
+    case 'unknown':
+    default:
+      return 'Unknown';
+  }
+};
+
+const formatCapabilityStageLabel = (stage?: 'none' | 'selection' | 'planner' | 'data' | 'method') => {
+  switch (stage) {
+    case 'selection':
+      return 'File selection';
+    case 'planner':
+      return 'Question classification';
+    case 'data':
+      return 'Data readiness';
+    case 'method':
+      return 'Method support';
+    case 'none':
+    default:
+      return 'Ready';
+  }
+};
+
 export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, messages, setMessages }) => {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [mode, setMode] = useState<AnalysisMode>(AnalysisMode.RAG);
+  const [mode, setMode] = useState<AnalysisMode>(AnalysisMode.AGENT);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
   const [planningAssist, setPlanningAssist] = useState<QuestionPlanningAssist | null>(null);
   const [isPlanningAssistLoading, setIsPlanningAssistLoading] = useState(false);
@@ -250,8 +439,27 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   const [isExplorationSuggestionsLoading, setIsExplorationSuggestionsLoading] = useState(false);
   const [explorationSuggestionsError, setExplorationSuggestionsError] = useState<string | null>(null);
   const [pendingSuggestedQuestion, setPendingSuggestedQuestion] = useState<ExplorationQuestionSuggestion | null>(null);
+  const [recentAgentRuns, setRecentAgentRuns] = useState<AnalysisAgentRunSummary[]>([]);
+  const [isAgentRunsLoading, setIsAgentRunsLoading] = useState(false);
+  const [agentRunsError, setAgentRunsError] = useState<string | null>(null);
+  const [activeAgentRunId, setActiveAgentRunId] = useState<string | null>(null);
+  const [expandedBlockedRunIds, setExpandedBlockedRunIds] = useState<Set<string>>(new Set());
+  const [selectedAgentRunDetail, setSelectedAgentRunDetail] = useState<AnalysisAgentRun | null>(null);
+  const [selectedAgentStepId, setSelectedAgentStepId] = useState<string | null>(null);
+  const [isAgentDetailLoading, setIsAgentDetailLoading] = useState(false);
+  const [agentDetailError, setAgentDetailError] = useState<string | null>(null);
+  const [agentPlanBrief, setAgentPlanBrief] = useState<AnalysisAgentPlanBrief | null>(null);
+  const [agentPlanStatus, setAgentPlanStatus] = useState<FastApiAgentPlanResponse['status'] | null>(null);
+  const [agentPlanExplanation, setAgentPlanExplanation] = useState<string | null>(null);
+  const [isAgentPlanBriefLoading, setIsAgentPlanBriefLoading] = useState(false);
+  const [agentPlanBriefError, setAgentPlanBriefError] = useState<string | null>(null);
+  const [isAgentToolsOpen, setIsAgentToolsOpen] = useState(false);
+  const [agentToolsTab, setAgentToolsTab] = useState<'brief' | 'runs'>('brief');
+  const [isContextDrawerOpen, setIsContextDrawerOpen] = useState(false);
+  const [isSourcesDrawerOpen, setIsSourcesDrawerOpen] = useState(false);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const agentPlanRequestIdRef = useRef(0);
   const docs = useMemo(
     () => files.filter(f => f.type === DataType.DOCUMENT || f.type === DataType.RAW || f.type === DataType.STANDARDIZED),
     [files]
@@ -268,6 +476,14 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   const selectedContextFiles = useMemo(
     () => files.filter((f) => selectedFileIds.has(f.id)),
     [files, selectedFileIds]
+  );
+  const selectedSourceKey = useMemo(
+    () => Array.from(selectedFileIds).sort().join('|'),
+    [selectedFileIds]
+  );
+  const agentDatasetFiles = useMemo(
+    () => docs.filter((file) => (file.type === DataType.RAW || file.type === DataType.STANDARDIZED) && Boolean(file.content)),
+    [docs]
   );
   const quickActions = useMemo(
     () => buildChatQuickActions(selectedContextFiles, docs),
@@ -323,6 +539,47 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
   }, [selectedFileIds, docs, input]);
 
   useEffect(() => {
+    if (mode === AnalysisMode.AGENT) {
+      void loadRecentAgentRuns();
+    }
+  }, [mode]);
+
+  useEffect(() => {
+    if (mode !== AnalysisMode.AGENT) {
+      setAgentPlanBrief(null);
+      setAgentPlanStatus(null);
+      setAgentPlanExplanation(null);
+      setAgentPlanBriefError(null);
+      setIsAgentPlanBriefLoading(false);
+      return;
+    }
+
+    if (!input.trim()) {
+      setAgentPlanBrief(null);
+      setAgentPlanStatus(null);
+      setAgentPlanExplanation(null);
+      setAgentPlanBriefError(null);
+      setIsAgentPlanBriefLoading(false);
+      return;
+    }
+
+    if (agentDatasetFiles.length === 0) {
+      setAgentPlanBrief(null);
+      setAgentPlanStatus('missing_data');
+      setAgentPlanExplanation('No tabular datasets are available for agent planning.');
+      setAgentPlanBriefError(null);
+      setIsAgentPlanBriefLoading(false);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void loadAgentPlanBrief(input);
+    }, 600);
+
+    return () => window.clearTimeout(timer);
+  }, [mode, input, selectedSourceKey, agentDatasetFiles]);
+
+  useEffect(() => {
     scrollToBottom();
   }, [messages, isLoading]);
 
@@ -357,6 +614,302 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       .filter(Boolean)
       .map((file) => (file as ClinicalFile).id);
     setSelectedFileIds(new Set([...preservedDocumentIds, ...recommendedIds]));
+  };
+
+  const applyRecommendedSourcesForQuestion = (question: string) => {
+    const scopedRecommendation = buildQuestionFileRecommendation(question, docs, fileProfiles);
+    if (!scopedRecommendation) return;
+    const preservedDocumentIds = docs
+      .filter((doc) => doc.type === DataType.DOCUMENT && selectedFileIds.has(doc.id))
+      .map((doc) => doc.id);
+    const recommendedIds = Object.values(scopedRecommendation.selectedByRole)
+      .filter(Boolean)
+      .map((file) => (file as ClinicalFile).id);
+    setSelectedFileIds(new Set([...preservedDocumentIds, ...recommendedIds]));
+  };
+
+  const toggleBlockedRunDetails = (runId: string) => {
+    setExpandedBlockedRunIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) {
+        next.delete(runId);
+      } else {
+        next.add(runId);
+      }
+      return next;
+    });
+  };
+
+  const toLocalAgentRun = (run: FastApiAgentRunResponse): AnalysisAgentRun => ({
+    runId: run.run_id,
+    question: run.question,
+    createdAt: run.created_at || null,
+    status: run.status,
+    missingRoles: run.missing_roles,
+    executed: run.executed,
+    analysisFamily: run.analysis_family,
+    selectedSources: run.selected_sources,
+    selectedRoles: run.selected_roles,
+    workspaceId: run.workspace_id || null,
+    userSummary: run.user_summary
+      ? {
+          bottomLine: run.user_summary.bottom_line,
+          evidencePoints: run.user_summary.evidence_points || [],
+          potentialHypotheses: run.user_summary.potential_hypotheses || [],
+          recommendedFollowUp: run.user_summary.recommended_follow_up || [],
+          limitations: run.user_summary.limitations || [],
+          nextStep: run.user_summary.next_step || null,
+          contextNote: run.user_summary.context_note || null,
+        }
+      : null,
+    steps: run.steps.map((step) => ({
+      id: step.id,
+      title: step.title,
+      status: step.status,
+      summary: step.summary,
+      details: step.details,
+      code: step.code || null,
+      chart: step.chart || undefined,
+      table: step.table || undefined,
+      provenance: step.provenance
+        ? {
+            sourceNames: step.provenance.source_names || [],
+            columnsUsed: step.provenance.columns_used || [],
+            derivedColumns: step.provenance.derived_columns || [],
+            cohortFiltersApplied: step.provenance.cohort_filters_applied || [],
+            joinKeys: step.provenance.join_keys || [],
+            note: step.provenance.note || null,
+          }
+        : null,
+    })),
+    warnings: run.warnings,
+  });
+
+  const toLocalAgentBrief = (plan: FastApiAgentPlanResponse): AnalysisAgentPlanBrief | null => {
+    if (!plan.brief) return null;
+
+    return {
+      analysisFamily: plan.brief.analysis_family,
+      targetDefinition: plan.brief.target_definition || null,
+      endpointLabel: plan.brief.endpoint_label || null,
+      treatmentVariable: plan.brief.treatment_variable || null,
+      subgroupFactors: Array.isArray(plan.brief.subgroup_factors) ? plan.brief.subgroup_factors : [],
+      requiredRoles: Array.isArray(plan.brief.required_roles) ? plan.brief.required_roles : [],
+      missingRoles: Array.isArray(plan.brief.missing_roles) ? plan.brief.missing_roles : [],
+      selectedSources: Array.isArray(plan.brief.selected_sources) ? plan.brief.selected_sources : [],
+      selectedRoles: plan.brief.selected_roles || {},
+      timeWindowDays: plan.brief.time_window_days ?? null,
+      gradeThreshold: plan.brief.grade_threshold ?? null,
+      termFilters: Array.isArray(plan.brief.term_filters) ? plan.brief.term_filters : [],
+      cohortFilters: Array.isArray(plan.brief.cohort_filters) ? plan.brief.cohort_filters : [],
+      interactionTerms: Array.isArray(plan.brief.interaction_terms) ? plan.brief.interaction_terms : [],
+      requestedOutputs: Array.isArray(plan.brief.requested_outputs) ? plan.brief.requested_outputs : [],
+      notes: Array.isArray(plan.brief.notes) ? plan.brief.notes : [],
+      assessment: plan.brief.assessment
+        ? {
+            supportLevel: plan.brief.assessment.support_level,
+            blockerStage: plan.brief.assessment.blocker_stage,
+            blockerReason: plan.brief.assessment.blocker_reason || null,
+            recommendedNextStep: plan.brief.assessment.recommended_next_step || null,
+            fallbackOption: plan.brief.assessment.fallback_option || null,
+            dataRequirements: Array.isArray(plan.brief.assessment.data_requirements) ? plan.brief.assessment.data_requirements : [],
+            methodConstraints: Array.isArray(plan.brief.assessment.method_constraints) ? plan.brief.assessment.method_constraints : [],
+          }
+        : null,
+    };
+  };
+
+  const loadAgentPlanBrief = async (question: string) => {
+    const trimmedQuestion = question.trim();
+    const requestId = ++agentPlanRequestIdRef.current;
+
+    if (!trimmedQuestion) {
+      if (requestId === agentPlanRequestIdRef.current) {
+        setAgentPlanBrief(null);
+        setAgentPlanStatus(null);
+        setAgentPlanExplanation(null);
+        setAgentPlanBriefError(null);
+        setIsAgentPlanBriefLoading(false);
+      }
+      return;
+    }
+
+    const datasetRefs = agentDatasetFiles.map((file) => buildDatasetReference(file, selectedFileIds.has(file.id)));
+    if (datasetRefs.length === 0) {
+      if (requestId === agentPlanRequestIdRef.current) {
+        setAgentPlanBrief(null);
+        setAgentPlanStatus('missing_data');
+        setAgentPlanExplanation('No tabular datasets are available for agent planning.');
+        setAgentPlanBriefError(null);
+        setIsAgentPlanBriefLoading(false);
+      }
+      return;
+    }
+
+    setIsAgentPlanBriefLoading(true);
+    setAgentPlanBriefError(null);
+
+    try {
+      const plan = await planAnalysisAgent(trimmedQuestion, datasetRefs);
+      if (requestId !== agentPlanRequestIdRef.current) return;
+
+      setAgentPlanBrief(toLocalAgentBrief(plan));
+      setAgentPlanStatus(plan.status);
+      setAgentPlanExplanation(plan.explanation || null);
+      setAgentPlanBriefError(null);
+    } catch (error) {
+      if (requestId !== agentPlanRequestIdRef.current) return;
+
+      setAgentPlanBrief(null);
+      setAgentPlanStatus(null);
+      setAgentPlanExplanation(null);
+      setAgentPlanBriefError(error instanceof Error ? error.message : 'Could not prepare the agent plan preview.');
+    } finally {
+      if (requestId === agentPlanRequestIdRef.current) {
+        setIsAgentPlanBriefLoading(false);
+      }
+    }
+  };
+
+  const restoreAgentRunSelection = (run: Pick<AnalysisAgentRun, 'selectedSources'>) => {
+    const matchedDocs = docs.filter((doc) => run.selectedSources.includes(doc.name));
+    const matchedIds = new Set(matchedDocs.map((doc) => doc.id));
+    setSelectedFileIds(matchedIds);
+    return {
+      matchedDocs,
+      matchedIds,
+    };
+  };
+
+  const loadRecentAgentRuns = async () => {
+    setIsAgentRunsLoading(true);
+    setAgentRunsError(null);
+    try {
+      const runs = await listAnalysisAgentRuns(12);
+      setRecentAgentRuns(
+        runs.map((run) => ({
+          runId: run.run_id,
+          question: run.question,
+          createdAt: run.created_at || null,
+          status: run.status,
+          missingRoles: run.missing_roles,
+          executed: run.executed,
+          analysisFamily: run.analysis_family,
+          selectedSources: run.selected_sources,
+        }))
+      );
+    } catch (error) {
+      setAgentRunsError(error instanceof Error ? error.message : 'Could not load saved agent runs.');
+      setRecentAgentRuns([]);
+    } finally {
+      setIsAgentRunsLoading(false);
+    }
+  };
+
+  const viewAgentRunDetail = async (runId: string) => {
+    if (isAgentDetailLoading || activeAgentRunId === runId) return;
+    setIsAgentDetailLoading(true);
+    setAgentDetailError(null);
+    setActiveAgentRunId(runId);
+    setIsAgentToolsOpen(true);
+    setAgentToolsTab('runs');
+    try {
+      const run = await getAnalysisAgentRun(runId);
+      const localRun = toLocalAgentRun(run);
+      setSelectedAgentRunDetail(localRun);
+      setSelectedAgentStepId(localRun.steps[0]?.id || null);
+      restoreAgentRunSelection(localRun);
+      setMode(AnalysisMode.AGENT);
+    } catch (error) {
+      setAgentDetailError(error instanceof Error ? error.message : 'Could not load run details.');
+      setSelectedAgentRunDetail(null);
+    } finally {
+      setIsAgentDetailLoading(false);
+      setActiveAgentRunId(null);
+    }
+  };
+
+  const reopenAgentRun = async (runId: string) => {
+    if (isLoading || activeAgentRunId === runId) return;
+
+    setActiveAgentRunId(runId);
+    setIsAgentToolsOpen(true);
+    setAgentToolsTab('runs');
+    try {
+      const run = await getAnalysisAgentRun(runId);
+      const localRun = toLocalAgentRun(run);
+      setSelectedAgentRunDetail(localRun);
+      setSelectedAgentStepId(localRun.steps[0]?.id || null);
+      restoreAgentRunSelection(localRun);
+      const reopenedQuestion = run.question || 'Reopened AI Analysis Agent run';
+      const userMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: reopenedQuestion,
+        timestamp: run.created_at || new Date().toISOString(),
+      };
+      const aiMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'model',
+        content: run.answer,
+        timestamp: new Date().toISOString(),
+        chartConfig: run.chart || undefined,
+        tableConfig: run.table || undefined,
+        agentRun: localRun,
+        responseModeBadge: {
+          label: localRun.executed ? 'Deterministic analysis' : 'Deterministic analysis blocked',
+          tone: localRun.executed ? 'deterministic' : 'blocked',
+          detail: 'Loaded from a saved AI Analysis Agent run.',
+        },
+      };
+      setMessages((prev) => [...prev, userMsg, aiMsg]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not reopen saved run.';
+      const aiMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'model',
+        content: `### Could not reopen saved agent run\n${message}`,
+        timestamp: new Date().toISOString(),
+        responseModeBadge: {
+          label: 'Saved run error',
+          tone: 'fallback',
+        },
+      };
+      setMessages((prev) => [...prev, aiMsg]);
+    } finally {
+      setActiveAgentRunId(null);
+    }
+  };
+
+  const rerunAgentRun = async (runId: string) => {
+    if (isLoading || activeAgentRunId === runId) return;
+    setActiveAgentRunId(runId);
+    setIsAgentToolsOpen(true);
+    setAgentToolsTab('runs');
+    try {
+      const run = await getAnalysisAgentRun(runId);
+      const localRun = toLocalAgentRun(run);
+      setSelectedAgentRunDetail(localRun);
+      setSelectedAgentStepId(localRun.steps[0]?.id || null);
+      const { matchedDocs, matchedIds } = restoreAgentRunSelection(localRun);
+      setMode(AnalysisMode.AGENT);
+      await handleSend(run.question, matchedDocs, matchedIds, AnalysisMode.AGENT);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not rerun saved agent run.';
+      const aiMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: 'model',
+        content: `### Could not rerun saved agent run\n${message}`,
+        timestamp: new Date().toISOString(),
+        responseModeBadge: {
+          label: 'Saved run error',
+          tone: 'fallback',
+        },
+      };
+      setMessages((prev) => [...prev, aiMsg]);
+    } finally {
+      setActiveAgentRunId(null);
+    }
   };
 
   const handleGeneratePlanningAssist = async () => {
@@ -428,10 +981,17 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
     await executeSuggestedQuestion(suggestion.question);
   };
 
+  const rerunBlockedAgentQuestionInSummaryMode = async (question: string) => {
+    setMode(AnalysisMode.RAG);
+    setInput(question);
+    await handleSend(question, selectedContextFiles, selectedFileIds, AnalysisMode.RAG);
+  };
+
   const handleSend = async (
     textOverride?: string,
     contextOverride?: ClinicalFile[],
-    selectedIdsOverride?: Set<string>
+    selectedIdsOverride?: Set<string>,
+    modeOverride?: AnalysisMode
   ) => {
     const textToSend = textOverride || input;
     if (!textToSend.trim() || isLoading) return;
@@ -470,11 +1030,11 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       timestamp: new Date().toISOString(),
       userId: 'current_user',
       actionType: ProvenanceType.ANALYSIS,
-      details: `Query: ${textToSend.substring(0, 50)}... | Mode: ${mode}`,
+      details: `Query: ${textToSend.substring(0, 50)}... | Mode: ${modeOverride || mode}`,
       inputs: provenanceInputs
     });
 
-    const response = await generateAnalysis(textToSend, contextFiles, mode, messages, docs);
+    const response = await generateAnalysis(textToSend, contextFiles, modeOverride || mode, messages, docs);
 
     const aiMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -484,7 +1044,9 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       citations: response.citations,
       chartConfig: response.chartConfig,
       tableConfig: response.tableConfig,
-      keyInsights: response.keyInsights
+      keyInsights: response.keyInsights,
+      agentRun: response.agentRun,
+      responseModeBadge: response.responseModeBadge,
     };
 
     if (resolutionNote) {
@@ -493,6 +1055,9 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
 
     setMessages(prev => [...prev, aiMsg]);
     setIsLoading(false);
+    if ((modeOverride || mode) === AnalysisMode.AGENT && response.agentRun) {
+      void loadRecentAgentRuns();
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -506,6 +1071,19 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       // Find the user query that triggered this, if possible (usually the previous message)
       const prevMsg = index > 0 ? messages[index - 1] : null;
       const userQuery = prevMsg?.role === 'user' ? prevMsg.content : "N/A";
+      const insightSections: InsightSections | null = msg.agentRun
+        ? (msg.agentRun.userSummary
+            ? {
+                directAnswer: msg.agentRun.userSummary.bottomLine,
+                supportingPoints: msg.agentRun.userSummary.evidencePoints,
+                potentialHypotheses: msg.agentRun.userSummary.potentialHypotheses,
+                recommendedFollowUp: msg.agentRun.userSummary.recommendedFollowUp,
+                limitations: msg.agentRun.userSummary.limitations,
+                nextSteps: msg.agentRun.userSummary.nextStep ? [msg.agentRun.userSummary.nextStep] : [],
+                contextNotes: msg.agentRun.userSummary.contextNote ? [msg.agentRun.userSummary.contextNote] : [],
+              }
+            : null)
+        : splitInsightSections(msg.keyInsights);
 
       // Create a nice HTML wrapper for the AI response
       const chartScript = msg.chartConfig ? `
@@ -581,12 +1159,31 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
           <div class="query-box">"${userQuery}"</div>
           
           <div><span class="label">Analysis Result</span></div>
+          ${msg.responseModeBadge ? `
+            <div style="margin: 10px 0 18px;">
+              <span style="display:inline-block; border:1px solid #cbd5e1; background:#f8fafc; color:#334155; border-radius:9999px; padding:6px 10px; font-size:12px; font-weight:600;">
+                ${escapeHtml(msg.responseModeBadge.label)}
+              </span>
+              ${msg.responseModeBadge.autoRouted ? `
+                <span style="display:inline-block; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:9999px; padding:6px 10px; font-size:12px; font-weight:600; margin-left:8px;">
+                  Auto-routed to agent
+                </span>
+              ` : ''}
+              ${msg.responseModeBadge.detail ? `<div style="margin-top:8px; color:#64748b; font-size:0.9em;">${escapeHtml(msg.responseModeBadge.detail)}</div>` : ''}
+            </div>
+          ` : ''}
           <div class="content">${formatMessageAsHtml(msg.content)}</div>
 
-          ${msg.keyInsights ? `
+          ${insightSections ? `
             <div class="insight-box">
-                <h3>💡 Key Clinical Insights</h3>
-                <ul>${msg.keyInsights.map(i => `<li>${i}</li>`).join('')}</ul>
+                <h3>Answer And Interpretation</h3>
+                <p>${escapeHtml(insightSections.directAnswer)}</p>
+                ${insightSections.supportingPoints.length > 0 ? `<ul>${insightSections.supportingPoints.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : ''}
+                ${insightSections.potentialHypotheses.length > 0 ? `<p><strong>Possible explanations</strong></p><ul>${insightSections.potentialHypotheses.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : ''}
+                ${insightSections.recommendedFollowUp.length > 0 ? `<p><strong>Recommended follow-up analyses</strong></p><ul>${insightSections.recommendedFollowUp.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : ''}
+                ${insightSections.limitations.length > 0 ? `<p><strong>Limitations</strong></p><ul>${insightSections.limitations.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : ''}
+                ${insightSections.nextSteps.length > 0 ? `<p><strong>Next step:</strong> ${escapeHtml(insightSections.nextSteps[0].replace(/^What to do next:\s*/i, ''))}</p>` : ''}
+                ${insightSections.contextNotes.length > 0 ? `<p><strong>Context:</strong> ${escapeHtml(insightSections.contextNotes.join(' '))}</p>` : ''}
             </div>
           ` : ''}
 
@@ -612,89 +1209,703 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
       URL.revokeObjectURL(url);
   };
 
+  const exportAgentRun = async (runId: string, format: 'ipynb' | 'html') => {
+    const exported = await exportAnalysisAgentRun(runId, format);
+    const blob = new Blob([exported.content], { type: exported.mime_type });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = exported.filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  };
+
   return (
-    <div className="flex h-full bg-white">
-      {/* Sidebar: Context Manager */}
-      <div className="w-80 border-r border-slate-200 flex flex-col bg-slate-50">
+    <div className="relative flex h-full bg-white">
+      {isContextDrawerOpen && (
+        <button
+          aria-label="Close context drawer"
+          onClick={() => setIsContextDrawerOpen(false)}
+          className="absolute inset-0 z-20 bg-slate-900/20"
+        />
+      )}
+
+      {/* Context Drawer */}
+      {isContextDrawerOpen && (
+      <div className="absolute inset-y-0 left-0 z-30 w-80 border-r border-slate-200 flex flex-col bg-slate-50 shadow-2xl">
         <div className="p-4 border-b border-slate-200">
-          <h3 className="font-semibold text-slate-800 flex items-center">
-            <BookOpen className="w-4 h-4 mr-2" /> Context Manager
-          </h3>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="font-semibold text-slate-800 flex items-center">
+              <BookOpen className="w-4 h-4 mr-2" /> Context Manager
+            </h3>
+            <button
+              onClick={() => setIsContextDrawerOpen(false)}
+              className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
+            >
+              Close
+            </button>
+          </div>
         </div>
         
         <div className="p-4 border-b border-slate-200 bg-white">
-          <div className="flex space-x-2 bg-slate-100 p-1 rounded-lg mb-4">
-             <button
-               onClick={() => setMode(AnalysisMode.RAG)}
-               className={`flex-1 flex items-center justify-center px-2 py-1.5 rounded text-xs font-medium transition-colors ${
-                 mode === AnalysisMode.RAG ? 'bg-white text-medical-600 shadow-sm' : 'text-slate-500'
-               }`}
-             >
-               <Search className="w-3 h-3 mr-1" /> Search Selected Sources
-               <InfoTooltip className="ml-1" content="Searches your selected files and uses the most relevant sections to answer your question." />
-             </button>
-             <button
-               onClick={() => setMode(AnalysisMode.STUFFING)}
-               className={`flex-1 flex items-center justify-center px-2 py-1.5 rounded text-xs font-medium transition-colors ${
-                 mode === AnalysisMode.STUFFING ? 'bg-white text-medical-600 shadow-sm' : 'text-slate-500'
-               }`}
-             >
-               <FileText className="w-3 h-3 mr-1" /> Use Selected Sources Directly
-               <InfoTooltip className="ml-1" content="Uses the selected files directly as context, without first searching for the most relevant sections." />
-             </button>
-          </div>
-          <p className="text-xs text-slate-500">
-            {mode === AnalysisMode.RAG 
-              ? "Automatically retrieves relevant chunks from all selected documents." 
-              : "Injects full content of selected documents into the prompt window."}
+          <p className="text-xs leading-relaxed text-slate-500">
+            Use this drawer only for secondary controls such as agent tools and source curation. Primary mode selection now lives in the chat composer.
           </p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-2">
-          <div className="flex items-center justify-between gap-3 mb-2">
-            <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Available Sources</div>
-            <div className="text-[11px] text-slate-400">
-              {selectedFileIds.size}/{docs.length} selected
-            </div>
-          </div>
-          {docs.length > 0 && (
-            <div className="mb-3 flex flex-wrap gap-2">
+          {mode === AnalysisMode.AGENT && (
+            <>
+              <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+                <button
+                  onClick={() => setIsAgentToolsOpen((prev) => !prev)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-wider text-slate-700">Agent Tools</div>
+                    <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                      Optional planning and run-history controls. Keep this collapsed unless you need to inspect or rerun.
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                    <span>{isAgentToolsOpen ? 'Hide' : 'Show'}</span>
+                    {isAgentToolsOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                  </div>
+                </button>
+                {isAgentToolsOpen && (
+                  <div className="mt-3 flex gap-2 rounded-lg bg-slate-100 p-1">
+                    <button
+                      onClick={() => setAgentToolsTab('brief')}
+                      className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                        agentToolsTab === 'brief' ? 'bg-white text-medical-700 shadow-sm' : 'text-slate-500'
+                      }`}
+                    >
+                      Planning Brief
+                    </button>
+                    <button
+                      onClick={() => setAgentToolsTab('runs')}
+                      className={`flex-1 rounded-md px-3 py-2 text-xs font-semibold transition-colors ${
+                        agentToolsTab === 'runs' ? 'bg-white text-medical-700 shadow-sm' : 'text-slate-500'
+                      }`}
+                    >
+                      Recent Runs
+                    </button>
+                  </div>
+                )}
+              </div>
+              {isAgentToolsOpen && agentToolsTab === 'brief' && (
+                <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-wider text-slate-700">Pre-Execution Brief</div>
+                    <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                      Preview of how the agent interprets the question before it builds the workspace and runs analysis.
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => void loadAgentPlanBrief(input)}
+                    disabled={!input.trim() || isAgentPlanBriefLoading}
+                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isAgentPlanBriefLoading ? 'Preparing…' : 'Refresh'}
+                  </button>
+                </div>
+                {!input.trim() && (
+                  <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-500">
+                    Ask a question to preview how the agent will scope the endpoint, data roles, and planned outputs.
+                  </div>
+                )}
+                {input.trim() && isAgentPlanBriefLoading && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-500">
+                    Preparing agent brief…
+                  </div>
+                )}
+                {agentPlanBriefError && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {agentPlanBriefError}
+                  </div>
+                )}
+                {input.trim() && !isAgentPlanBriefLoading && !agentPlanBriefError && (
+                  <>
+                    {agentPlanStatus && (
+                      <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${
+                        agentPlanStatus === 'executable'
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                          : agentPlanStatus === 'missing_data'
+                            ? 'border-amber-200 bg-amber-50 text-amber-800'
+                            : 'border-rose-200 bg-rose-50 text-rose-700'
+                      }`}>
+                        <span className="font-semibold">
+                          {agentPlanStatus === 'executable'
+                            ? 'Execution ready'
+                            : agentPlanStatus === 'missing_data'
+                              ? 'Execution readiness: missing data'
+                              : 'Execution not supported yet'}
+                        </span>
+                        {agentPlanExplanation ? <span>{' '} {agentPlanExplanation}</span> : null}
+                      </div>
+                    )}
+                    {agentPlanBrief ? (
+                      <div className="space-y-3 text-xs text-slate-700">
+                        {agentPlanBrief.assessment && (
+                          <div className={`rounded-lg border px-3 py-3 ${
+                            agentPlanBrief.assessment.supportLevel === 'supported'
+                              ? 'border-emerald-200 bg-emerald-50'
+                              : agentPlanBrief.assessment.supportLevel === 'partial'
+                                ? 'border-amber-200 bg-amber-50'
+                                : 'border-rose-200 bg-rose-50'
+                          }`}>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                                agentPlanBrief.assessment.supportLevel === 'supported'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : agentPlanBrief.assessment.supportLevel === 'partial'
+                                    ? 'bg-amber-100 text-amber-800'
+                                    : 'bg-rose-100 text-rose-700'
+                              }`}>
+                                {agentPlanBrief.assessment.supportLevel === 'supported'
+                                  ? 'Supported'
+                                  : agentPlanBrief.assessment.supportLevel === 'partial'
+                                    ? 'Partially supported'
+                                    : 'Not supported yet'}
+                              </span>
+                              <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">
+                                {formatCapabilityStageLabel(agentPlanBrief.assessment.blockerStage)}
+                              </span>
+                            </div>
+                            {agentPlanBrief.assessment.blockerReason && (
+                              <div className="mt-2 text-sm font-medium text-slate-800">
+                                {agentPlanBrief.assessment.blockerReason}
+                              </div>
+                            )}
+                            {agentPlanBrief.assessment.recommendedNextStep && (
+                              <div className="mt-2 text-xs leading-relaxed text-slate-700">
+                                <span className="font-semibold text-slate-800">What to do next:</span>{' '}
+                                {agentPlanBrief.assessment.recommendedNextStep}
+                              </div>
+                            )}
+                            {agentPlanBrief.assessment.fallbackOption && (
+                              <div className="mt-2 text-xs leading-relaxed text-slate-600">
+                                <span className="font-semibold text-slate-700">Fallback:</span>{' '}
+                                {agentPlanBrief.assessment.fallbackOption}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <div className="grid grid-cols-1 gap-2">
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Analysis Family</div>
+                            <div className="mt-1 text-sm font-semibold text-slate-800">
+                              {formatAnalysisFamilyLabel(agentPlanBrief.analysisFamily)}
+                            </div>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Endpoint</div>
+                            <div className="mt-1 leading-relaxed text-slate-800">
+                              {agentPlanBrief.endpointLabel || agentPlanBrief.targetDefinition || 'Auto-derived from available analysis-ready fields.'}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                          <div className="font-semibold uppercase tracking-wide text-slate-500">Treatment Variable</div>
+                          <div className="mt-1 leading-relaxed text-slate-800">
+                            {agentPlanBrief.treatmentVariable || 'Auto-detect treatment or arm variable from subject-level data.'}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                          <div className="font-semibold uppercase tracking-wide text-slate-500">Subgroup Factors</div>
+                          <div className="mt-1 leading-relaxed text-slate-800">
+                            {agentPlanBrief.subgroupFactors.length > 0 ? agentPlanBrief.subgroupFactors.join(', ') : 'No specific subgroup modifiers inferred.'}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                          <div className="font-semibold uppercase tracking-wide text-slate-500">Required Dataset Roles</div>
+                          <div className="mt-1 leading-relaxed text-slate-800">
+                            {agentPlanBrief.requiredRoles.length > 0 ? agentPlanBrief.requiredRoles.join(', ') : 'No deterministic role set inferred yet.'}
+                          </div>
+                          {agentPlanBrief.missingRoles.length > 0 && (
+                            <div className="mt-2 text-amber-700">
+                              Missing: {agentPlanBrief.missingRoles.join(', ')}
+                            </div>
+                          )}
+                        </div>
+                        {agentPlanBrief.selectedSources.length > 0 && (
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Selected Sources</div>
+                            <div className="mt-1 leading-relaxed text-slate-800">
+                              {agentPlanBrief.selectedSources.join(', ')}
+                            </div>
+                          </div>
+                        )}
+                        {(agentPlanBrief.timeWindowDays || agentPlanBrief.gradeThreshold || agentPlanBrief.termFilters.length > 0 || agentPlanBrief.cohortFilters.length > 0) && (
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Derived Constraints</div>
+                            <div className="mt-1 space-y-1 leading-relaxed text-slate-800">
+                              {agentPlanBrief.timeWindowDays ? <div>Time window: {agentPlanBrief.timeWindowDays} days</div> : null}
+                              {agentPlanBrief.gradeThreshold ? <div>Grade threshold: Grade {agentPlanBrief.gradeThreshold}+</div> : null}
+                              {agentPlanBrief.termFilters.length > 0 ? <div>Term filters: {agentPlanBrief.termFilters.join(', ')}</div> : null}
+                              {agentPlanBrief.cohortFilters.length > 0 ? <div>Cohort filters: {agentPlanBrief.cohortFilters.join(', ')}</div> : null}
+                            </div>
+                          </div>
+                        )}
+                        {(agentPlanBrief.interactionTerms.length > 0 || agentPlanBrief.requestedOutputs.length > 0) && (
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Planned Outputs</div>
+                            <div className="mt-1 space-y-1 leading-relaxed text-slate-800">
+                              {agentPlanBrief.interactionTerms.length > 0 ? <div>Interactions: {agentPlanBrief.interactionTerms.join(', ')}</div> : null}
+                              {agentPlanBrief.requestedOutputs.length > 0 ? <div>Outputs: {agentPlanBrief.requestedOutputs.join(', ')}</div> : null}
+                            </div>
+                          </div>
+                        )}
+                        {agentPlanBrief.assessment && (agentPlanBrief.assessment.dataRequirements.length > 0 || agentPlanBrief.assessment.methodConstraints.length > 0) && (
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Capability Constraints</div>
+                            {agentPlanBrief.assessment.dataRequirements.length > 0 && (
+                              <div className="mt-2">
+                                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Data Requirements</div>
+                                <ul className="mt-1 space-y-1 leading-relaxed text-slate-700">
+                                  {agentPlanBrief.assessment.dataRequirements.map((item, idx) => (
+                                    <li key={`agent-brief-requirement-${idx}`} className="flex items-start">
+                                      <div className="mt-1.5 mr-2 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                                      <span>{item}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {agentPlanBrief.assessment.methodConstraints.length > 0 && (
+                              <div className="mt-3">
+                                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Method Constraints</div>
+                                <ul className="mt-1 space-y-1 leading-relaxed text-slate-700">
+                                  {agentPlanBrief.assessment.methodConstraints.map((item, idx) => (
+                                    <li key={`agent-brief-constraint-${idx}`} className="flex items-start">
+                                      <div className="mt-1.5 mr-2 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                                      <span>{item}</span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {agentPlanBrief.notes.length > 0 && (
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="font-semibold uppercase tracking-wide text-slate-500">Planner Notes</div>
+                            <ul className="mt-1 space-y-1 leading-relaxed text-slate-700">
+                              {agentPlanBrief.notes.slice(0, 4).map((note, idx) => (
+                                <li key={`agent-brief-note-${idx}`} className="flex items-start">
+                                  <div className="mt-1.5 mr-2 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                                  <span>{note}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-500">
+                        The planner did not produce a structured brief for this question yet.
+                      </div>
+                    )}
+                  </>
+                )}
+                </div>
+              )}
+              {selectedAgentRunDetail && (
+                <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-wider text-slate-700">Run Detail</div>
+                      <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                        Focused view of the selected agent run with restore and rerun controls.
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setSelectedAgentRunDetail(null);
+                        setSelectedAgentStepId(null);
+                      }}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="text-sm font-semibold leading-5 text-slate-800">
+                    {selectedAgentRunDetail.question || 'Saved AI Analysis Agent run'}
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    {formatAgentRunTimestamp(selectedAgentRunDetail.createdAt)} | {selectedAgentRunDetail.analysisFamily}
+                  </div>
+                  {selectedAgentRunDetail.userSummary?.bottomLine && (
+                    <div className="mt-3 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2 text-sm leading-relaxed text-indigo-950">
+                      {selectedAgentRunDetail.userSummary.bottomLine}
+                    </div>
+                  )}
+                  {selectedAgentRunDetail.selectedSources.length > 0 && (
+                    <div className="mt-3 text-[11px] leading-relaxed text-slate-600">
+                      Sources: {selectedAgentRunDetail.selectedSources.join(', ')}
+                    </div>
+                  )}
+                  {selectedAgentRunDetail.missingRoles.length > 0 && (
+                    <div className="mt-2 text-[11px] leading-relaxed text-amber-700">
+                      Still needed: {selectedAgentRunDetail.missingRoles.join(', ')}
+                    </div>
+                  )}
+                  {selectedAgentRunDetail.userSummary?.evidencePoints && selectedAgentRunDetail.userSummary.evidencePoints.length > 0 && (
+                    <div className="mt-3">
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">Evidence</div>
+                      <ul className="space-y-1 text-[11px] leading-relaxed text-slate-600">
+                        {selectedAgentRunDetail.userSummary.evidencePoints.slice(0, 3).map((point, idx) => (
+                          <li key={`${selectedAgentRunDetail.runId}-evidence-${idx}`} className="flex items-start">
+                            <div className="mt-1.5 mr-2 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                            <span>{point}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                    {selectedAgentRunDetail.steps.map((step) => (
+                      <button
+                        key={`${selectedAgentRunDetail.runId}-${step.id}`}
+                        onClick={() => setSelectedAgentStepId(step.id)}
+                        className={`rounded-lg border px-2 py-2 text-left ${
+                          selectedAgentStepId === step.id ? 'border-medical-200 bg-medical-50' : 'border-slate-200 bg-slate-50'
+                        }`}
+                      >
+                        <div className="font-semibold text-slate-700">{step.title}</div>
+                        <div className={`mt-1 uppercase tracking-wide ${
+                          step.status === 'completed'
+                            ? 'text-emerald-700'
+                            : step.status === 'failed'
+                              ? 'text-red-700'
+                              : 'text-slate-500'
+                        }`}>
+                          {step.status}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  {selectedAgentRunDetail.steps.find((step) => step.id === selectedAgentStepId) && (
+                    <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      {(() => {
+                        const step = selectedAgentRunDetail.steps.find((candidate) => candidate.id === selectedAgentStepId)!;
+                        return (
+                          <>
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <div className="text-sm font-semibold text-slate-800">{step.title}</div>
+                                <div className="mt-1 text-xs leading-relaxed text-slate-600">{step.summary}</div>
+                              </div>
+                              <div className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                                step.status === 'completed'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : step.status === 'failed'
+                                    ? 'bg-red-50 text-red-700'
+                                    : 'bg-slate-100 text-slate-500'
+                              }`}>
+                                {step.status}
+                              </div>
+                            </div>
+                            {step.details.length > 0 && (
+                              <ul className="mt-3 space-y-1 text-[11px] leading-relaxed text-slate-600">
+                                {step.details.map((detail, idx) => (
+                                  <li key={`${step.id}-detail-${idx}`} className="flex items-start">
+                                    <div className="mt-1.5 mr-2 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                                    <span>{detail}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                            {renderAgentStepProvenance(step.provenance, 'compact')}
+                            {step.code && (
+                              <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900 p-3 text-[11px] text-slate-100 whitespace-pre-wrap">
+                                {step.code}
+                              </pre>
+                            )}
+                            {step.chart && (
+                              <div className="mt-3">
+                                <Chart data={step.chart.data} layout={step.chart.layout} />
+                              </div>
+                            )}
+                            {step.table && (
+                              <div className="mt-3 overflow-hidden rounded-lg border border-slate-200 bg-white">
+                                {step.table.title && (
+                                  <div className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-[11px] font-semibold text-slate-600">
+                                    {step.table.title}
+                                  </div>
+                                )}
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-full text-left text-[11px]">
+                                    <thead className="bg-slate-50">
+                                      <tr>
+                                        {step.table.columns.map((column) => (
+                                          <th key={`${step.id}-${column}`} className="px-3 py-2 font-semibold text-slate-600">
+                                            {column}
+                                          </th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {step.table.rows.map((row, rowIndex) => (
+                                        <tr key={`${step.id}-detail-row-${rowIndex}`} className="border-t border-slate-100">
+                                          {step.table!.columns.map((column) => (
+                                            <td key={`${step.id}-detail-${rowIndex}-${column}`} className="px-3 py-2 text-slate-700">
+                                              {String(row[column] ?? '')}
+                                            </td>
+                                          ))}
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  )}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => restoreAgentRunSelection(selectedAgentRunDetail)}
+                      className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700 hover:bg-medical-100"
+                    >
+                      Restore Files
+                    </button>
+                    <button
+                      onClick={() => void rerunAgentRun(selectedAgentRunDetail.runId)}
+                      disabled={activeAgentRunId === selectedAgentRunDetail.runId || isLoading}
+                      className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {activeAgentRunId === selectedAgentRunDetail.runId ? 'Rerunning…' : 'Rerun'}
+                    </button>
+                    <button
+                      onClick={() => void reopenAgentRun(selectedAgentRunDetail.runId)}
+                      disabled={activeAgentRunId === selectedAgentRunDetail.runId}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {activeAgentRunId === selectedAgentRunDetail.runId ? 'Opening…' : 'Open In Chat'}
+                    </button>
+                    <button
+                      onClick={() => exportAgentRun(selectedAgentRunDetail.runId, 'ipynb')}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                    >
+                      Notebook
+                    </button>
+                    <button
+                      onClick={() => exportAgentRun(selectedAgentRunDetail.runId, 'html')}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                    >
+                      HTML
+                    </button>
+                  </div>
+                </div>
+              )}
+              {isAgentToolsOpen && agentToolsTab === 'runs' && (
+                <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-wider text-slate-700">Recent Agent Runs</div>
+                    <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                      Reopen prior deterministic agent runs, inspect their details, restore files, or rerun them.
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => void loadRecentAgentRuns()}
+                    disabled={isAgentRunsLoading}
+                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isAgentRunsLoading ? 'Loading…' : 'Refresh'}
+                  </button>
+                </div>
+                {agentRunsError && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {agentRunsError}
+                  </div>
+                )}
+                {agentDetailError && (
+                  <div className="mb-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {agentDetailError}
+                  </div>
+                )}
+                {!agentRunsError && recentAgentRuns.length === 0 && !isAgentRunsLoading && (
+                  <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-500">
+                    No saved agent runs yet.
+                  </div>
+                )}
+                {recentAgentRuns.length > 0 && (
+                  <div className="space-y-2">
+                    {recentAgentRuns.map((run) => (
+                      <div key={run.runId} className={`rounded-lg border px-3 py-3 ${
+                        selectedAgentRunDetail?.runId === run.runId ? 'border-medical-200 bg-medical-50' : 'border-slate-200 bg-slate-50'
+                      }`}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-semibold text-slate-800">{run.question || 'Saved AI Analysis Agent run'}</div>
+                            <div className="mt-1 text-[11px] text-slate-500">
+                              {formatAgentRunTimestamp(run.createdAt)} | {run.analysisFamily}
+                            </div>
+                          </div>
+                          <span className={`inline-flex shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                            run.executed ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                          }`}>
+                            {run.executed ? 'Executed' : 'Blocked'}
+                          </span>
+                        </div>
+                        {run.selectedSources.length > 0 && (
+                        <div className="mt-2 text-[11px] leading-relaxed text-slate-500">
+                          Sources: {run.selectedSources.join(', ')}
+                        </div>
+                      )}
+                        {run.missingRoles.length > 0 && (
+                          <div className="mt-2 text-[11px] leading-relaxed text-amber-700">
+                            Still needed: {run.missingRoles.join(', ')}
+                          </div>
+                        )}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            onClick={() => void viewAgentRunDetail(run.runId)}
+                            disabled={activeAgentRunId === run.runId || isAgentDetailLoading}
+                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {activeAgentRunId === run.runId && isAgentDetailLoading ? 'Loading…' : 'View'}
+                          </button>
+                          <button
+                            onClick={() => void rerunAgentRun(run.runId)}
+                            disabled={activeAgentRunId === run.runId || isLoading}
+                            className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {activeAgentRunId === run.runId && !isAgentDetailLoading ? 'Rerunning…' : 'Rerun'}
+                          </button>
+                          <button
+                            onClick={() => void reopenAgentRun(run.runId)}
+                            disabled={activeAgentRunId === run.runId}
+                            className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700 hover:bg-medical-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {activeAgentRunId === run.runId ? 'Opening…' : 'Open In Chat'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                </div>
+              )}
+            </>
+          )}
+          <div className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wider text-slate-700">Source Selection</div>
+                <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                  {selectedFileIds.size}/{docs.length} selected. Keep this collapsed unless you need to curate the source set manually.
+                </div>
+              </div>
               <button
-                onClick={selectAllSources}
-                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                onClick={() => setIsSourcesDrawerOpen(true)}
+                className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-700 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
               >
-                Select All
+                Edit Sources
               </button>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
               <button
                 onClick={clearSelectedSources}
                 className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-100"
               >
                 Clear
               </button>
-              <button
-                onClick={() => selectSourcesByType([DataType.RAW, DataType.STANDARDIZED])}
-                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
-              >
-                Datasets Only
-              </button>
-              <button
-                onClick={() => selectSourcesByType([DataType.DOCUMENT])}
-                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
-              >
-                Documents Only
-              </button>
               {recommendation && recommendation.requiredRoles.length > 0 && (
                 <button
                   onClick={applyRecommendedSources}
                   className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700 hover:bg-medical-100"
                 >
-                  Use Recommended Files
+                  Use Recommended
                 </button>
               )}
             </div>
-          )}
-          {recommendation && recommendation.requiredRoles.length > 0 && (
-            <div className="mb-3 rounded-xl border border-medical-100 bg-medical-50/60 p-3">
+            {selectedContextFiles.length > 0 && (
+              <div className="mt-3 text-[11px] leading-relaxed text-slate-600">
+                Active: {selectedContextFiles.slice(0, 3).map((file) => file.name).join(', ')}
+                {selectedContextFiles.length > 3 ? ` +${selectedContextFiles.length - 3} more` : ''}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      )}
+
+      {isSourcesDrawerOpen && (
+        <>
+          <button
+            aria-label="Close source drawer"
+            onClick={() => setIsSourcesDrawerOpen(false)}
+            className="absolute inset-0 z-20 bg-slate-900/20"
+          />
+          <div className="absolute inset-y-0 left-0 z-40 w-[420px] border-r border-slate-200 bg-white shadow-2xl">
+            <div className="flex h-full flex-col">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4">
+                <div>
+                  <div className="text-sm font-semibold text-slate-800">Edit Sources</div>
+                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    Choose datasets and documents, then close this panel to keep the main workspace focused.
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsSourcesDrawerOpen(false)}
+                  className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
+                >
+                  Close
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Available Sources</div>
+                  <div className="text-[11px] text-slate-400">
+                    {selectedFileIds.size}/{docs.length} selected
+                  </div>
+                </div>
+                {docs.length > 0 && (
+                  <div className="mb-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={selectAllSources}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      onClick={clearSelectedSources}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-slate-300 hover:bg-slate-100"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={() => selectSourcesByType([DataType.RAW, DataType.STANDARDIZED])}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                    >
+                      Datasets Only
+                    </button>
+                    <button
+                      onClick={() => selectSourcesByType([DataType.DOCUMENT])}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                    >
+                      Documents Only
+                    </button>
+                    {recommendation && recommendation.requiredRoles.length > 0 && (
+                      <button
+                        onClick={applyRecommendedSources}
+                        className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700 hover:bg-medical-100"
+                      >
+                        Use Recommended Files
+                      </button>
+                    )}
+                  </div>
+                )}
+                {recommendation && recommendation.requiredRoles.length > 0 && (
+                  <div className="mb-3 rounded-xl border border-medical-100 bg-medical-50/60 p-3">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="text-xs font-semibold uppercase tracking-wider text-medical-700">Recommended For This Question</div>
                 <div className="text-[11px] text-medical-600">
@@ -768,10 +1979,10 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                   </div>
                 )}
               </div>
-            </div>
-          )}
-          {input.trim() && docs.length > 0 && (
-            <div className="mb-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3">
+                  </div>
+                )}
+                {input.trim() && docs.length > 0 && (
+                  <div className="mb-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-3">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div>
                   <div className="text-xs font-semibold uppercase tracking-wider text-indigo-700">AI Planning Assist</div>
@@ -861,10 +2072,10 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                   )}
                 </div>
               )}
-            </div>
-          )}
-          {selectedContextFiles.length > 0 && (
-            <div className="mb-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
+                  </div>
+                )}
+                {selectedContextFiles.length > 0 && (
+                  <div className="mb-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div>
                   <div className="text-xs font-semibold uppercase tracking-wider text-emerald-700">Explore Questions</div>
@@ -965,65 +2176,84 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                   </div>
                 </div>
               )}
-            </div>
-          )}
-          {docs.map(doc => (
-            <div 
-              key={doc.id} 
-              onClick={() => toggleFileSelection(doc.id)}
-              className={`flex items-start space-x-3 p-2 rounded cursor-pointer transition-colors ${
-                selectedFileIds.has(doc.id) ? 'bg-medical-50 border border-medical-200' : 'hover:bg-slate-100 border border-transparent'
-              }`}
-            >
-              <div className={`mt-0.5 w-4 h-4 border rounded flex items-center justify-center transition-colors ${
-                selectedFileIds.has(doc.id) ? 'bg-medical-600 border-medical-600' : 'border-slate-300 bg-white'
-              }`}>
-                {selectedFileIds.has(doc.id) && <CheckSquare className="w-3 h-3 text-white" />}
-              </div>
-              <div className="flex-1 overflow-hidden">
-                <div className="text-sm font-medium text-slate-700 truncate">{doc.name}</div>
-                <div className="text-xs text-slate-500">{doc.type} • {doc.size}</div>
-                <div className="mt-1 flex flex-wrap gap-1.5">
-                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
-                    {fileProfiles.get(doc.id)?.shortLabel || 'Clinical'}
-                  </span>
-                  {recommendedRoleByFileId.has(doc.id) && (
-                    <span className="rounded-full bg-medical-100 px-2 py-0.5 text-[10px] font-semibold text-medical-700">
-                      Recommended: {ROLE_LABELS[recommendedRoleByFileId.get(doc.id)!]}
-                    </span>
-                  )}
-                  {!recommendedRoleByFileId.has(doc.id) && alternativeRoleByFileId.has(doc.id) && (
-                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
-                      Alternative: {ROLE_LABELS[alternativeRoleByFileId.get(doc.id)!]}
-                    </span>
-                  )}
-                  {recommendation?.confidenceByFileId[doc.id] && (
-                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${confidenceBadgeClass(recommendation.confidenceByFileId[doc.id])}`}>
-                      {recommendation.confidenceByFileId[doc.id]} confidence
-                    </span>
-                  )}
-                </div>
-                {recommendedRoleByFileId.has(doc.id) && recommendation?.rationaleByFileId[doc.id] && (
-                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                    {recommendation.rationaleByFileId[doc.id]}
                   </div>
                 )}
-                {!recommendedRoleByFileId.has(doc.id) && recommendation?.whyNotSelectedByFileId[doc.id] && (
-                  <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                    {recommendation.whyNotSelectedByFileId[doc.id]}
+                {docs.map(doc => (
+                  <div 
+                    key={doc.id} 
+                    onClick={() => toggleFileSelection(doc.id)}
+                    className={`flex items-start space-x-3 p-2 rounded cursor-pointer transition-colors ${
+                      selectedFileIds.has(doc.id) ? 'bg-medical-50 border border-medical-200' : 'hover:bg-slate-100 border border-transparent'
+                    }`}
+                  >
+                    <div className={`mt-0.5 w-4 h-4 border rounded flex items-center justify-center transition-colors ${
+                      selectedFileIds.has(doc.id) ? 'bg-medical-600 border-medical-600' : 'border-slate-300 bg-white'
+                    }`}>
+                      {selectedFileIds.has(doc.id) && <CheckSquare className="w-3 h-3 text-white" />}
+                    </div>
+                    <div className="flex-1 overflow-hidden">
+                      <div className="text-sm font-medium text-slate-700 truncate">{doc.name}</div>
+                      <div className="text-xs text-slate-500">{doc.type} • {doc.size}</div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                          {fileProfiles.get(doc.id)?.shortLabel || 'Clinical'}
+                        </span>
+                        {recommendedRoleByFileId.has(doc.id) && (
+                          <span className="rounded-full bg-medical-100 px-2 py-0.5 text-[10px] font-semibold text-medical-700">
+                            Recommended: {ROLE_LABELS[recommendedRoleByFileId.get(doc.id)!]}
+                          </span>
+                        )}
+                        {!recommendedRoleByFileId.has(doc.id) && alternativeRoleByFileId.has(doc.id) && (
+                          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                            Alternative: {ROLE_LABELS[alternativeRoleByFileId.get(doc.id)!]}
+                          </span>
+                        )}
+                        {recommendation?.confidenceByFileId[doc.id] && (
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${confidenceBadgeClass(recommendation.confidenceByFileId[doc.id])}`}>
+                            {recommendation.confidenceByFileId[doc.id]} confidence
+                          </span>
+                        )}
+                      </div>
+                      {recommendedRoleByFileId.has(doc.id) && recommendation?.rationaleByFileId[doc.id] && (
+                        <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                          {recommendation.rationaleByFileId[doc.id]}
+                        </div>
+                      )}
+                      {!recommendedRoleByFileId.has(doc.id) && recommendation?.whyNotSelectedByFileId[doc.id] && (
+                        <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                          {recommendation.whyNotSelectedByFileId[doc.id]}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                )}
+                ))}
+                {docs.length === 0 && <div className="text-sm text-slate-400 italic">No documents available. Upload in Ingestion tab.</div>}
               </div>
             </div>
-          ))}
-          {docs.length === 0 && <div className="text-sm text-slate-400 italic">No documents available. Upload in Ingestion tab.</div>}
-        </div>
-      </div>
+          </div>
+        </>
+      )}
 
       {/* Main Chat Area */}
       <div className="flex-1 flex flex-col">
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {messages.map((msg, index) => (
+          {messages.map((msg, index) => {
+            const agentRun = normalizeAgentRun(msg.agentRun);
+            const blockedMissingRoles = agentRun?.missingRoles || [];
+            const insightSections: InsightSections | null = agentRun
+              ? (agentRun.userSummary
+                  ? {
+                      directAnswer: agentRun.userSummary.bottomLine,
+                      supportingPoints: agentRun.userSummary.evidencePoints,
+                      potentialHypotheses: agentRun.userSummary.potentialHypotheses,
+                      recommendedFollowUp: agentRun.userSummary.recommendedFollowUp,
+                      limitations: agentRun.userSummary.limitations,
+                      nextSteps: agentRun.userSummary.nextStep ? [agentRun.userSummary.nextStep] : [],
+                      contextNotes: agentRun.userSummary.contextNote ? [agentRun.userSummary.contextNote] : [],
+                    }
+                  : null)
+              : splitInsightSections(msg.keyInsights);
+            return (
             <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               <div className={`max-w-3xl flex items-start space-x-3 ${msg.role === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
                 <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
@@ -1036,7 +2266,178 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                     ? 'bg-slate-100 text-slate-800 rounded-tr-none' 
                     : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none shadow-sm'
                 }`}>
-                  <div className="text-sm leading-relaxed font-sans">{renderFormattedMessage(msg.content)}</div>
+                  {msg.role === 'model' && msg.responseModeBadge && (
+                    <div className="mb-3 flex flex-wrap items-center gap-2">
+                      <div className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${responseBadgeClass(msg.responseModeBadge.tone)}`}>
+                        {msg.responseModeBadge.label}
+                      </div>
+                      {msg.responseModeBadge.autoRouted && (
+                        <div className="rounded-full border border-medical-200 bg-medical-50 px-2.5 py-1 text-[11px] font-semibold text-medical-700">
+                          Auto-routed to agent
+                        </div>
+                      )}
+                      {msg.responseModeBadge.detail && (
+                        <div className="text-[11px] leading-relaxed text-slate-500">
+                          {msg.responseModeBadge.detail}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {(!agentRun || agentRun.executed) && (
+                    <div className="text-sm leading-relaxed font-sans">{renderFormattedMessage(msg.content)}</div>
+                  )}
+
+                  {agentRun && (
+                    <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                      <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-100 px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <Cpu className="w-4 h-4 text-slate-700" />
+                          <div className="text-sm font-semibold text-slate-800">AI Analysis Agent Run</div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => exportAgentRun(agentRun.runId, 'ipynb')}
+                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                          >
+                            Notebook
+                          </button>
+                          <button
+                            onClick={() => exportAgentRun(agentRun.runId, 'html')}
+                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                          >
+                            HTML
+                          </button>
+                          <div className={`text-[11px] font-semibold uppercase tracking-wide ${
+                            agentRun.executed ? 'text-slate-500' : 'text-amber-700'
+                          }`}>
+                            {agentRun.executed ? 'Executed' : 'Execution Blocked'}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="space-y-3 p-4">
+                        <div className="text-xs leading-relaxed text-slate-600">
+                          {agentRun.question && (
+                            <>
+                              <span className="font-semibold text-slate-800">Question:</span> {agentRun.question}
+                              <br />
+                            </>
+                          )}
+                          <span className="font-semibold text-slate-800">Family:</span> {agentRun.analysisFamily}
+                          {agentRun.createdAt && (
+                            <>
+                              {' '}| <span className="font-semibold text-slate-800">Saved:</span> {formatAgentRunTimestamp(agentRun.createdAt)}
+                            </>
+                          )}
+                          {agentRun.selectedSources.length > 0 && (
+                            <>
+                              {' '}| <span className="font-semibold text-slate-800">Sources:</span> {agentRun.selectedSources.join(', ')}
+                            </>
+                          )}
+                        </div>
+                        {!agentRun.executed && (
+                          <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                            <div className="text-sm font-semibold text-amber-900">Execution blocked</div>
+                            <div className="mt-2 text-sm leading-relaxed text-amber-900">
+                              {blockedMissingRoles.length > 0
+                                ? `The agent searched the available project datasets but still could not find the required role${blockedMissingRoles.length === 1 ? '' : 's'}: ${blockedMissingRoles.join(', ')}.`
+                                : 'The agent stopped before execution because the available datasets still do not satisfy the required deterministic analysis roles.'}
+                            </div>
+                            <div className="mt-2 text-xs leading-relaxed text-amber-800">
+                              Next step: add the missing dataset type or switch to a summary-only chat answer if you only need orientation.
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                onClick={() => applyRecommendedSourcesForQuestion(agentRun.question)}
+                                className="rounded-full border border-amber-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
+                              >
+                                Use Recommended Files
+                              </button>
+                              <button
+                                onClick={() => rerunBlockedAgentQuestionInSummaryMode(agentRun.question)}
+                                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+                              >
+                                Ask In AI Summary Mode
+                              </button>
+                              <button
+                                onClick={() => toggleBlockedRunDetails(agentRun.runId)}
+                                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
+                              >
+                                {expandedBlockedRunIds.has(agentRun.runId) ? 'Hide Details' : 'Show Details'}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {(agentRun.executed || expandedBlockedRunIds.has(agentRun.runId)) && agentRun.steps.map((step) => (
+                          <div key={step.id} className="rounded-xl border border-slate-200 bg-white p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <div className="text-sm font-semibold text-slate-800">{step.title}</div>
+                                <div className="mt-1 text-sm text-slate-600">{step.summary}</div>
+                              </div>
+                              <div className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                                step.status === 'completed'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : step.status === 'failed'
+                                    ? 'bg-red-50 text-red-700'
+                                    : 'bg-slate-100 text-slate-500'
+                              }`}>
+                                {step.status}
+                              </div>
+                            </div>
+                            {step.details.length > 0 && (
+                              <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-slate-600">
+                                {step.details.map((detail, idx) => (
+                                  <li key={`${step.id}-detail-${idx}`}>{detail}</li>
+                                ))}
+                              </ul>
+                            )}
+                            {renderAgentStepProvenance(step.provenance, 'default')}
+                            {step.code && (
+                              <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-100 whitespace-pre-wrap">
+                                {step.code}
+                              </pre>
+                            )}
+                            {step.chart && (
+                              <div className="mt-3">
+                                <Chart data={step.chart.data} layout={step.chart.layout} />
+                              </div>
+                            )}
+                            {step.table && (
+                              <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
+                                {step.table.title && (
+                                  <div className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
+                                    {step.table.title}
+                                  </div>
+                                )}
+                                <table className="min-w-full text-left text-xs">
+                                  <thead className="bg-slate-50">
+                                    <tr>
+                                      {step.table.columns.map((column) => (
+                                        <th key={`${step.id}-${column}`} className="px-3 py-2 font-semibold text-slate-600">
+                                          {column}
+                                        </th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {step.table.rows.map((row, rowIndex) => (
+                                      <tr key={`${step.id}-row-${rowIndex}`} className="border-t border-slate-100">
+                                        {step.table!.columns.map((column) => (
+                                          <td key={`${step.id}-${rowIndex}-${column}`} className="px-3 py-2 text-slate-700">
+                                            {String(row[column] ?? '')}
+                                          </td>
+                                        ))}
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   
                   {/* Chart Rendering */}
                   {msg.chartConfig && (
@@ -1080,23 +2481,89 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                   )}
 
                   {/* Key Takeaways */}
-                  {msg.keyInsights && msg.keyInsights.length > 0 && (
+                  {insightSections && (
                     <div className="mt-4 bg-indigo-50 border border-indigo-200 rounded-xl overflow-hidden shadow-sm">
                       <div className="bg-indigo-100 px-4 py-2 border-b border-indigo-200 flex items-center">
                         <Sparkles className="w-4 h-4 mr-2 text-indigo-600" />
                         <h4 className="text-sm font-bold text-indigo-800">
-                          Key Takeaways
+                          Answer And Interpretation
                         </h4>
                       </div>
                       <div className="p-4">
-                        <ul className="space-y-3">
-                          {msg.keyInsights.map((insight, idx) => (
-                            <li key={idx} className="flex items-start">
-                                <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
-                                <span className="text-sm text-indigo-900 leading-relaxed">{insight}</span>
-                            </li>
-                          ))}
-                        </ul>
+                        <div className="text-sm font-semibold leading-relaxed text-indigo-950">
+                          {insightSections.directAnswer}
+                        </div>
+                        {insightSections.supportingPoints.length > 0 && (
+                          <div className="mt-4">
+                            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-indigo-700">
+                              Supporting points
+                            </div>
+                            <ul className="space-y-3">
+                              {insightSections.supportingPoints.map((insight, idx) => (
+                                <li key={idx} className="flex items-start">
+                                  <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
+                                  <span className="text-sm text-indigo-900 leading-relaxed">{insight}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {insightSections.potentialHypotheses.length > 0 && (
+                          <div className="mt-4">
+                            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-indigo-700">
+                              Possible explanations
+                            </div>
+                            <ul className="space-y-3">
+                              {insightSections.potentialHypotheses.map((item, idx) => (
+                                <li key={`hypothesis-${idx}`} className="flex items-start">
+                                  <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
+                                  <span className="text-sm text-indigo-900 leading-relaxed">{item}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {insightSections.recommendedFollowUp.length > 0 && (
+                          <div className="mt-4">
+                            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-indigo-700">
+                              Recommended follow-up analyses
+                            </div>
+                            <ul className="space-y-3">
+                              {insightSections.recommendedFollowUp.map((item, idx) => (
+                                <li key={`follow-up-${idx}`} className="flex items-start">
+                                  <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
+                                  <span className="text-sm text-indigo-900 leading-relaxed">{item}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {insightSections.limitations.length > 0 && (
+                          <div className="mt-4">
+                            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-indigo-700">
+                              Limitations
+                            </div>
+                            <ul className="space-y-3">
+                              {insightSections.limitations.map((item, idx) => (
+                                <li key={`limitation-${idx}`} className="flex items-start">
+                                  <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 mr-3 flex-shrink-0" />
+                                  <span className="text-sm text-indigo-900 leading-relaxed">{item}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {insightSections.nextSteps.length > 0 && (
+                          <div className="mt-4 rounded-lg border border-indigo-200 bg-white/70 px-3 py-2 text-sm text-indigo-900">
+                            <span className="font-semibold">Next step:</span>{' '}
+                            {insightSections.nextSteps[0].replace(/^What to do next:\s*/i, '')}
+                          </div>
+                        )}
+                        {insightSections.contextNotes.length > 0 && (
+                          <div className="mt-3 text-xs leading-relaxed text-indigo-700">
+                            {insightSections.contextNotes.join(' ')}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -1156,7 +2623,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
                 </div>
               </div>
             </div>
-          ))}
+          )})}
           {isLoading && (
             <div className="flex justify-start">
                <div className="flex items-center space-x-3">
@@ -1178,6 +2645,44 @@ export const Analysis: React.FC<AnalysisProps> = ({ files, onRecordProvenance, m
 
         {/* Input Area & Quick Actions */}
         <div className="p-4 border-t border-slate-200 bg-white">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <div className="flex items-center rounded-full border border-slate-200 bg-slate-50 p-1">
+              <button
+                onClick={() => setMode(AnalysisMode.RAG)}
+                className={`rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                  mode === AnalysisMode.RAG ? 'bg-white text-medical-700 shadow-sm' : 'text-slate-500'
+                }`}
+              >
+                AI Chat
+              </button>
+              <button
+                onClick={() => setMode(AnalysisMode.AGENT)}
+                className={`rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                  mode === AnalysisMode.AGENT ? 'bg-white text-medical-700 shadow-sm' : 'text-slate-500'
+                }`}
+              >
+                AI Analysis Agent
+              </button>
+            </div>
+            <button
+              onClick={() => setIsSourcesDrawerOpen(true)}
+              className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+            >
+              Sources: {selectedFileIds.size}
+            </button>
+            <button
+              onClick={() => setIsContextDrawerOpen(true)}
+              className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:border-medical-200 hover:bg-medical-50 hover:text-medical-700"
+            >
+              Tools
+            </button>
+            <div className="text-[11px] text-slate-500">
+              {mode === AnalysisMode.AGENT
+                ? 'Deterministic multi-step execution mode.'
+                : 'Unified AI chat with automatic context strategy.'}
+            </div>
+          </div>
+
           {/* Quick Action Chips */}
           <div className="mb-2 flex items-center justify-between gap-3">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">

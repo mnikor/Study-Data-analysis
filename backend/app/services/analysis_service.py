@@ -21,8 +21,10 @@ from .endpoint_templates import resolve_endpoint_template
 from .workspace_repository import FileWorkspaceRepository
 from .workspace_builder import build_workspace, infer_role
 from ..models.analysis import (
+    AnalysisCapabilityAssessment,
     AnalysisCapabilityRequest,
     AnalysisCapabilityResponse,
+    CapabilityBlockerStage,
     AnalysisExecutionReceipt,
     AnalysisFamily,
     AnalysisFilter,
@@ -82,6 +84,22 @@ class CapabilityResult:
     requires_row_level_data: bool
     warnings: list[str]
     explanation: str
+    blocker_stage: CapabilityBlockerStage
+    blocker_reason: str | None
+    recommended_next_step: str | None
+    fallback_option: str | None
+    data_requirements: list[str]
+    method_constraints: list[str]
+
+
+@dataclass(frozen=True)
+class UnsupportedMethodGap:
+    family: AnalysisFamily
+    reason: str
+    recommended_next_step: str
+    fallback_option: str
+    method_constraints: list[str]
+    data_requirements: list[str]
 
 
 class AnalysisService:
@@ -99,6 +117,7 @@ class AnalysisService:
             missing_roles=result.missing_roles,
             warnings=result.warnings,
             explanation=result.explanation,
+            assessment=self._build_assessment(result),
         )
 
     def build_plan(self, payload: AnalysisPlanRequest) -> AnalysisPlanResponse:
@@ -113,6 +132,7 @@ class AnalysisService:
             missing_roles=result.missing_roles,
             warnings=result.warnings,
             explanation=result.explanation,
+            assessment=self._build_assessment(result),
         )
 
     def build_workspace(self, payload: WorkspaceBuildRequest) -> WorkspaceBuildResponse:
@@ -378,6 +398,23 @@ class AnalysisService:
     def _classify(self, question: str, datasets: Iterable[DatasetReference]) -> CapabilityResult:
         question_lower = question.lower()
         family = self._infer_family(question_lower)
+        method_gap = self._detect_unsupported_method_gap(question_lower)
+        if method_gap is not None:
+            return CapabilityResult(
+                status="unsupported",
+                family=method_gap.family,
+                missing_roles=[],
+                requires_row_level_data=True,
+                warnings=[],
+                explanation=method_gap.reason,
+                blocker_stage="method",
+                blocker_reason=method_gap.reason,
+                recommended_next_step=method_gap.recommended_next_step,
+                fallback_option=method_gap.fallback_option,
+                data_requirements=method_gap.data_requirements,
+                method_constraints=method_gap.method_constraints,
+            )
+
         duplicate_roles = self._detect_duplicate_roles(datasets)
         if duplicate_roles:
             formatted = "; ".join(f"{role}: {', '.join(names)}" for role, names in duplicate_roles.items())
@@ -388,10 +425,17 @@ class AnalysisService:
                 requires_row_level_data=True,
                 warnings=["The backend no longer guesses when multiple selected datasets map to the same singleton analysis role."],
                 explanation=f"Multiple selected datasets map to the same required role. Keep one file per role before execution. Conflicts: {formatted}",
+                blocker_stage="selection",
+                blocker_reason="Multiple selected files map to the same singleton dataset role.",
+                recommended_next_step="Keep one analysis-ready file per role, remove duplicate ADSL/ADAE/ADLB/ADTTE-style files, then rerun the question.",
+                fallback_option="Use AI Chat only for high-level document or metadata review until the file selection is cleaned up.",
+                data_requirements=["One de-duplicated analysis-ready file for each required role."],
+                method_constraints=[],
             )
 
         roles = self._infer_roles(datasets)
         endpoint_template = resolve_endpoint_template(question_lower, family)
+        base_data_requirements = self._describe_data_requirements(family, list(endpoint_template.required_roles))
 
         if family in {"feature_importance", "partial_dependence"}:
             missing = self._missing_roles(roles, list(endpoint_template.required_roles or ("ADSL", "ADAE", "ADLB")))
@@ -409,6 +453,22 @@ class AnalysisService:
                     if missing
                     else "This request matches the exploratory ML workflow implemented in the analysis engine."
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Required analysis roles for exploratory ML are missing." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) and rerun the analysis agent."
+                    if missing
+                    else "Run the analysis agent to execute the exploratory ML workflow on the assembled workspace."
+                ),
+                fallback_option=(
+                    "Use AI Chat only for qualitative source review; do not treat chat output as executed ML analysis."
+                    if missing
+                    else "Use AI Chat for framing questions, but rely on the agent run for actual model output."
+                ),
+                data_requirements=self._describe_data_requirements(family, list(endpoint_template.required_roles or ("ADSL", "ADAE", "ADLB"))),
+                method_constraints=[
+                    "Feature importance and partial dependence are exploratory and do not establish causality.",
+                ],
             )
 
         if family in {"incidence", "risk_difference"}:
@@ -427,6 +487,22 @@ class AnalysisService:
                     if missing
                     else "This request matches the deterministic incidence workflow implemented in the analysis engine."
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Required subject-level denominator or adverse-event rows are missing." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) so the app can derive denominators and event incidence."
+                    if missing
+                    else "Run the analysis agent to compute the bounded incidence comparison on the selected data."
+                ),
+                fallback_option=(
+                    "Use AI Chat for protocol or metadata review only until the missing clinical domains are available."
+                    if missing
+                    else "Use AI Chat for interpretation after the deterministic result is executed."
+                ),
+                data_requirements=self._describe_data_requirements(family, list(endpoint_template.required_roles or ("ADSL", "ADAE"))),
+                method_constraints=[
+                    "Week-window incidence questions require deterministic event timing and endpoint derivation rules.",
+                ],
             )
 
         if family == "logistic_regression":
@@ -434,6 +510,22 @@ class AnalysisService:
             if self._is_dose_or_exposure_question(question_lower) and not self._has_exposure_inputs(datasets, roles):
                 missing = [*missing, "ADEX/EX or weight column"]
             status = "executable" if not missing else "missing_data"
+            exposure_warnings = (
+                [
+                    "Exposure or weight-tier questions are executed as subject-level risk models with dose/exposure features and treatment interaction screening when mitigation language is present.",
+                    "If the question does not specify an endpoint explicitly, the workspace will fall back to the default derived AE outcome for the selected datasets.",
+                ]
+                if self._is_exposure_risk_question(question_lower)
+                else []
+            )
+            subgroup_warnings = (
+                [
+                    "Subgroup-benefit questions are executed as treatment-interaction screening against the derived binary endpoint.",
+                    "If the endpoint is not explicit in the question, the workspace will fall back to the default derived AE outcome for the selected datasets.",
+                ]
+                if self._is_subgroup_benefit_question(question_lower)
+                else []
+            )
             return CapabilityResult(
                 status=status,
                 family=family,
@@ -442,12 +534,43 @@ class AnalysisService:
                 warnings=[
                     "Logistic regression assumes the derived endpoint is binary and subject-level.",
                     "Dose-tier questions work best when exposure data or baseline weight is available for deterministic feature derivation.",
+                    *exposure_warnings,
+                    *subgroup_warnings,
                 ],
                 explanation=(
                     "This request needs subject-level baseline covariates plus derived adverse-event outcomes."
                     if missing
-                    else "This request matches the deterministic logistic regression workflow implemented in the analysis engine."
+                    else (
+                        "This request matches the deterministic exposure-mitigation workflow implemented on top of the logistic regression engine."
+                        if self._is_exposure_risk_question(question_lower)
+                        else (
+                        "This request matches the deterministic subgroup interaction workflow implemented on top of the logistic regression engine."
+                        if self._is_subgroup_benefit_question(question_lower)
+                        else "This request matches the deterministic logistic regression workflow implemented in the analysis engine."
+                        )
+                    )
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Required subject-level predictors or derived endpoints are missing." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) so the app can derive the endpoint and predictors."
+                    if missing
+                    else "Run the analysis agent to estimate the subject-level risk model on the selected workspace."
+                ),
+                fallback_option=(
+                    "Use AI Chat for qualitative review only until the subject-level modeling inputs are available."
+                    if missing
+                    else "Use AI Chat to refine the question, then use the agent run for the executed model."
+                ),
+                data_requirements=self._describe_data_requirements(
+                    family,
+                    list(endpoint_template.required_roles or ("ADSL", "ADAE")),
+                    include_exposure_requirement=self._is_dose_or_exposure_question(question_lower),
+                ),
+                method_constraints=[
+                    "The implemented logistic workflow assumes a binary subject-level endpoint.",
+                    "Predictor effects are associative and should not be interpreted as causal without additional methods.",
+                ],
             )
 
         if family in {"kaplan_meier", "cox"}:
@@ -477,6 +600,27 @@ class AnalysisService:
                         else "This request can use a derived AE time-to-first-event workflow because the selected ADSL + ADAE datasets expose explicit event timing."
                     )
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Explicit event timing or a formal time-to-event dataset is missing." if missing else None,
+                recommended_next_step=(
+                    "Select an ADTTE file, or provide ADSL + ADAE with explicit event timing and any needed exposure inputs, then rerun."
+                    if missing
+                    else "Run the analysis agent to execute the time-to-event workflow on the selected sources."
+                ),
+                fallback_option=(
+                    "Use AI Chat for question framing only; survival curves and hazard estimates require an executed run."
+                    if missing
+                    else "Use AI Chat after execution for narrative interpretation, not as a replacement for the survival model."
+                ),
+                data_requirements=self._describe_data_requirements(
+                    family,
+                    list(endpoint_template.required_roles or ("ADSL", "ADAE")),
+                    include_survival_requirement=True,
+                    include_exposure_requirement=self._is_dose_or_exposure_question(question_lower),
+                ),
+                method_constraints=[
+                    "The current survival workflow does not support time-varying covariates, recurrent-event models, or treatment switching adjustments.",
+                ],
             )
 
         if family == "mixed_model":
@@ -496,6 +640,22 @@ class AnalysisService:
                     if missing
                     else "This request matches the repeated-measures workflow implemented in the analysis engine."
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Repeated-measures source data is missing." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) so the app can assemble a visit-level longitudinal workspace."
+                    if missing
+                    else "Run the analysis agent to execute the repeated-measures model."
+                ),
+                fallback_option=(
+                    "Use AI Chat only for high-level review until a repeated-measures dataset is available."
+                    if missing
+                    else "Use AI Chat for follow-up interpretation once the repeated-measures output has executed."
+                ),
+                data_requirements=self._describe_data_requirements(family, list(endpoint_template.required_roles or ("ADSL", "ADLB"))),
+                method_constraints=[
+                    "The current repeated-measures workflow expects long-format rows with consistent subject and visit identifiers.",
+                ],
             )
 
         if family == "threshold_search":
@@ -515,6 +675,22 @@ class AnalysisService:
                     if missing
                     else "This request matches the exploratory threshold-search workflow implemented in the analysis engine."
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Threshold-search inputs are incomplete." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) so the app can derive early predictors and later persistence outcomes."
+                    if missing
+                    else "Run the analysis agent to execute the threshold-search workflow and inspect the ranking output."
+                ),
+                fallback_option=(
+                    "Use AI Chat for planning only until the full threshold-search inputs are present."
+                    if missing
+                    else "Use AI Chat for interpretation after the exploratory threshold-search run completes."
+                ),
+                data_requirements=self._describe_data_requirements(family, list(endpoint_template.required_roles or ("ADSL", "ADAE", "DS"))),
+                method_constraints=[
+                    "Threshold-search results are exploratory and require validation before operational use.",
+                ],
             )
 
         if family == "competing_risks":
@@ -533,6 +709,22 @@ class AnalysisService:
                     if missing
                     else "This request matches the competing-risks workflow implemented in the analysis engine."
                 ),
+                blocker_stage="data" if missing else "none",
+                blocker_reason="Disposition or competing-event timing inputs are missing." if missing else None,
+                recommended_next_step=(
+                    f"Add or select the missing roles ({', '.join(missing)}) so the app can derive event-of-interest and competing-event status."
+                    if missing
+                    else "Run the analysis agent to compute the cumulative-incidence summary on the selected data."
+                ),
+                fallback_option=(
+                    "Use AI Chat for protocol review only until disposition timing is available."
+                    if missing
+                    else "Use AI Chat for interpretation after the executed competing-risk summary."
+                ),
+                data_requirements=self._describe_data_requirements(family, list(endpoint_template.required_roles or ("ADSL", "DS")), include_survival_requirement=True),
+                method_constraints=[
+                    "The current implementation provides nonparametric cumulative-incidence summaries, not full Fine-Gray regression.",
+                ],
             )
 
         return CapabilityResult(
@@ -542,9 +734,21 @@ class AnalysisService:
             requires_row_level_data=False,
             warnings=[],
             explanation="The planner could not classify this question yet. Extend the supported analysis rules before allowing fallback analysis.",
+            blocker_stage="planner",
+            blocker_reason="The question did not map to a supported deterministic analysis family.",
+            recommended_next_step="Rewrite the question with a specific endpoint, population, time window, and analysis objective, or extend the planner rules for this question type.",
+            fallback_option="Use AI Chat for qualitative review only and do not present the output as executed analysis.",
+            data_requirements=base_data_requirements,
+            method_constraints=self._infer_unknown_method_constraints(question_lower),
         )
 
     def _infer_family(self, question: str) -> AnalysisFamily:
+        if self._is_subgroup_benefit_question(question):
+            return "logistic_regression"
+        if self._is_exposure_risk_question(question):
+            if any(token in question for token in ("time to", "onset", "resolution", "survival", "hazard")):
+                return "cox"
+            return "logistic_regression"
         if any(token in question for token in ("repeated measures", "repeated-measures", "longitudinal", "mixed model", "trajectory", "trend over time", "visit-level")):
             return "mixed_model"
         if any(token in question for token in ("threshold", "cutoff", "cut-off", "early warning", "warning threshold", "best predict")):
@@ -591,6 +795,125 @@ class AnalysisService:
     def _missing_roles(self, roles: set[str], required_roles: list[str]) -> list[str]:
         return [role for role in required_roles if role not in roles]
 
+    def _build_assessment(self, result: CapabilityResult) -> AnalysisCapabilityAssessment:
+        support_level = (
+            "supported"
+            if result.status == "executable"
+            else "partial"
+            if result.status == "missing_data"
+            else "unsupported"
+        )
+        return AnalysisCapabilityAssessment(
+            support_level=support_level,
+            blocker_stage=result.blocker_stage,
+            blocker_reason=result.blocker_reason,
+            recommended_next_step=result.recommended_next_step,
+            fallback_option=result.fallback_option,
+            data_requirements=result.data_requirements,
+            method_constraints=result.method_constraints,
+        )
+
+    def _describe_data_requirements(
+        self,
+        family: AnalysisFamily,
+        required_roles: list[str],
+        *,
+        include_survival_requirement: bool = False,
+        include_exposure_requirement: bool = False,
+    ) -> list[str]:
+        requirements: list[str] = []
+        if required_roles:
+            requirements.append(f"Required dataset roles: {', '.join(required_roles)}.")
+        if family in {"incidence", "risk_difference", "logistic_regression"}:
+            requirements.append("Subject-level denominators plus row-level event outcomes are needed.")
+        if family in {"kaplan_meier", "cox"} or include_survival_requirement:
+            requirements.append("Explicit event timing is required through ADTTE or derivable event dates/durations.")
+        if family == "mixed_model":
+            requirements.append("Repeated measurement rows with visit or day information are required.")
+        if family == "threshold_search":
+            requirements.append("Both early predictors and a downstream persistence endpoint are required.")
+        if family == "competing_risks":
+            requirements.append("Event-of-interest timing and a distinguishable competing-event definition are required.")
+        if family in {"feature_importance", "partial_dependence"}:
+            requirements.append("A derived subject-level target plus baseline covariates are required.")
+        if include_exposure_requirement:
+            requirements.append("Exposure, dosing, or baseline weight information is required for deterministic dose/exposure features.")
+        return requirements
+
+    def _infer_unknown_method_constraints(self, question: str) -> list[str]:
+        constraints: list[str] = []
+        unsupported_tokens: tuple[tuple[tuple[str, ...], str], ...] = (
+            (("non-inferiority", "noninferiority", "equivalence margin"), "Formal non-inferiority or equivalence testing is not implemented."),
+            (("multiplicity", "hierarchical testing", "alpha spending", "interim analysis"), "Multiplicity control and formal testing hierarchies are not implemented."),
+            (("propensity", "iptw", "inverse probability", "matching", "causal"), "Causal-adjustment workflows are not implemented in the deterministic engine."),
+            (("time-varying", "multi-state", "recurrent event", "andersen-gill"), "Advanced survival extensions are not implemented in the deterministic engine."),
+            (("fine-gray", "fine gray", "subdistribution hazard"), "Fine-Gray competing-risk regression is not implemented."),
+            (("hy's law", "hys law", "shift table", "ctcae lab"), "Specialized clinical safety-table workflows are not implemented yet."),
+        )
+        for aliases, message in unsupported_tokens:
+            if any(alias in question for alias in aliases):
+                constraints.append(message)
+        if not constraints:
+            constraints.append("The planner currently handles only implemented deterministic families such as incidence, logistic regression, survival, repeated measures, threshold search, competing-risk summaries, and exploratory ML.")
+        return constraints
+
+    def _detect_unsupported_method_gap(self, question: str) -> UnsupportedMethodGap | None:
+        if any(token in question for token in ("non-inferiority", "noninferiority", "equivalence margin", "superiority margin")):
+            return UnsupportedMethodGap(
+                family="unknown",
+                reason="Formal non-inferiority, equivalence, or margin-based superiority testing is not implemented in the deterministic engine.",
+                recommended_next_step="Route this request to a dedicated statistical testing workflow or extend the backend with margin-based hypothesis-testing support.",
+                fallback_option="Use AI Chat only for SAP or protocol review; do not treat it as a formal test result.",
+                data_requirements=["Analysis-ready endpoint data plus a prespecified testing framework and margin definition."],
+                method_constraints=["Formal margin-based testing, alpha control, and reporting are not implemented."],
+            )
+        if any(token in question for token in ("multiplicity", "hierarchical testing", "gatekeeping", "alpha spending", "interim analysis")):
+            return UnsupportedMethodGap(
+                family="unknown",
+                reason="Multiplicity adjustment, hierarchical testing, and interim alpha-control workflows are not implemented in the deterministic engine.",
+                recommended_next_step="Route this question to a dedicated SAP/statistics workflow or extend the backend with formal multiple-testing support.",
+                fallback_option="Use AI Chat to review the protocol language only; do not present a qualitative answer as a multiplicity-adjusted result.",
+                data_requirements=["Prespecified endpoint hierarchy, testing order, and adjusted hypothesis-testing logic."],
+                method_constraints=["Formal multiplicity control is outside the current deterministic workflow set."],
+            )
+        if any(token in question for token in ("propensity", "iptw", "inverse probability", "matching", "causal inference", "instrumental variable", "mediation")):
+            return UnsupportedMethodGap(
+                family="unknown",
+                reason="Causal-adjustment workflows such as propensity methods, IPTW, and mediation analysis are not implemented in the deterministic engine.",
+                recommended_next_step="Reframe the question as an associative analysis, or extend the backend with a dedicated causal-inference workflow.",
+                fallback_option="Use AI Chat only for framing and assumptions review, not for causal conclusions.",
+                data_requirements=["Treatment, outcome, and confounder data plus a dedicated causal-identification strategy."],
+                method_constraints=["Current models estimate association, not causal effect."],
+            )
+        if any(token in question for token in ("time-varying covariate", "time varying covariate", "multi-state", "multistate", "recurrent event", "andersen-gill", "treatment switching")):
+            return UnsupportedMethodGap(
+                family="cox",
+                reason="Advanced survival workflows such as time-varying covariates, recurrent events, multi-state models, and treatment-switching adjustments are not implemented.",
+                recommended_next_step="Simplify the request to a standard KM/Cox question, or extend the backend with the required survival method.",
+                fallback_option="Use AI Chat to scope the endpoint and data, but not to replace the unsupported survival method.",
+                data_requirements=["Time-dependent covariates or event-history structure plus a dedicated advanced survival implementation."],
+                method_constraints=["Only standard Kaplan-Meier and Cox-style workflows are currently supported."],
+            )
+        if any(token in question for token in ("fine-gray", "fine gray", "subdistribution hazard")):
+            return UnsupportedMethodGap(
+                family="competing_risks",
+                reason="Fine-Gray subdistribution hazard modeling is not implemented. The current competing-risk workflow only produces nonparametric cumulative-incidence summaries.",
+                recommended_next_step="Either simplify the request to cumulative-incidence comparison or extend the backend with Fine-Gray regression support.",
+                fallback_option="Use AI Chat for protocol review only; do not report a qualitative substitute as Fine-Gray output.",
+                data_requirements=["Competing-risk event coding, event timing, and a Fine-Gray regression implementation."],
+                method_constraints=["Competing-risk support is summary-level only, not full regression modeling."],
+            )
+        if any(token in question for token in ("hy's law", "hys law", "shift table", "ctcae lab", "lab shift")):
+            return UnsupportedMethodGap(
+                family="unknown",
+                reason="Specialized clinical safety workflows such as Hy's law and formal lab-shift tables are not implemented yet.",
+                recommended_next_step="Extend the backend with domain-specific safety derivations and reporting logic for this question type.",
+                fallback_option="Use AI Chat for high-level source inspection only; do not present it as a validated safety-table result.",
+                data_requirements=["Analysis-ready laboratory data plus domain-specific toxicity grading and shift derivation rules."],
+                method_constraints=["The current engine does not yet implement standard safety-table derivations for these endpoints."],
+            )
+        return None
+
     def _default_outputs(self, family: AnalysisFamily) -> list[str]:
         if family == "feature_importance":
             return ["feature_importance", "partial_dependence", "model_summary"]
@@ -614,6 +937,7 @@ class AnalysisService:
         lower_question = question.lower()
         family = self._resolve_planned_family(inferred_family, lower_question)
         endpoint_template = resolve_endpoint_template(lower_question, family)
+        requested_covariates = self._extract_requested_covariates(lower_question)
         return AnalysisSpec(
             analysis_family=family,
             target_definition=endpoint_template.target_definition or self._extract_target_definition(lower_question, family),
@@ -621,6 +945,7 @@ class AnalysisService:
             grade_threshold=self._extract_grade_threshold(lower_question),
             term_filters=list(endpoint_template.term_filters) or self._extract_term_filters(lower_question),
             cohort_filters=self._extract_cohort_filters(lower_question),
+            covariates=requested_covariates,
             interaction_terms=list(endpoint_template.interaction_terms) or self._extract_interaction_terms(lower_question),
             threshold_variables=list(endpoint_template.threshold_variables),
             threshold_metric=endpoint_template.threshold_metric,  # type: ignore[arg-type]
@@ -628,6 +953,13 @@ class AnalysisService:
             requested_outputs=list(endpoint_template.requested_outputs) or self._default_outputs(family),
             notes=[
                 "Deterministic analysis plan generated from question classification.",
+                *(
+                    [
+                        "Requested subgroup factors were converted into targeted treatment-interaction terms for deterministic effect-modifier screening."
+                    ]
+                    if self._is_subgroup_benefit_question(lower_question)
+                    else []
+                ),
                 *list(endpoint_template.notes),
             ],
         )
@@ -687,10 +1019,77 @@ class AnalysisService:
             interactions.append("treatment*dose")
         if "differ by arm" in question or "predictors differ by arm" in question:
             interactions.append("treatment*all")
+        if self._is_subgroup_benefit_question(question):
+            subgroup_terms = self._extract_requested_covariates(question)
+            for term in subgroup_terms:
+                interaction = f"treatment*{term}"
+                if interaction not in interactions:
+                    interactions.append(interaction)
+            if not subgroup_terms and "treatment*all" not in interactions:
+                interactions.append("treatment*all")
         return interactions
+
+    def _extract_requested_covariates(self, question: str) -> list[str]:
+        requested: list[str] = []
+        token_map: tuple[tuple[tuple[str, ...], str], ...] = (
+            (("older age", "age", "older"), "age"),
+            (("weight tier", "80 kg", "weight", "body weight"), "weight"),
+            (("dose", "dosing", "exposure", "higher exposure"), "dose"),
+            (("crp", "c-reactive protein"), "crp"),
+            (("eczema", "eczema history"), "eczema"),
+            (("dryness", "dry skin", "skin dryness"), "dry"),
+            (("sex", "female", "male", "women", "men"), "sex"),
+            (("race", "ethnicity", "ethnic"), "race"),
+            (("ecog", "performance status"), "ecog"),
+        )
+        for aliases, label in token_map:
+            if any(alias in question for alias in aliases) and label not in requested:
+                requested.append(label)
+        return requested
+
+    def _is_subgroup_benefit_question(self, question: str) -> bool:
+        subgroup_markers = (
+            "larger in patients with",
+            "greater in patients with",
+            "benefit larger",
+            "benefit greater",
+            "larger benefit",
+            "greater benefit",
+            "benefit in subgroups",
+            "benefit in certain",
+            "high-risk subgroup",
+            "high risk subgroup",
+            "high-risk subgroups",
+            "high risk subgroups",
+            "certain subgroups",
+            "certain high-risk subgroups",
+            "which patients benefit more",
+            "which subgroup benefits more",
+            "effect modifier",
+            "effect modification",
+            "heterogeneity of treatment effect",
+        )
+        return any(marker in question for marker in subgroup_markers)
 
     def _is_dose_or_exposure_question(self, question: str) -> bool:
         return any(token in question for token in ("dose", "dosing", "weight", "exposure", ">80 kg", "80 kg"))
+
+    def _is_exposure_risk_question(self, question: str) -> bool:
+        if not self._is_dose_or_exposure_question(question):
+            return False
+        risk_markers = (
+            "increase risk",
+            "higher risk",
+            "risk increase",
+            "risk of",
+            "more likely",
+            "associated with risk",
+            "linked to risk",
+            "mitigat",
+            "mitigated",
+            "mitigation",
+        )
+        return any(marker in question for marker in risk_markers)
 
     def _has_exposure_inputs(self, datasets: Iterable[DatasetReference], roles: set[str]) -> bool:
         if "ADEX" in roles or "EX" in roles:
